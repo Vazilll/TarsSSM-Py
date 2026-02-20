@@ -1,0 +1,16 @@
+torch
+torchvision
+ultralytics
+bettercam
+faster-whisper
+fastapi
+uvicorn
+pyautogui
+pygetwindow
+pyperclip
+mem0ai
+sentence-transformers
+numpy
+winsound; platform_system == 'Windows'
+onnxruntime
+pyyaml

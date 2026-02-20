@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+
+# TARS Specific
+data/
+models/
+*.wav
+*.mp3
+*.log
+memory/*.index
+data/mem0_db/
+
+# OS / IDE
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# C++ Build
+brain/*.obj
+brain/*.lib
+brain/*.exp
+brain/tars_kernels/
