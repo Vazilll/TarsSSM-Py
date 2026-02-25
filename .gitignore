@@ -6,14 +6,26 @@ __pycache__/
 env/
 venv/
 
-# TARS Specific
+# TARS Data (downloaded during training)
 data/
+!data/.gitkeep
+
+# TARS Models (trained weights)
 models/
+!models/tars_v3/
+models/tars_v3/*.pt
+!models/tars_v3/config.json
+
+# TARS Memory (runtime index)
+memory/*.index
+
+# Logs
+*.log
+data/thinking_logs/
+
+# Media
 *.wav
 *.mp3
-*.log
-memory/*.index
-data/mem0_db/
 
 # OS / IDE
 .vscode/
@@ -26,3 +38,5 @@ brain/*.obj
 brain/*.lib
 brain/*.exp
 brain/tars_kernels/
+brain/omega_core/*.dll
+brain/omega_core/*.so
