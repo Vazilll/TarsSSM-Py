@@ -33,7 +33,7 @@ class ReflexClassifier(nn.Module):
         "complex",        # 5: Needs Tier 2+ (catch-all)
     ]
 
-    def __init__(self, vocab_size=32000, embed_dim=128, hidden_dim=128, n_intents=6):
+    def __init__(self, vocab_size=256, embed_dim=64, hidden_dim=64, n_intents=6):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, embed_dim)
         self.mingru_gate = nn.Linear(embed_dim, hidden_dim)

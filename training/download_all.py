@@ -32,7 +32,7 @@ def main():
     print("━" * 60)
     try:
         from download_wiki import download_corpus
-        download_corpus(count=100000)
+        download_corpus(count=10000)
     except Exception as e:
         print(f"  ⚠ Wikipedia: {e}")
     print()

@@ -3,7 +3,7 @@ from .utils import decode_tokens, tokenize_text
 
 def generate_text(model, start_text="Привет", max_length=128, temperature=0.7, device='cuda', context_vec=None):
     """
-    Генерация текста через MinGRU_LM с поддержкой UTF-8 кириллицы.
+    Генерация текста через MinGRU_LM с поддержкой CP1251 кириллицы.
     
     Args:
         model: MinGRU_LM модель

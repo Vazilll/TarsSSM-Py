@@ -24,6 +24,8 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import json
+import os
 import logging
 from typing import Optional, Tuple, Any
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
@@ -38,6 +40,8 @@ from brain.mamba2.bitnet import (
     convert_model_to_fp16, model_stats, replace_linear_with_universal
 )
 
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 
 class TarsMamba2LM(nn.Module):
     """
@@ -49,6 +53,56 @@ class TarsMamba2LM(nn.Module):
     
     ~130M params (fp16: ~260MB, 1.58-bit: ~60MB)
     """
+    
+    @classmethod
+    def from_config(cls, config_path=None, device="cpu"):
+        """Создаёт модель из config.json."""
+        if config_path is None:
+            config_path = os.path.join(_ROOT, "models", "tars_v3", "config.json")
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        p = cfg["models"]["mamba2"]["params"]
+        return cls(
+            d_model=p.get("d_model", 768), n_layers=p.get("n_layers", 12),
+            vocab_size=p.get("vocab_size", 256), d_state=p.get("d_state", 64),
+            headdim=p.get("headdim", 64), omega_dim=p.get("omega_dim", 32),
+            pool_size=p.get("pool_size", 48), n_experts=p.get("n_experts", 8),
+        ).to(device)
+    
+    @classmethod
+    def load_pretrained(cls, checkpoint_path=None, config_path=None, device="cpu"):
+        """Загружает модель из config + checkpoint."""
+        _logger = logging.getLogger("Tars.Mamba2LM")
+        model = cls.from_config(config_path, device)
+        
+        if checkpoint_path is None:
+            for p in [
+                os.path.join(_ROOT, "models", "tars_v3", "mamba2.pt"),
+                os.path.join(_ROOT, "models", "mamba2", "mamba2_omega_158bit.pt"),
+                os.path.join(_ROOT, "models", "mamba2", "mamba2_omega.pt"),
+            ]:
+                if os.path.exists(p):
+                    checkpoint_path = p
+                    break
+        
+        if checkpoint_path and os.path.exists(checkpoint_path):
+            _logger.info(f"Loading weights: {checkpoint_path}")
+            cp = torch.load(checkpoint_path, map_location=device, weights_only=False)
+            state = cp.get("model_state_dict", cp)
+            model_state = model.state_dict()
+            loaded, skipped = 0, 0
+            for key, value in state.items():
+                if key in model_state and model_state[key].shape == value.shape:
+                    model_state[key] = value
+                    loaded += 1
+                else:
+                    skipped += 1
+            model.load_state_dict(model_state, strict=False)
+            _logger.info(f"Loaded {loaded} tensors, skipped {skipped}")
+            return model, checkpoint_path
+        
+        _logger.warning("No checkpoint found — UNTRAINED")
+        return model, None
     
     def __init__(
         self,
@@ -75,6 +129,7 @@ class TarsMamba2LM(nn.Module):
         self.embedding = nn.Embedding(vocab_size, d_model)
         
         # ═══ Основные блоки (12 × TarsBlock) ═══
+        # Используются парами: [B0||B1] → merge → spine → [B2||B3] → ...
         self.blocks = nn.ModuleList([
             TarsBlock(
                 d_model=d_model, d_state=d_state,
@@ -83,6 +138,26 @@ class TarsMamba2LM(nn.Module):
                 quant_mode=quant_mode,
             )
             for i in range(n_layers)
+        ])
+        
+        # ═══ Wave Merge Gates (6 gates для 12/2=6 волн) ═══
+        # Каждый merge сливает 2 параллельных блока в один выход
+        n_waves = n_layers // 2
+        self.wave_merges = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model * 2, d_model),
+                nn.SiLU(),
+                nn.Linear(d_model, d_model),
+            )
+            for _ in range(n_waves)
+        ])
+        # Обучаемый гейт: сколько от каждого из 2 блоков взять
+        self.wave_gates = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model * 2, 1),
+                nn.Sigmoid(),
+            )
+            for _ in range(n_waves)
         ])
         
         # ═══ IDME Matrix Pool (48+, бесконечное расширение) ═══
@@ -100,6 +175,13 @@ class TarsMamba2LM(nn.Module):
         
         # ═══ Thinking Logger ═══
         self.thinking_logger = ThinkingLogger()
+        
+        # ═══ Titans Memory Hook (384d LTM) ═══
+        # Проекция d_model → 384d (пространство памяти LEANN/Titans)
+        self.mem_dim = 384
+        self.to_memory_space = nn.Linear(d_model, self.mem_dim, bias=False)
+        self.from_memory_space = nn.Linear(self.mem_dim, d_model, bias=False)
+        self.titans_memory = None  # Set externally: model.titans_memory = TitansMemory(384)
         
         # ═══ Output head ═══
         self.norm_f = nn.LayerNorm(d_model)
@@ -130,29 +212,63 @@ class TarsMamba2LM(nn.Module):
         labels: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Обычный forward pass (для обучения и быстрой генерации).
-        Без IDME — только 12 блоков TarsBlock.
+        Forward pass (для обучения и генерации).
+        Использует Parallel Wave Merge: [B0||B1] → gate → merge → ...
+        Все wave_merges и wave_gates обучаются через backprop.
         
         input_ids: [B, L]
         Returns: logits [B, L, vocab_size]
         """
         x = self.embedding(input_ids)  # [B, L, d_model]
         
-        # WKV state (переносится между блоками внутри TarsCoreBlock)
-        wkv_state = None
-        x_prev = None
+        wkv_states = [None] * self.n_layers
+        x_prevs = [None] * self.n_layers
         
-        # Forward through TarsBlocks
-        for block in self.blocks:
+        # Parallel Wave through TarsBlocks
+        n_waves = self.n_layers // 2
+        
+        for wave_idx in range(n_waves):
+            b_left = wave_idx * 2
+            b_right = wave_idx * 2 + 1
+            
+            if b_right >= self.n_layers:
+                break
+            
+            # 2 блока параллельно
             if self.use_checkpointing and self.training:
-                x, wkv_state, x_prev, _ = grad_checkpoint(
-                    block, x, wkv_state, x_prev, memory_vec, rag_state,
+                x_left, wkv_states[b_left], x_prevs[b_left], _ = grad_checkpoint(
+                    self.blocks[b_left], x, wkv_states[b_left],
+                    x_prevs[b_left], memory_vec, rag_state,
+                    use_reentrant=False
+                )
+                x_right, wkv_states[b_right], x_prevs[b_right], _ = grad_checkpoint(
+                    self.blocks[b_right], x, wkv_states[b_right],
+                    x_prevs[b_right], memory_vec, rag_state,
                     use_reentrant=False
                 )
             else:
-                x, wkv_state, x_prev, _ = block(
-                    x, wkv_state, x_prev, memory_vec, rag_state
+                x_left, wkv_states[b_left], x_prevs[b_left], _ = self.blocks[b_left](
+                    x, wkv_states[b_left], x_prevs[b_left], memory_vec, rag_state
                 )
+                x_right, wkv_states[b_right], x_prevs[b_right], _ = self.blocks[b_right](
+                    x, wkv_states[b_right], x_prevs[b_right], memory_vec, rag_state
+                )
+            
+            # Wave Merge: gate + correction
+            h_left = x_left.mean(dim=1)
+            h_right = x_right.mean(dim=1)
+            gate_input = torch.cat([h_left, h_right], dim=-1)
+            
+            alpha = self.wave_gates[wave_idx](gate_input).unsqueeze(1)
+            x_merged = (1 - alpha) * x_left + alpha * x_right
+            
+            correction = self.wave_merges[wave_idx](gate_input).unsqueeze(1)
+            x = x_merged + 0.1 * correction
+        
+        # Handle odd number of blocks
+        if self.n_layers % 2 == 1:
+            last_block = self.blocks[-1]
+            x, _, _, _ = last_block(x, None, None, memory_vec, rag_state)
         
         # Output
         x = self.norm_f(x)
@@ -230,48 +346,131 @@ class TarsMamba2LM(nn.Module):
             max_expansion_rounds = 100
             estimated_depth = self.n_layers
         
-        # ═══ 1. Forward через TarsBlocks (adaptive depth) ═══
+        # ═══════════════════════════════════════════════════════════════
+        # 1. Parallel Wave Depth (2 параллельных блока → merge → spine)
+        #
+        # Простой запрос:  [B0 || B1] → merge → spine → СОШЛОСЬ (2 блока)
+        # Средний запрос:  ... → [B2 || B3] → merge → spine → СОШЛОСЬ (4)
+        # Сложный запрос:  ... все 6 волн (12 блоков) → IDME
+        # ═══════════════════════════════════════════════════════════════
         x = self.embedding(input_ids)
         
-        wkv_state = None
-        x_prev = None
+        wkv_states = [None] * self.n_layers   # WKV state per block
+        x_prevs = [None] * self.n_layers      # time-shift per block
         h_prev = x.mean(dim=1).detach()
         
         block_stats = []
         blocks_executed = 0
+        surprise_signals = []
+        converged_early = False
+        wave_count = 0
         
-        for i, block in enumerate(self.blocks):
-            # ═══ Adaptive depth: skip blocks beyond estimated_depth ═══
-            if i >= estimated_depth and not force_deep:
+        max_waves = self.n_layers // 2   # 12/2 = 6 волн
+        
+        for wave_idx in range(max_waves):
+            # Проверяем depth limit
+            if blocks_executed >= estimated_depth and not force_deep:
+                break
+            
+            wave_count += 1
+            b_left = wave_idx * 2       # индекс левого блока
+            b_right = wave_idx * 2 + 1  # индекс правого блока
+            
+            if b_right >= self.n_layers:
+                break
+            
+            # ── 2 блока работают ПАРАЛЛЕЛЬНО на одном входе ──
+            x_left, wkv_states[b_left], x_prevs[b_left], stats_l = self.blocks[b_left](
+                x, wkv_states[b_left], x_prevs[b_left], memory_vec, rag_state
+            )
+            x_right, wkv_states[b_right], x_prevs[b_right], stats_r = self.blocks[b_right](
+                x, wkv_states[b_right], x_prevs[b_right], memory_vec, rag_state
+            )
+            block_stats.extend([stats_l, stats_r])
+            blocks_executed += 2
+            
+            # ── Merge: обучаемый гейт сливает два выхода ──
+            h_left = x_left.mean(dim=1)   # [B, d_model]
+            h_right = x_right.mean(dim=1)
+            gate_input = torch.cat([h_left, h_right], dim=-1)  # [B, 2*d_model]
+            
+            # Гейт: 0.0=только левый, 1.0=только правый
+            alpha = self.wave_gates[wave_idx](gate_input)  # [B, 1]
+            alpha = alpha.unsqueeze(1)                       # [B, 1, 1]
+            x_merged = (1 - alpha) * x_left + alpha * x_right
+            
+            # Residual: добавляем обучаемую нелинейную коррекцию
+            merge_input = torch.cat([h_left, h_right], dim=-1)
+            correction = self.wave_merges[wave_idx](merge_input)  # [B, d_model]
+            x = x_merged + 0.1 * correction.unsqueeze(1)
+            
+            # Собираем surprise
+            for stats in [stats_l, stats_r]:
+                if stats.get("surprise", 0.0) > 0.3:
+                    surprise_signals.append({
+                        "layer": stats["layer_idx"],
+                        "surprise": stats["surprise"],
+                        "mem_relevance": stats.get("mem_relevance", 0.0),
+                    })
+            
+            # ── Integral Auditor: проверка сходимости ──
+            h_curr = x.mean(dim=1).detach()
+            ia_result = self.integral_auditor.observe(h_curr, h_prev)
+            h_prev = h_curr
+            
+            self.thinking_logger.log_step(blocks_executed - 1, {
+                "p": ia_result["p"], "r_squared": ia_result["r_squared"],
+                "f_t": ia_result["f_t"], "converged": ia_result["converged"],
+                "wave": wave_count, "depth": blocks_executed,
+                "width": 2,
+            })
+            
+            self.logger.debug(
+                f"Wave {wave_count}: [B{b_left}||B{b_right}] → merge → "
+                f"p={ia_result['p']:.3f} | converged={ia_result['converged']}"
+            )
+            
+            # ── Сошлось? ──
+            if ia_result["converged"] and wave_count >= 2:
+                converged_early = True
                 self.logger.debug(
-                    f"Adaptive skip: block {i}+ (depth={estimated_depth})"
+                    f"Converged at wave {wave_count} (depth={blocks_executed})"
                 )
                 break
             
-            x, wkv_state, x_prev, stats = block(
-                x, wkv_state, x_prev, memory_vec, rag_state
-            )
-            block_stats.append(stats)
-            blocks_executed = i + 1
-            
-            # IA check mid-stream (каждые 3 блока)
-            if (i + 1) % 3 == 0:
-                h_curr = x.mean(dim=1).detach()
-                ia_result = self.integral_auditor.observe(h_curr, h_prev)
-                h_prev = h_curr
+            # ── Спинной мозг обновляет память между волнами ──
+            if wave_idx < max_waves - 1:
+                if hasattr(self, 'to_memory_space') and memory_vec is not None:
+                    try:
+                        h_for_mem = self.to_memory_space(h_curr)
+                        memory_vec = 0.7 * memory_vec + 0.3 * h_for_mem.detach()
+                    except Exception:
+                        pass
                 
-                self.thinking_logger.log_step(i, {
-                    "p": ia_result["p"], "r_squared": ia_result["r_squared"],
-                    "f_t": ia_result["f_t"], "converged": ia_result["converged"],
-                    "block": i,
-                })
-                
-                # Early exit: если уже сошлось раньше estimated_depth
-                if ia_result["converged"] and i >= 5 and task_type in ("chat", "action"):
+                # Titans surprise feedback между волнами
+                if hasattr(self, 'titans_memory') and self.titans_memory is not None:
+                    wave_surprises = [s for s in surprise_signals 
+                                     if s["layer"] >= blocks_executed - 2]
+                    if wave_surprises:
+                        try:
+                            h_for_titans = self.to_memory_space(h_curr)
+                            self.titans_memory.forward(h_for_titans)
+                        except Exception:
+                            pass
+        
+        # ═══ Titans Feedback: финальный сигнал ═══
+        if hasattr(self, 'titans_memory') and self.titans_memory is not None:
+            if surprise_signals:
+                avg_surprise = sum(s["surprise"] for s in surprise_signals) / len(surprise_signals)
+                try:
+                    h_for_titans = self.to_memory_space(x.mean(dim=1).detach())
+                    self.titans_memory.forward(h_for_titans)
                     self.logger.debug(
-                        f"Early exit at block {i}: p={ia_result['p']:.3f}"
+                        f"Titans final: {len(surprise_signals)} layers surprised, "
+                        f"avg={avg_surprise:.3f}"
                     )
-                    break
+                except Exception as e:
+                    self.logger.debug(f"Titans feedback error: {e}")
         
         # Собираем экспертов из последнего выполненного блока
         last_idx = min(blocks_executed - 1, len(self.blocks) - 1)
@@ -301,8 +500,23 @@ class TarsMamba2LM(nn.Module):
             total_matrices_recruited += len(candidates)
             branches_tested += len(candidates)
             
+            # ═══ Lazy Expansion: пул исчерпан → рекрутируем новые матрицы ═══
             if not candidates:
-                break
+                available = self.matrix_pool.total_available()
+                used = len(getattr(self.matrix_pool, 'used_mask', []))
+                if available <= used + N_CANDIDATES:
+                    try:
+                        self.matrix_pool._lazy_expand(4, h_curr.mean(0))
+                        self.logger.debug(
+                            f"IDME lazy expand: +4 matrices (total={self.matrix_pool.total_available()})"
+                        )
+                        candidates, indices = self.matrix_pool.select(h_curr.mean(0), k=N_CANDIDATES)
+                        total_matrices_recruited += len(candidates)
+                        branches_tested += len(candidates)
+                    except Exception as e:
+                        self.logger.debug(f"Lazy expand failed: {e}")
+                if not candidates:
+                    break
             
             # Branch & Bound
             best_p = prev_p
@@ -362,8 +576,10 @@ class TarsMamba2LM(nn.Module):
             "final_p": ia_result["p"],
             "r_squared": ia_result.get("r_squared", 0),
             "converged": ia_result["converged"],
+            "converged_early": converged_early,
             "total_blocks": self.n_layers,
             "blocks_executed": blocks_executed,
+            "waves": wave_count,
             "estimated_depth": estimated_depth,
             "expansion_rounds": expansion_round,
             "matrices_recruited": total_matrices_recruited,
@@ -372,6 +588,7 @@ class TarsMamba2LM(nn.Module):
             "branches_won": len(branches_won),
             "active_experts": active_experts,
             "hankel_collapses": self.hankel.collapse_count,
+            "surprise_layers": len(surprise_signals),
             "rwkv_state_size_mb": (wkv_state.numel() * 4 / 1024 / 1024) if wkv_state is not None else 0,
             "total_ms": total_time,
         }

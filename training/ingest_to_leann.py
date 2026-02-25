@@ -221,9 +221,9 @@ def ingest_all(data_dir: str = None, index_path: str = None,
     logger.info("═" * 60)
     logger.info("  LEANN — Загрузка ВСЕХ данных в векторную память")
     logger.info("═" * 60)
-    print()
+    logger.info("")
     
-    txt_files = sorted(Path(data_dir).glob("*.txt"))
+    txt_files = list(sorted(Path(data_dir).glob("*.txt")))
     
     if not txt_files:
         logger.info("⚠ Нет .txt файлов в data/. Сначала скачайте данные:")
@@ -234,11 +234,11 @@ def ingest_all(data_dir: str = None, index_path: str = None,
     for f in txt_files:
         size_mb = f.stat().st_size / (1024 * 1024)
         logger.info(f"  • {f.name} ({size_mb:.1f} MB)")
-    logger.info()
+    logger.info("")
     
     for f in txt_files:
         ingest_file(str(f), index_path=index_path, chunk_size=chunk_size)
-        logger.info()
+        logger.info("")
     
     # Проверяем итоговый размер
     if os.path.exists(index_path):

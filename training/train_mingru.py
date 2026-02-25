@@ -62,6 +62,7 @@ def parse_args():
     p.add_argument('--lr', type=float, default=3e-3, help="Начальная скорость обучения")
     p.add_argument('--wd', type=float, default=1e-2, help="Weight decay")
     p.add_argument('--augment', action='store_true', help="Скачать доп. данные с HuggingFace")
+    p.add_argument('--max_samples', type=int, default=0, help="Макс. примеров (0 = без ограничений)")
     p.add_argument('--resume', action='store_true', help="Продолжить обучение с чекпоинта")
     p.add_argument('--save_every', type=int, default=10, help="Сохранять чекпоинт каждые N эпох")
     return p.parse_args()
@@ -71,10 +72,16 @@ def parse_args():
 # Подготовка данных
 # ═══════════════════════════════════════════
 
-def prepare_data(text: str, seq_length: int):
+def prepare_data(text: str, seq_length: int, max_samples: int = 0):
     """Нарезает текст на пары (input, target) для next-byte prediction."""
     tokens = tokenize_text(text)
     
+    # Если max_samples задан, ограничиваем длину текста чтобы не делать лишнюю работу
+    if max_samples > 0:
+        max_chars = max_samples * seq_length
+        if len(tokens) > max_chars:
+            tokens = tokens[:max_chars]
+            
     inputs = []
     targets = []
     
@@ -86,56 +93,56 @@ def prepare_data(text: str, seq_length: int):
         if len(inp) == seq_length and len(tgt) == seq_length:
             inputs.append(inp)
             targets.append(tgt)
-    
+        if max_samples > 0 and len(inputs) >= max_samples:
+            break
+            
     return torch.tensor(inputs, dtype=torch.long), torch.tensor(targets, dtype=torch.long)
 
 
 def augment_with_huggingface():
-    """Скачивает дополнительный русский текст c HuggingFace."""
+    """Загружает дополнительный русский текст — сначала из кэша, потом с HuggingFace."""
+    
+    # 1. Сначала проверяем кэш data/hf_*.txt (уже скачанные файлы)
+    hf_dir = ROOT / "data"
+    cached_texts = []
+    if hf_dir.exists():
+        for hf_file in sorted(hf_dir.glob("hf_*.txt")):
+            try:
+                with open(hf_file, 'r', encoding='utf-8') as f:
+                    text = f.read()
+                if len(text) > 1000:
+                    cached_texts.append(text)
+                    size_kb = len(text.encode('cp1251', errors='replace')) / 1024
+                    print(f"[Augment] Кэш: {hf_file.name} ({size_kb:.0f} KB)")
+            except Exception:
+                pass
+    
+    if cached_texts:
+        result = "\n\n".join(cached_texts)
+        print(f"[Augment] Итого из кэша: {len(result):,} символов")
+        return result
+    
+    # 2. Если кэша нет — скачиваем с HuggingFace
     try:
         from datasets import load_dataset
-        print("[Augment] Загрузка русского текстового датасета из HuggingFace...")
+        print("[Augment] Кэш не найден, загрузка с HuggingFace...")
         
-        # IlyaGusev/ru_turbo_saiga — русские диалоги
         try:
-            ds = load_dataset("IlyaGusev/ru_turbo_saiga", split="train", streaming=True)
+            ds = load_dataset("Den4ikAI/russian_instructions_2", split="train", streaming=True)
             texts = []
             for i, item in enumerate(ds):
                 if i >= 5000:
                     break
-                # Формат: messages → Q&A
-                messages = item.get("messages", [])
-                for msg in messages:
-                    role = msg.get("role", "")
-                    content = msg.get("content", "").strip()
-                    if role == "user" and content:
-                        texts.append(f"Вопрос: {content}")
-                    elif role == "assistant" and content:
-                        texts.append(f"Ответ: {content}")
-                texts.append("")  # разделитель
-            
-            augmented = "\n".join(texts)
-            print(f"[Augment] Загружено {len(augmented)} символов из ru_turbo_saiga")
-            return augmented
-        except Exception as e1:
-            print(f"[Augment] ru_turbo_saiga не доступен: {e1}")
-        
-        # Fallback: любой русский текст
-        try:
-            ds = load_dataset("IlyaGusev/gazeta", split="train", streaming=True)
-            texts = []
-            for i, item in enumerate(ds):
-                if i >= 3000:
-                    break
-                text = item.get("text", "").strip()
-                if text and len(text) > 100:
-                    texts.append(text[:500])  # Обрезаем длинные статьи
+                q = item.get("question", item.get("instruction", "")).strip()
+                a = item.get("answer", item.get("output", "")).strip()
+                if q and a:
+                    texts.append(f"Вопрос: {q}\nОтвет: {a}")
             
             augmented = "\n\n".join(texts)
-            print(f"[Augment] Загружено {len(augmented)} символов из gazeta")
+            print(f"[Augment] Загружено {len(augmented):,} символов из russian_instructions_2")
             return augmented
-        except Exception as e2:
-            print(f"[Augment] gazeta не доступен: {e2}")
+        except Exception as e1:
+            print(f"[Augment] russian_instructions_2: {e1}")
         
         return ""
     except ImportError:
@@ -209,17 +216,16 @@ def train(args):
     corpus = "\n\n".join(corpus_parts)
     
     # Повторяем маленький корпус для лучшего обучения
-    corpus_bytes = len(corpus.encode('utf-8'))
+    corpus_bytes = len(corpus.encode('cp1251', errors='replace'))
     if corpus_bytes < 100_000:
-        # Повторяем корпус чтобы было хотя бы 100KB для стабильного обучения
         repeat = max(1, 100_000 // corpus_bytes)
         corpus = ("\n\n" + corpus) * repeat
         print(f"[Data] Корпус повторён {repeat}x для стабильности")
     
-    print(f"[Data] Итоговый корпус: {len(corpus)} символов, {len(corpus.encode('utf-8'))} байт")
+    print(f"[Data] Итоговый корпус: {len(corpus)} символов, {corpus_bytes} байт (cp1251)")
     
     # ═══ Подготовка тензоров ═══
-    inputs, targets = prepare_data(corpus, args.seq_len)
+    inputs, targets = prepare_data(corpus, args.seq_len, max_samples=args.max_samples)
     print(f"[Data] Создано {len(inputs)} обучающих примеров (seq_len={args.seq_len})")
     
     if len(inputs) < 4:

@@ -60,13 +60,13 @@ PRESETS = {
     # ─── Харизма, шутки, русские диалоги ───
     "chat": [
         {
-            "name": "IlyaGusev/ru_turbo_alpaca",
-            "desc": "50K+ русских инструкций и ответов",
+            "name": "Vikhrmodels/ru_turbo_saiga",
+            "desc": "50K+ русских инструкций и ответов (Saiga)",
             "count": 50000,
-            "format": "instruct",
+            "format": "chat",
         },
         {
-            "name": "IlyaGusev/ru_sharegpt_cleaned",
+            "name": "ai-forever/ru_sharegpt",
             "desc": "Диалоги людей с ChatGPT (русские)",
             "count": 20000,
             "format": "sharegpt",
@@ -92,9 +92,15 @@ PRESETS = {
     # ─── Instruction tuning (основа) ───
     "instruct": [
         {
-            "name": "IlyaGusev/ru_turbo_alpaca",
+            "name": "Vikhrmodels/ru_turbo_saiga",
             "desc": "50K+ русских инструкций (основной датасет)",
             "count": 50000,
+            "format": "chat",
+        },
+        {
+            "name": "Den4ikAI/russian_instructions_2",
+            "desc": "Русские инструкции для ИИ",
+            "count": 20000,
             "format": "instruct",
         },
     ],
@@ -106,9 +112,17 @@ def format_row(row: dict, fmt: str) -> str:
     
     # Формат Alpaca / Instruct
     if fmt == "instruct":
-        inst = row.get("instruction", row.get("prompt", "")).strip()
-        inp = row.get("input", row.get("context", "")).strip()
-        out = row.get("output", row.get("response", row.get("completion", ""))).strip()
+        inst = row.get("instruction", row.get("prompt", row.get("question", "")))
+        if not isinstance(inst, str): inst = str(inst) if inst else ""
+        inst = inst.strip()
+        
+        inp = row.get("input", row.get("context", ""))
+        if not isinstance(inp, str): inp = str(inp) if inp else ""
+        inp = inp.strip()
+        
+        out = row.get("output", row.get("response", row.get("completion", row.get("answer", ""))))
+        if not isinstance(out, str): out = str(out) if out else ""
+        out = out.strip()
         
         if not inst and not out:
             return ""
@@ -134,8 +148,17 @@ def format_row(row: dict, fmt: str) -> str:
     if fmt == "chat":
         messages = row.get("messages", row.get("conversations", []))
         if not messages:
+            # Special parsing for glaive function calling dataset which has system/chat as strings
+            if "chat" in row and isinstance(row["chat"], str):
+                system_prompt = row.get("system", "").strip()
+                chat_str = row["chat"].strip()
+                if system_prompt:
+                    return f"Система: {system_prompt}\nДиалог:\n{chat_str}"
+                return f"Диалог:\n{chat_str}"
+                
             # Fallback: text field
             return row.get("text", row.get("content", "")).strip()
+        
         dialog = []
         for msg in messages:
             role = msg.get("role", msg.get("from", "user"))
@@ -191,9 +214,9 @@ def download_one_dataset(ds_config: dict, output_dir: str) -> str:
         # Загрузка
         subsets = ds_config.get("subsets", [])
         if subsets:
-            ds = load_dataset(name, subsets[0], split="train", streaming=False, trust_remote_code=True)
+            ds = load_dataset(name, subsets[0], split="train", streaming=False)
         else:
-            ds = load_dataset(name, split="train", streaming=False, trust_remote_code=True)
+            ds = load_dataset(name, split="train", streaming=False)
         
         if len(ds) > count:
             ds = ds.select(range(count))

@@ -150,8 +150,8 @@ def verify():
 
     # 7. MoLE
     try:
-        from brain.mole import MoleManager
-        results["MoLE"] = "✅ 8 experts"
+        from brain.mamba2.mole_router import MoLELayer
+        results["MoLE"] = "✅ 8 experts (MoLELayer)"
     except Exception as e:
         results["MoLE"] = f"⚠️  {e}"
 
@@ -187,30 +187,11 @@ def verify():
 # ═══════════════════════════════════════════
 
 # Русский алфавит + символы (для читаемого вывода даже без обучения)
-CHARSET = (
-    " абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
-    "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
-    "abcdefghijklmnopqrstuvwxyz"
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    "0123456789.,!?;:()-—\"'«»\n"
-)
-
-class CharTokenizer:
-    """
-    Посимвольный токенизатор (char-level).
-    Каждый символ = 1 токен. Vocab = len(charset) + 1.
-    """
-    def __init__(self, charset=CHARSET):
-        self.char2id = {ch: i + 1 for i, ch in enumerate(charset)}
-        self.id2char = {i + 1: ch for i, ch in enumerate(charset)}
-        self.eos_token_id = 0
-        self.vocab_size = len(charset) + 1  # +1 для EOS/PAD (id=0)
-
-    def encode(self, text: str) -> list:
-        return [self.char2id.get(ch, 1) for ch in text]
-
-    def decode(self, ids: list) -> str:
-        return "".join(self.id2char.get(i, "") for i in ids if i != 0)
+# ═══════════════════════════════════════
+# Токенизатор — ЕДИНЫЙ для всех моделей
+# ═══════════════════════════════════════
+# Убран CharTokenizer(vocab=145) — заменён на cp1251 ByteTokenizer(vocab=256)
+from brain.tokenizer import TarsTokenizer
 
 
 def run_cli():
@@ -230,17 +211,21 @@ def run_cli():
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"  Device: {device}")
 
-        # Токенизатор
-        tokenizer = CharTokenizer()
-        print(f"  Tokenizer: CharTokenizer (vocab={tokenizer.vocab_size}, chars={tokenizer.vocab_size - 1})")
+        # Токенизатор — cp1251 byte-level (vocab=256)
+        tokenizer = TarsTokenizer()
+        print(f"  Tokenizer: {tokenizer}")
 
-        # Модель — vocab_size ТОЧНО совпадает с токенизатором
-        model = TarsMamba2LM(
-            d_model=256, n_layers=4, vocab_size=tokenizer.vocab_size, mingru_dim=128
-        ).to(device)
+        # Модель — из config.json + загрузка обученных весов
+        model, checkpoint = TarsMamba2LM.load_pretrained(device=device)
         model.eval()
         total_params = sum(p.numel() for p in model.parameters())
-        print(f"  Model: Mamba-2 LM ({total_params:,} params, UNTRAINED)")
+        
+        if checkpoint:
+            print(f"  Model: Mamba-2 LM ({total_params:,} params)")
+            print(f"  Weights: {checkpoint}")
+        else:
+            print(f"  Model: Mamba-2 LM ({total_params:,} params, UNTRAINED)")
+            print(f"  ⚠️  Обучите: python training/train_mamba2.py")
 
         core = get_omega_core()
         print(f"  OmegaCore: {'C++ DLL' if core.available else 'Python fallback'}")
@@ -248,9 +233,7 @@ def run_cli():
         # ═══ Reflex Dispatcher (Спинной мозг) ═══
         dispatcher = ReflexDispatcher(memory=None, max_workers=6)
         print(f"  Reflexes: {len(dispatcher.sensors)} sensors (parallel ThreadPool)")
-        
-        print(f"\n  ⚠️  Модель НЕ обучена — вывод случайный!")
-        print(f"  Обучите: python training/train_mamba2.py\n")
+        print()
 
         gen = TarsGenerator(model, tokenizer, omega_core=core)
         config = GenerationConfig(max_tokens=64, temperature=0.9, top_k=40, top_p=0.92)

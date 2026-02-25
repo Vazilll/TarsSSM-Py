@@ -2,7 +2,7 @@
 # Requires: Zig 0.16+ (as C++ compiler only)
 # Output: omega_core.dll (Windows) / libomega_core.so (Linux)
 
-$ZIG = "C:\Users\Public\Tarsfull\tools\zig-x86_64-windows-0.16.0\zig.exe"
+$ZIG = "zig"
 $CORE_DIR = $PSScriptRoot
 
 Write-Host "`n--- TARS OmegaCore: Pure C++ Build ---" -ForegroundColor Cyan

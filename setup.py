@@ -64,20 +64,30 @@ def run_cmd(cmd, desc="", check=True, capture=False):
     """Запускает команду с описанием."""
     if desc:
         info(desc)
-    try:
-        result = subprocess.run(
-            cmd, shell=isinstance(cmd, str),
-            capture_output=capture, text=True,
-            check=check
-        )
-        return result
-    except subprocess.CalledProcessError as e:
-        if capture:
-            warn(f"Команда вернула ошибку: {e.stderr[:200] if e.stderr else ''}")
-        return e
-    except FileNotFoundError:
-        warn(f"Команда не найдена: {cmd[0] if isinstance(cmd, list) else cmd}")
-        return None
+    
+    # Retry logic for Windows PermissionError (Antivirus locks)
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            result = subprocess.run(
+                cmd, shell=isinstance(cmd, str),
+                capture_output=capture, text=True,
+                check=check
+            )
+            return result
+        except PermissionError as e:
+            if attempt < max_retries - 1:
+                time.sleep(2.0)
+                continue
+            warn(f"Ошибка доступа (WinError 5): {e}")
+            return None
+        except subprocess.CalledProcessError as e:
+            if capture:
+                warn(f"Команда вернула ошибку: {e.stderr[:200] if e.stderr else ''}")
+            return e
+        except FileNotFoundError:
+            warn(f"Команда не найдена: {cmd[0] if isinstance(cmd, list) else cmd}")
+            return None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -130,18 +140,15 @@ def install_dependencies(use_gpu=False):
         core_deps.append("torch")
     
     # Устанавливаем core
-    for dep in core_deps:
-        run_cmd(f"{python} -m pip install {dep}", f"Установка {dep}...", check=False)
+    run_cmd(f"{python} -m pip install {' '.join(core_deps)}", "Установка базовых библиотек (core)...", check=False)
     
     # Голос (STT/TTS)
     voice_deps = ["faster-whisper", "sounddevice"]
-    for dep in voice_deps:
-        run_cmd(f"{python} -m pip install {dep}", f"Установка {dep}...", check=False)
+    run_cmd(f"{python} -m pip install {' '.join(voice_deps)}", "Установка библиотек голоса...", check=False)
     
     # RAG и обучение
     ml_deps = ["sentence-transformers", "datasets"]
-    for dep in ml_deps:
-        run_cmd(f"{python} -m pip install {dep}", f"Установка {dep}...", check=False)
+    run_cmd(f"{python} -m pip install {' '.join(ml_deps)}", "Установка библиотек ML...", check=False)
     
     # Опционально
     optional = ["onnxruntime", "pyttsx3"]
@@ -195,7 +202,7 @@ def download_models():
             result = run_cmd(
                 f'{python} -c "from sentence_transformers import SentenceTransformer; '
                 f"m = SentenceTransformer('all-MiniLM-L6-v2'); "
-                f"m.save('{str(emb_dir)}')" + '"',
+                f"m.save('{emb_dir.as_posix()}')" + '"',
                 check=False
             )
             if (emb_dir / "config.json").exists():

@@ -71,11 +71,19 @@ class TarsBlock(nn.Module):
         self.rag_query = UniversalLinear(d_model, d_state, bias=False, mode=quant_mode)
         self.rag_out = UniversalLinear(d_state, d_model, bias=False, mode=quant_mode)
         
-        # ═══ 6. Memory injection (LEANN) ═══
+        # ═══ 6. Dynamic Memory Injection (вместо статичного 0.05) ═══
+        # Проекция h → пространство памяти для динамического запроса
+        self.mem_query_proj = UniversalLinear(d_model, 384, bias=False, mode=quant_mode)
         self.mem_proj = UniversalLinear(384, d_model, bias=False, mode=quant_mode)
+        # Обучаемый гейт: насколько сильно слой использует память
+        self.mem_gate = nn.Sequential(
+            nn.Linear(d_model + 384, 1),
+            nn.Sigmoid(),
+        )
         
         # Stats
         self.last_stats = {}
+        self.last_surprise = 0.0  # Для Titans feedback
     
     def forward(
         self,
@@ -106,7 +114,6 @@ class TarsBlock(nn.Module):
         
         # ═══ RAG injection ═══
         if rag_state is not None:
-            # Кэшируем x.mean — переиспользуем ниже
             h_mean = x.mean(dim=1)                                    # [B, d_model]
             q = self.rag_query(h_mean)                                # [B, d_state]
             info = torch.bmm(rag_state, q.unsqueeze(-1)).squeeze(-1)  # [B, d_state]
@@ -122,19 +129,37 @@ class TarsBlock(nn.Module):
         h_old = residual.mean(dim=1)                             # [B, d_model]
         h_new = x.mean(dim=1)                                    # [B, d_model]
         _, novelty = self.novelty_gate(h_old, h_new)             # novelty: [B]
-        # novelty ∈ (0,1): high = keep update, low = revert to residual
         n = novelty.unsqueeze(-1).unsqueeze(-1)                  # [B, 1, 1]
         x = n * x + (1 - n) * residual
         
-        # ═══ 5. Memory injection ═══
+        # ═══ 5. Dynamic Memory Injection (спинной мозг → кора) ═══
+        # Каждый слой САМОСТОЯТЕЛЬНО запрашивает память через своё
+        # текущее скрытое состояние, а не через один статичный вектор.
+        mem_relevance = 0.0
         if memory_vec is not None:
-            x = x + 0.05 * self.mem_proj(memory_vec).unsqueeze(1)
+            h_mean = x.mean(dim=1)                                    # [B, d_model]
+            # Проецируем текущее состояние слоя в пространство памяти
+            h_query = self.mem_query_proj(h_mean)                     # [B, 384]
+            # Вычисляем релевантность: косинусное сходство + гейт
+            similarity = F.cosine_similarity(h_query, memory_vec, dim=-1)  # [B]
+            gate_input = torch.cat([h_mean, memory_vec], dim=-1)      # [B, d_model+384]
+            gate = self.mem_gate(gate_input).squeeze(-1)              # [B]
+            # Итоговая сила инъекции = similarity × gate
+            mem_strength = (similarity * gate).unsqueeze(-1).unsqueeze(-1)  # [B, 1, 1]
+            mem_signal = self.mem_proj(memory_vec).unsqueeze(1)       # [B, 1, d_model]
+            x = x + mem_strength * mem_signal
+            mem_relevance = similarity.mean().item()
+            # Surprise для Titans: чем больше гейт открыт, тем больше
+            # информации было нужно — значит модель «удивлена»
+            self.last_surprise = gate.mean().item()
         
-        # Stats (без повторного forward — используем cached данные)
+        # Stats
         self.last_stats = {
             "layer_idx": self.layer_idx,
             "novelty": novelty.mean().item() if isinstance(novelty, torch.Tensor) else novelty,
             "has_rag": rag_state is not None,
+            "mem_relevance": mem_relevance,
+            "surprise": self.last_surprise,
         }
         
         return x, wkv_state, x_prev, self.last_stats

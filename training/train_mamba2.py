@@ -35,21 +35,34 @@ from brain.mamba2.model import TarsMamba2LM
 
 def parse_args():
     p = argparse.ArgumentParser(description="ТАРС Mamba-2 + RWKV-7 Training (Deep WuNeng Core)")
-    p.add_argument('--d_model', type=int, default=256)
-    p.add_argument('--n_layers', type=int, default=4)
-    p.add_argument('--vocab_size', type=int, default=32000)
-    p.add_argument('--seq_len', type=int, default=512)
-    p.add_argument('--batch', type=int, default=16)
-    p.add_argument('--epochs', type=int, default=3)
+    # ═══ Model params (из config.json) ═══
+    p.add_argument('--d_model', type=int, default=768)
+    p.add_argument('--n_layers', type=int, default=12)
+    p.add_argument('--vocab_size', type=int, default=256)  # cp1251 bytes
+    # ═══ Training params ═══
+    p.add_argument('--seq_len', type=int, default=256)
+    p.add_argument('--batch', type=int, default=8)
+    p.add_argument('--accum_steps', type=int, default=4,
+                   help="Gradient accumulation steps (effective batch = batch × accum)")
+    p.add_argument('--epochs', type=int, default=5)
     p.add_argument('--lr', type=float, default=3e-4)
+    p.add_argument('--label_smoothing', type=float, default=0.1)
     p.add_argument('--phase', type=int, default=1, 
                    help="1=pretrain all, 2=WKV+Fusion (freeze SSD), 3=MoLE+Pool, 4=WKV RAG")
+    p.add_argument('--curriculum', action='store_true', default=True,
+                   help="Enable curriculum learning (short→long sequences)")
     p.add_argument('--resume', action='store_true')
     p.add_argument('--pretrained', type=str, default=None, help="Путь к весам для дообучения")
     p.add_argument('--data', type=str, default=None, help="Путь к текстовому корпусу (.txt)")
     p.add_argument('--device', type=str, default='auto', help="cpu/cuda/auto")
     p.add_argument('--quant', action='store_true', help="Обучать в 1.58-bit режиме (BitNet STE)")
     p.add_argument('--save_dir', type=str, default='models/mamba2')
+    p.add_argument('--max_samples', type=int, default=0,
+                   help="Максимум обучающих примеров (0 = без ограничений)")
+    p.add_argument('--pretrained_emb', type=str, default=None,
+                   help="Путь к предобученному эмбеддингу (из MinGRU)")
+    p.add_argument('--no_compile', action='store_true',
+                   help="Отключить torch.compile")
     return p.parse_args()
 
 
@@ -95,7 +108,7 @@ def load_corpus(data_path=None, download_wiki=True):
         try:
             sys.path.insert(0, str(ROOT / "training"))
             from download_wiki import download_corpus
-            wiki_text = download_corpus(count=100000)
+            wiki_text = download_corpus(count=10000)
             if wiki_text:
                 parts.append(wiki_text)
                 wiki_mb = len(wiki_text.encode('utf-8')) / (1024 * 1024)
@@ -144,13 +157,19 @@ def load_corpus(data_path=None, download_wiki=True):
     return corpus
 
 
-def prepare_byte_data(text: str, seq_len: int, vocab_size: int = 32000):
+def prepare_byte_data(text: str, seq_len: int, vocab_size: int = 32000, max_samples: int = 0):
     """
     Подготовка данных для byte-level обучения.
     Для полной модели нужен SentencePiece tokenizer,
-    но для начала используем byte-level (vocab=256, pad до vocab_size).
+    но для начала используем byte-level (vocab=256, кириллица через cp1251).
     """
-    tokens = list(text.encode('utf-8'))
+    tokens = list(text.encode('cp1251', errors='replace'))
+    
+    # Если max_samples задан, ограничиваем длину текста
+    if max_samples > 0:
+        max_chars = max_samples * seq_len
+        if len(tokens) > max_chars:
+            tokens = tokens[:max_chars]
     
     inputs = []
     targets = []
@@ -162,6 +181,8 @@ def prepare_byte_data(text: str, seq_len: int, vocab_size: int = 32000):
         if len(inp) == seq_len and len(tgt) == seq_len:
             inputs.append(inp)
             targets.append(tgt)
+        if max_samples > 0 and len(inputs) >= max_samples:
+            break
     
     return (
         torch.tensor(inputs, dtype=torch.long),
@@ -217,15 +238,9 @@ def train(args):
     else:
         print("[CPU] GPU не используется")
     
-    # Данные
+    # Данные (корпус загружается 1 раз, токенизация — по curriculum)
     corpus = load_corpus(data_path=args.data)
-    inputs, targets = prepare_byte_data(corpus, args.seq_len, args.vocab_size)
-    print(f"[Data] {len(inputs)} примеров (seq_len={args.seq_len})")
-    
-    # Разделение
-    n_test = max(2, len(inputs) // 10)
-    train_in, test_in = inputs[:-n_test], inputs[-n_test:]
-    train_tgt, test_tgt = targets[:-n_test], targets[-n_test:]
+    print(f"[Data] Корпус загружен ({len(corpus):,} символов)")
     
     # ═══════════════════════════════════════════════════════════
     # Модель: 3-шаговый пайплайн
@@ -261,6 +276,25 @@ def train(args):
         model.load_state_dict(checkpoint['model_state_dict'], strict=False)
     
     model.to(device)
+    
+    # ── Transfer pre-trained embedding from MinGRU ──
+    if args.pretrained_emb and os.path.exists(args.pretrained_emb):
+        print(f"\n[🔗 Transfer] Загрузка предобученного эмбеддинга из MinGRU...")
+        try:
+            mingru_emb = torch.load(args.pretrained_emb, map_location=device)
+            if mingru_emb.shape[0] == actual_vocab:
+                # MinGRU dim might differ from Mamba-2 d_model
+                if mingru_emb.shape[1] == args.d_model:
+                    # Perfect match — direct copy
+                    model.embedding.weight.data.copy_(mingru_emb)
+                    print(f"  ✔ Прямой перенос ({mingru_emb.shape})")
+                else:
+                    # Dimension mismatch — use projection (truncate or pad)
+                    min_dim = min(mingru_emb.shape[1], args.d_model)
+                    model.embedding.weight.data[:, :min_dim] = mingru_emb[:, :min_dim]
+                    print(f"  ✔ Частичный перенос ({mingru_emb.shape} → {model.embedding.weight.shape})")
+        except Exception as e:
+            print(f"  ⚠ Embedding transfer failed: {e}")
     
     params = model.count_parameters()
     total = params["total"]
@@ -372,55 +406,99 @@ def train(args):
     print(f"  Epochs: {args.epochs} | Batch: {args.batch} | LR: {args.lr}")
     print(f"{'═'*60}\n")
     
+    # ═══ torch.compile (30-50% ускорение) ═══
+    if hasattr(torch, 'compile') and not args.no_compile and device.type == 'cuda':
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            print("  ⚡ torch.compile enabled (reduce-overhead mode)")
+        except Exception as e:
+            print(f"  ⚠ torch.compile failed: {e}")
+    
+    # ═══ Curriculum Learning ═══
+    curriculum_schedule = None
+    if args.curriculum and args.epochs >= 3:
+        # Постепенно увеличиваем seq_len: 64 → 128 → 256 → target
+        max_sl = args.seq_len
+        steps = [max(64, max_sl // 4), max(128, max_sl // 2), max_sl]
+        epoch_per_step = max(1, args.epochs // len(steps))
+        curriculum_schedule = []
+        for sl in steps:
+            curriculum_schedule.extend([sl] * epoch_per_step)
+        while len(curriculum_schedule) < args.epochs:
+            curriculum_schedule.append(max_sl)
+        print(f"  📚 Curriculum: {' → '.join(str(s) for s in dict.fromkeys(curriculum_schedule))}")
+    
+    accum_steps = max(1, args.accum_steps)
+    print(f"  Effective batch: {args.batch} × {accum_steps} = {args.batch * accum_steps}")
+    
     for epoch in range(args.epochs):
         t0 = time.time()
         model.train()
         total_loss = 0
         n_batches = 0
+        tokens_processed = 0
         
-        perm = torch.randperm(len(train_in))
-        train_in_s = train_in[perm]
-        train_tgt_s = train_tgt[perm]
+        # Curriculum: пересоздать данные с новым seq_len
+        cur_seq_len = curriculum_schedule[epoch] if curriculum_schedule else args.seq_len
+        if epoch == 0 or (curriculum_schedule and cur_seq_len != curriculum_schedule[max(0, epoch-1)]):
+            c_inputs, c_targets = prepare_byte_data(corpus, cur_seq_len, actual_vocab, max_samples=args.max_samples)
+            n_test_c = max(2, len(c_inputs) // 10)
+            c_train_in, c_test_in = c_inputs[:-n_test_c], c_inputs[-n_test_c:]
+            c_train_tgt, c_test_tgt = c_targets[:-n_test_c], c_targets[-n_test_c:]
+            print(f"  seq_len={cur_seq_len}, samples={len(c_train_in)}")
+        
+        perm = torch.randperm(len(c_train_in))
+        train_in_s = c_train_in[perm]
+        train_tgt_s = c_train_tgt[perm]
+        
+        optimizer.zero_grad()
         
         for i in range(0, len(train_in_s), args.batch):
             batch_in = train_in_s[i:i+args.batch].to(device)
             batch_tgt = train_tgt_s[i:i+args.batch].to(device)
-            
-            optimizer.zero_grad()
             
             if use_amp:
                 with torch.amp.autocast('cuda'):
                     logits = model(batch_in)
                     loss = F.cross_entropy(
                         logits.view(-1, actual_vocab),
-                        batch_tgt.view(-1)
-                    )
+                        batch_tgt.view(-1),
+                        label_smoothing=args.label_smoothing,
+                    ) / accum_steps
                 scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
             else:
                 logits = model(batch_in)
                 loss = F.cross_entropy(
                     logits.view(-1, actual_vocab),
-                    batch_tgt.view(-1)
-                )
+                    batch_tgt.view(-1),
+                    label_smoothing=args.label_smoothing,
+                ) / accum_steps
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
             
-            scheduler.step()
-            total_loss += loss.item()
+            total_loss += loss.item() * accum_steps
             n_batches += 1
+            tokens_processed += batch_in.numel()
+            
+            # Gradient accumulation step
+            if n_batches % accum_steps == 0 or i + args.batch >= len(train_in_s):
+                if use_amp:
+                    scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                if use_amp:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad()
+                scheduler.step()
         
         # Eval
         model.eval()
         with torch.no_grad():
             eval_losses = []
-            for j in range(0, len(test_in), args.batch):
-                test_batch = test_in[j:j+args.batch].to(device)
-                test_tgt_batch = test_tgt[j:j+args.batch].to(device)
+            for j in range(0, len(c_test_in), args.batch):
+                test_batch = c_test_in[j:j+args.batch].to(device)
+                test_tgt_batch = c_test_tgt[j:j+args.batch].to(device)
                 logits = model(test_batch)
                 el = F.cross_entropy(
                     logits.view(-1, actual_vocab),
@@ -431,11 +509,12 @@ def train(args):
         
         elapsed = time.time() - t0
         ppl = np.exp(min(eval_loss, 20))
+        tok_per_sec = tokens_processed / max(elapsed, 0.01)
         
         print(f"Epoch {epoch+1}/{args.epochs} | "
               f"Train: {total_loss/max(n_batches,1):.4f} | "
               f"Eval: {eval_loss:.4f} | PPL: {ppl:.1f} | "
-              f"{elapsed:.1f}s")
+              f"{tok_per_sec:.0f} tok/s | {elapsed:.1f}s")
         
         # Save best
         if eval_loss < best_loss:

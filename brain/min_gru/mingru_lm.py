@@ -42,10 +42,14 @@ class RMSNorm(nn.Module):
         return F.normalize(x, dim=-1) * self.scale * (self.gamma + 1)
 
 class MinGRU_Layers(nn.Module):
-    def __init__(self, dim, num_tokens):
+    def __init__(self, dim, num_tokens, shared_emb=None):
         super().__init__()
-        self.emb = nn.Embedding(num_tokens, dim)
-        self.casual_depth = CausalDepthWiseConv1d(dim=dim,kernel_size=3)
+        # Используем общий эмбеддинг если передан, иначе создаём свой
+        if shared_emb is not None:
+            self.emb = shared_emb
+        else:
+            self.emb = nn.Embedding(num_tokens, dim)
+        self.casual_depth = CausalDepthWiseConv1d(dim=dim, kernel_size=3)
         self.rms_norm = RMSNorm(dim)
         self.gru = MinGRU(dim)
         self.ff = FeedForward(dim)
@@ -86,7 +90,19 @@ class MinGRU_LM(nn.Module):
     def __init__(self, dim, num_tokens, num_layers, context_dim=1024):
         super().__init__()
         self.dim = dim
-        self.layers = nn.ModuleList([MinGRU_Layers(dim, num_tokens) for _ in range(num_layers)])
+        
+        # ═══ Единый эмбеддинг для всех слоёв (экономия памяти в num_layers раз) ═══
+        self.shared_embedding = nn.Embedding(num_tokens, dim)
+        
+        self.layers = nn.ModuleList([
+            MinGRU_Layers(dim, num_tokens, shared_emb=self.shared_embedding)
+            for _ in range(num_layers)
+        ])
+        
+        # Тайным весом привязываем lm_head к эмбеддингу (weight tying)
+        # Каждый слой уже имеет to_logits, но мы привязываем первый к shared_embedding
+        self.layers[0].to_logits.weight = self.shared_embedding.weight
+        
         # Проекция контекста из Ω-SSM (1024-dim) → MinGRU hidden (256-dim)
         self.context_proj = nn.Linear(context_dim, dim)
 
@@ -124,3 +140,4 @@ class MinGRU_LM(nn.Module):
         if labels is not None:
             return total_loss / len(self.layers), logits
         return logits
+
