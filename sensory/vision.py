@@ -38,6 +38,20 @@ class TarsVision:
             return results[0].boxes.data.tolist() 
         return []
 
+    async def extract_text(self, frame):
+        """ Чтение текста с экрана (OCR). Аналог ocr.rs """
+        try:
+            import pytesseract
+            # Использование OCR (Tesseract)
+            text = pytesseract.image_to_string(frame, lang='rus+eng')
+            return text.strip()
+        except ImportError:
+            self.logger.warning("Vision: pytesseract не установлен. OCR отключен.")
+            return ""
+        except Exception as e:
+            self.logger.error(f"Vision OCR Error: {e}")
+            return ""
+
     async def analyze_workspace(self):
         """ Комплексный анализ экрана для GIE агента. """
         frame = self.capture_screen()
@@ -45,9 +59,11 @@ class TarsVision:
             return {"status": "error", "message": "Не удалось захватить экран"}
         
         detections = await self.detect_objects(frame)
+        text_content = await self.extract_text(frame)
         
         return {
             "status": "online",
             "det_count": len(detections),
-            "summary": f"Обнаружено {len(detections)} UI-элементов."
+            "text": text_content[:500] + "..." if len(text_content) > 500 else text_content,
+            "summary": f"Обнаружено {len(detections)} UI-элементов. Текст с экрана: {text_content[:100]}..."
         }

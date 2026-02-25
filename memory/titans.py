@@ -5,11 +5,15 @@ import logging
 
 class LongTermMemory(nn.Module):
     """
-    Нейронная долговременная память (LTM Layer).
-    Знания 'запекаются' прямо в веса.
+    Нейронная Долговременная Память (Neural LTM Layer).
+    
+    В отличие от LEANN (где знания лежат в базе), здесь знания 'запекаются'
+    в сами веса нейронов. Это аналог человеческой памяти, где информация
+    меняет структуру синапсов.
     """
     def __init__(self, dim=1024):
         super().__init__()
+        # Двухслойный скрытый базис для хранения ассоциаций.
         self.layer1 = nn.Linear(dim, dim * 2)
         self.silu = nn.SiLU()
         self.layer2 = nn.Linear(dim * 2, dim)
@@ -21,37 +25,46 @@ class LongTermMemory(nn.Module):
 
 class TitansMemory:
     """
-    Память Titans (Deep implementation).
-    Использует Surprise-based learning для вечной адаптации.
+    Реализация памяти Titans.
+    
+    Ключевая особенность: Surprise-Based Learning (Обучение на основе удивления).
+    Пока входящие данные предсказуемы (ошибка мала), модель ничего не учит.
+    Но если система встречает нечто новое и неожиданное (сюрприз выше порога),
+    она моментально запускает цикл градиентного обучения, чтобы 'запомнить' этот факт.
     """
     def __init__(self, dim=1024, learning_rate=2e-4):
         self.ltm = LongTermMemory(dim)
+        # Оптимизатор Adam позволяет быстро корректировать веса 'на лету'.
         self.optimizer = optim.Adam(self.ltm.parameters(), lr=learning_rate)
-        self.criteria = nn.HuberLoss() # Более стабильна чем MSE
+        self.criteria = nn.HuberLoss() # Устойчива к выбросам (аномалиям).
         self.logger = logging.getLogger("Tars.Titans")
+        
+        # Порог удивления. Если ошибка предсказания выше 0.45 — факт считается важным.
         self.surprise_threshold = 0.45
 
     async def get_recall(self, context_embedding: torch.Tensor):
-        """ Извлечение знаний на основе текущего контекста. """
+        """ Извлечение (вспоминание) знаний на основе текущей ситуации. """
         with torch.no_grad():
             recall = self.ltm(context_embedding)
         return recall
 
     async def update(self, entry_embedding: torch.Tensor):
         """
-        Обновление весов памяти при высоком уровне 'сюрприза'.
+        Динамическое обновление весов памяти. 
+        TARS обучается каждую секунду, если видит что-то новое.
         """
-        # 1. Предсказание на основе текущих весов
+        # 1. Проверяем, насколько текущая память справляется с новыми данными.
         prediction = self.ltm(entry_embedding)
         
-        # 2. Вычисление ошибки (сюрприза)
+        # 2. Оцениваем 'уровень удивления' (метрика L2).
         with torch.no_grad():
             loss_val = torch.norm(entry_embedding - prediction).item()
         
         if loss_val > self.surprise_threshold:
-            self.logger.info(f"Titans: Сюрприз ({loss_val:.3f}) > порога. Изучаю новые данные...")
+            self.logger.info(f"Titans: Сюрприз! ({loss_val:.3f}). Консолидация новых знаний...")
             
-            # 3. Цикл быстрой консолидации (3 шага градиента)
+            # 3. Быстрая консолидация (Fast Weight Update).
+            # Мы делаем 3 итерации обучения прямо в рантайме.
             for _ in range(3):
                 self.optimizer.zero_grad()
                 pred = self.ltm(entry_embedding)

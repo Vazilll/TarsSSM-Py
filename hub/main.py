@@ -9,7 +9,10 @@ from agent.moira import MoIRA
 from memory.leann import TarsMemory
 from memory.titans import TitansMemory
 from memory.store import TarsStorage
-from brain.aussm import TarsBrain
+try:
+    from brain.mamba2.model import TarsMamba2LM as TarsBrain
+except ImportError:
+    TarsBrain = None
 from sensory.vision import TarsVision
 from sensory.voice import TarsVoice
 
@@ -69,15 +72,24 @@ async def telemetry(websocket: WebSocket):
         await websocket.send_json({
             "vision": v_data,
             "brain": {
-                "recursive_loops": 4,
-                "confidence_gate": 0.98
+                "model_loaded": brain.llm is not None,
+                "recursive_loops": brain.n_loops,
+                "has_cpp_kernels": hasattr(brain, 'layers'),
+            },
+            "rrn": {
+                "working_memory_size": len(gie.rrn.working_memory),
+                "llm_loaded": gie.rrn.llm is not None,
             },
             "memory": {
-                "titans_surprise": 0.12,
-                "ltm_status": "consolidated"
+                "leann_docs": len(memory.leann.texts),
+                "storage_entries": len(storage.local_memories) if hasattr(storage, 'local_memories') else 0,
+            },
+            "session": {
+                "goals_processed": gie.state["total_processed"],
+                "history_size": len(gie.state["history"]),
             }
         })
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(1.0)
 
 app.mount("/", StaticFiles(directory="hub/static", html=True), name="static")
 
