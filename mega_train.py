@@ -161,13 +161,70 @@ def get_ram_gb():
 #  ФАЗА 0: УСТАНОВКА ЗАВИСИМОСТЕЙ
 # ═════════════════════════════════════════════════════════════════════════
 
+def _detect_cuda_version():
+    """Определяет версию CUDA через nvidia-smi."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            result2 = subprocess.run(
+                ["nvidia-smi"], capture_output=True, text=True, timeout=10
+            )
+            output = result2.stdout
+            import re
+            match = re.search(r'CUDA Version:\s*(\d+)\.(\d+)', output)
+            if match:
+                major = int(match.group(1))
+                minor = int(match.group(2))
+                # PyTorch wheels: cu124 (latest), cu121, cu118
+                # CUDA 13.x обратно совместима с cu124
+                if major >= 13 or (major == 12 and minor >= 4):
+                    return "cu124"
+                elif major == 12:
+                    return "cu121"
+                elif major >= 11:
+                    return "cu118"
+            return "cu124"  # default для новых драйверов
+    except Exception:
+        pass
+    return None
+
+
+def _install_torch_cuda(pip_cmd, cuda_tag, extra_flags=None):
+    """Устанавливает PyTorch с CUDA поддержкой."""
+    extra = extra_flags or []
+    
+    # Проверяем — может torch уже с CUDA?
+    try:
+        import torch
+        if torch.cuda.is_available():
+            logger.info(f"  ✅ torch — уже установлен (CUDA: True)")
+            return
+    except ImportError:
+        pass
+    
+    if cuda_tag:
+        logger.info(f"  📦 Установка PyTorch с CUDA ({cuda_tag})...")
+        torch_url = f"https://download.pytorch.org/whl/{cuda_tag}"
+        run(pip_cmd + ["install", "torch", "--index-url", torch_url, "--quiet", "--force-reinstall"] + extra, check=False)
+    else:
+        logger.info("  📦 Установка PyTorch (CPU)...")
+        run(pip_cmd + ["install", "torch", "--quiet"] + extra, check=False)
+
+
 def phase_0_install():
     """Устанавливает все необходимые пакеты."""
     banner(0, "Установка зависимостей")
     
     global PYTHON
     
-    # ═══ Автоматическое создание venv (PEP 668 fix) ═══
+    cuda_tag = _detect_cuda_version()
+    if cuda_tag:
+        logger.info(f"  🎮 NVIDIA GPU обнаружен, CUDA tag: {cuda_tag}")
+    
+    # ═══ Попытка создания venv (PEP 668 fix) ═══
     venv_dir = ROOT / "venv"
     if sys.platform == "win32":
         venv_python = venv_dir / "Scripts" / "python.exe"
@@ -176,104 +233,40 @@ def phase_0_install():
         venv_python = venv_dir / "bin" / "python"
         venv_pip = venv_dir / "bin" / "pip"
     
+    use_venv = False
     if not venv_python.exists():
         logger.info("  🔧 Создание виртуального окружения (venv)...")
         try:
             subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
             logger.info(f"  ✅ venv создан: {venv_dir}")
+            use_venv = True
         except subprocess.CalledProcessError as e:
-            logger.error(f"  ❌ Не удалось создать venv: {e}")
-            logger.info("  Попытка установки через --break-system-packages...")
-            # Fallback: использовать системный pip с --break-system-packages
-            PYTHON = sys.executable
-            pip_cmd = [PYTHON, "-m", "pip"]
-            packages = [
-                "torch", "numpy", "einops", "tqdm",
-                "sentencepiece", "tokenizers",
-                "sentence-transformers", "datasets", "psutil",
-            ]
-            logger.info("Проверка и установка пакетов...")
-            for pkg in packages:
-                try:
-                    __import__(pkg.replace("-", "_"))
-                    logger.info(f"  ✅ {pkg} — уже установлен")
-                except ImportError:
-                    logger.info(f"  📦 Установка {pkg}...")
-                    run(pip_cmd + ["install", pkg, "--quiet", "--break-system-packages"], check=False)
-            return True
+            logger.warning(f"  ⚠ venv не удалось создать: {e}")
+            logger.info("  💡 Установите: sudo apt install python3.12-venv")
+            logger.info("  Используем системный pip + --break-system-packages")
+    else:
+        use_venv = True
     
-    # Обновляем PYTHON для всего пайплайна
-    PYTHON = str(venv_python)
-    pip_cmd = [str(venv_pip)]
+    if use_venv:
+        PYTHON = str(venv_python)
+        pip_cmd = [str(venv_pip)]
+        extra_flags = []
+    else:
+        PYTHON = sys.executable
+        pip_cmd = [PYTHON, "-m", "pip"]
+        extra_flags = ["--break-system-packages"]
+    
     logger.info(f"  🐍 Python: {PYTHON}")
     
-    # ═══ Определяем версию CUDA для установки PyTorch ═══
-    def _detect_cuda_version():
-        """Определяет версию CUDA через nvidia-smi."""
-        try:
-            result = subprocess.run(
-                ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
-                capture_output=True, text=True, timeout=10
-            )
-            if result.returncode == 0:
-                # nvidia-smi работает → GPU есть, определяем CUDA version
-                result2 = subprocess.run(
-                    ["nvidia-smi"], capture_output=True, text=True, timeout=10
-                )
-                output = result2.stdout
-                # Ищем "CUDA Version: XX.Y"
-                import re
-                match = re.search(r'CUDA Version:\s*(\d+)\.(\d+)', output)
-                if match:
-                    major = int(match.group(1))
-                    minor = int(match.group(2))
-                    # PyTorch wheels: cu124 (latest), cu121, cu118
-                    # CUDA 13.x обратно совместима с cu124
-                    if major >= 13 or (major == 12 and minor >= 4):
-                        return "cu124"
-                    elif major == 12:
-                        return "cu121"
-                    elif major >= 11:
-                        return "cu118"
-                return "cu124"  # default для новых драйверов
-        except Exception:
-            pass
-        return None
-    
-    cuda_tag = _detect_cuda_version()
-    
     # ═══ Установка PyTorch (отдельно, с CUDA) ═══
-    check_torch = [PYTHON, "-c", "import torch; print(torch.cuda.is_available())"]
-    try:
-        r = subprocess.run(check_torch, capture_output=True, text=True, timeout=30)
-        torch_ok = r.returncode == 0
-        torch_has_cuda = "True" in r.stdout
-    except Exception:
-        torch_ok = False
-        torch_has_cuda = False
+    _install_torch_cuda(pip_cmd, cuda_tag, extra_flags)
     
-    if torch_ok and (torch_has_cuda or cuda_tag is None):
-        logger.info(f"  ✅ torch — уже установлен (CUDA: {torch_has_cuda})")
-    else:
-        if cuda_tag:
-            logger.info(f"  📦 Установка PyTorch с CUDA ({cuda_tag})...")
-            torch_url = f"https://download.pytorch.org/whl/{cuda_tag}"
-            run(pip_cmd + ["install", "torch", "--index-url", torch_url, "--quiet"], check=False)
-        else:
-            logger.info("  📦 Установка PyTorch (CPU)...")
-            run(pip_cmd + ["install", "torch", "--quiet"], check=False)
-    
-    # Обязательные пакеты (без torch — уже установлен выше)
+    # Остальные пакеты
     packages = [
-        # Ядро
         "numpy", "einops", "tqdm",
-        # Токенайзеры
         "sentencepiece", "tokenizers",
-        # Память (LEANN)
         "sentence-transformers",
-        # Датасеты
         "datasets",
-        # Мониторинг
         "psutil",
     ]
     
@@ -290,7 +283,7 @@ def phase_0_install():
             logger.info(f"  ✅ {pkg} — уже установлен")
         else:
             logger.info(f"  📦 Установка {pkg}...")
-            run(pip_cmd + ["install", pkg, "--quiet"], check=False)
+            run(pip_cmd + ["install", pkg, "--quiet"] + extra_flags, check=False)
     
     # Проверка CUDA
     gpu_name, vram = gpu_info()
@@ -322,7 +315,7 @@ def phase_1_download():
         logger.info(f"  📚 Wikipedia: уже есть ({wiki_mb:.1f} MB)")
     else:
         logger.info("  📚 Скачивание Wikipedia (100 000 статей)...")
-        if not run([PYTHON, TRAINING / "download_wiki.py"], check=False):
+        if not run([PYTHON, TRAINING / "download_wiki.py", "--count", "100000"], check=False):
             logger.warning("  ⚠ Wikipedia не скачана — продолжаем")
             success = False
     
