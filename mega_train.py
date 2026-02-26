@@ -111,10 +111,10 @@ def gpu_info():
             name = torch.cuda.get_device_name(0)
             vram = torch.cuda.get_device_properties(0).total_mem / 1024**3
             return name, vram
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"  gpu_info torch attempt failed: {e}")
     
-    # Попытка 2: через venv Python (если PYTHON указывает на venv)
+    # Попытка 2: через subprocess (PYTHON может быть venv)
     try:
         code = (
             "import torch; "
@@ -129,8 +129,26 @@ def gpu_info():
                 name = lines[1].strip()
                 vram = float(lines[2].strip())
                 return name, vram
-    except Exception:
-        pass
+        elif r.stderr:
+            logger.debug(f"  gpu_info subprocess stderr: {r.stderr[:200]}")
+    except Exception as e:
+        logger.debug(f"  gpu_info subprocess failed: {e}")
+    
+    # Попытка 3: напрямую через nvidia-smi (не зависит от PyTorch)
+    try:
+        import re
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            parts = r.stdout.strip().split(", ")
+            if len(parts) >= 2:
+                name = parts[0].strip()
+                vram = float(parts[1].strip()) / 1024  # MiB → GiB
+                return name, vram
+    except Exception as e:
+        logger.debug(f"  gpu_info nvidia-smi failed: {e}")
     
     return None, 0
 
