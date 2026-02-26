@@ -6,7 +6,7 @@ or if it needs the full Mamba-2 pipeline.
 
 Outputs:
   P_conf > 0.85 → Reflex handles it (Tier 1)
-  P_conf < 0.85 → Pass to RRN/Mamba-2 (Tier 2+)
+  P_conf < 0.85 → Pass to Mamba-2 SSM (Tier 2)
 """
 import torch
 import torch.nn as nn

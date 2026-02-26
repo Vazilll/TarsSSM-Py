@@ -502,13 +502,13 @@ class TarsMamba2LM(nn.Module):
             
             # ═══ Lazy Expansion: пул исчерпан → рекрутируем новые матрицы ═══
             if not candidates:
-                available = self.matrix_pool.total_available()
+                available = self.matrix_pool.total_available
                 used = len(getattr(self.matrix_pool, 'used_mask', []))
                 if available <= used + N_CANDIDATES:
                     try:
                         self.matrix_pool._lazy_expand(4, h_curr.mean(0))
                         self.logger.debug(
-                            f"IDME lazy expand: +4 matrices (total={self.matrix_pool.total_available()})"
+                            f"IDME lazy expand: +4 matrices (total={self.matrix_pool.total_available})"
                         )
                         candidates, indices = self.matrix_pool.select(h_curr.mean(0), k=N_CANDIDATES)
                         total_matrices_recruited += len(candidates)
