@@ -43,7 +43,6 @@ DATA = ROOT / "data"
 MODELS = ROOT / "models"
 TARS_V3 = MODELS / "tars_v3"
 PYTHON = sys.executable
-VENV_PIP = ROOT / "venv" / "Scripts" / "pip.exe"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -146,8 +145,47 @@ def phase_0_install():
     """Устанавливает все необходимые пакеты."""
     banner(0, "Установка зависимостей")
     
-    pip = str(VENV_PIP) if VENV_PIP.exists() else f"{PYTHON} -m pip"
-    pip_cmd = [str(VENV_PIP)] if VENV_PIP.exists() else [PYTHON, "-m", "pip"]
+    global PYTHON
+    
+    # ═══ Автоматическое создание venv (PEP 668 fix) ═══
+    venv_dir = ROOT / "venv"
+    if sys.platform == "win32":
+        venv_python = venv_dir / "Scripts" / "python.exe"
+        venv_pip = venv_dir / "Scripts" / "pip.exe"
+    else:
+        venv_python = venv_dir / "bin" / "python"
+        venv_pip = venv_dir / "bin" / "pip"
+    
+    if not venv_python.exists():
+        logger.info("  🔧 Создание виртуального окружения (venv)...")
+        try:
+            subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
+            logger.info(f"  ✅ venv создан: {venv_dir}")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"  ❌ Не удалось создать venv: {e}")
+            logger.info("  Попытка установки через --break-system-packages...")
+            # Fallback: использовать системный pip с --break-system-packages
+            PYTHON = sys.executable
+            pip_cmd = [PYTHON, "-m", "pip"]
+            packages = [
+                "torch", "numpy", "einops", "tqdm",
+                "sentencepiece", "tokenizers",
+                "sentence-transformers", "datasets", "psutil",
+            ]
+            logger.info("Проверка и установка пакетов...")
+            for pkg in packages:
+                try:
+                    __import__(pkg.replace("-", "_"))
+                    logger.info(f"  ✅ {pkg} — уже установлен")
+                except ImportError:
+                    logger.info(f"  📦 Установка {pkg}...")
+                    run(pip_cmd + ["install", pkg, "--quiet", "--break-system-packages"], check=False)
+            return True
+    
+    # Обновляем PYTHON для всего пайплайна
+    PYTHON = str(venv_python)
+    pip_cmd = [str(venv_pip)]
+    logger.info(f"  🐍 Python: {PYTHON}")
     
     # Обязательные пакеты
     packages = [
@@ -166,10 +204,17 @@ def phase_0_install():
     logger.info("Проверка и установка пакетов...")
     
     for pkg in packages:
+        # Проверяем через venv python
+        check_cmd = [PYTHON, "-c", f"import {pkg.replace('-', '_')}"]
         try:
-            __import__(pkg.replace("-", "_"))
+            subprocess.run(check_cmd, capture_output=True, timeout=10)
+            result_ok = subprocess.run(check_cmd, capture_output=True, timeout=10).returncode == 0
+        except Exception:
+            result_ok = False
+        
+        if result_ok:
             logger.info(f"  ✅ {pkg} — уже установлен")
-        except ImportError:
+        else:
             logger.info(f"  📦 Установка {pkg}...")
             run(pip_cmd + ["install", pkg, "--quiet"], check=False)
     

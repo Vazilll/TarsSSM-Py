@@ -174,6 +174,35 @@ SEED_TOPICS = [
 ]
 
 
+def _wiki_api_get(params: dict, timeout: int = 15) -> dict:
+    """Делает запрос к Wikipedia API с retry."""
+    url = "https://ru.wikipedia.org/w/api.php?" + urllib.parse.urlencode(params)
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "TARS-Bot/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+        except Exception:
+            if attempt < 2:
+                time.sleep(1 + attempt)
+    return {}
+
+
+def _search_wiki_title(query: str) -> str:
+    """Ищет правильный заголовок статьи через opensearch API."""
+    params = {
+        "action": "opensearch",
+        "search": query,
+        "limit": "1",
+        "namespace": "0",
+        "format": "json",
+    }
+    data = _wiki_api_get(params, timeout=10)
+    if isinstance(data, list) and len(data) >= 2 and data[1]:
+        return data[1][0]
+    return ""
+
+
 def fetch_wiki_article(title: str) -> tuple:
     """Загружает текст статьи из русской Википедии. Returns (title, text)."""
     params = {
@@ -181,24 +210,32 @@ def fetch_wiki_article(title: str) -> tuple:
         "titles": title,
         "prop": "extracts",
         "explaintext": "true",
+        "redirects": "true",
         "format": "json",
         "exsectionformat": "plain",
     }
-    url = "https://ru.wikipedia.org/w/api.php?" + urllib.parse.urlencode(params)
+    data = _wiki_api_get(params)
     
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "TARS-Bot/1.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode('utf-8'))
-        
+    pages = data.get("query", {}).get("pages", {})
+    for page_id, page in pages.items():
+        if page_id != "-1":
+            text = page.get("extract", "")
+            if text:
+                return (title, clean_wiki_text(text))
+    
+    # Fallback: поиск правильного заголовка
+    real_title = _search_wiki_title(title)
+    if real_title and real_title != title:
+        params["titles"] = real_title
+        data = _wiki_api_get(params)
         pages = data.get("query", {}).get("pages", {})
         for page_id, page in pages.items():
-            if page_id == "-1":
-                return (title, "")
-            text = page.get("extract", "")
-            return (title, clean_wiki_text(text))
-    except Exception:
-        return (title, "")
+            if page_id != "-1":
+                text = page.get("extract", "")
+                if text:
+                    return (title, clean_wiki_text(text))
+    
+    return (title, "")
 
 
 def fetch_random_titles(count: int = 500) -> list:
@@ -210,16 +247,8 @@ def fetch_random_titles(count: int = 500) -> list:
         "rnlimit": str(min(count, 500)),
         "format": "json",
     }
-    url = "https://ru.wikipedia.org/w/api.php?" + urllib.parse.urlencode(params)
-    
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "TARS-Bot/1.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode('utf-8'))
-        
-        return [item["title"] for item in data.get("query", {}).get("random", [])]
-    except Exception:
-        return []
+    data = _wiki_api_get(params)
+    return [item["title"] for item in data.get("query", {}).get("random", [])]
 
 
 def fetch_links_from(title: str, limit: int = 50) -> list:
@@ -232,21 +261,14 @@ def fetch_links_from(title: str, limit: int = 50) -> list:
         "plnamespace": "0",
         "format": "json",
     }
-    url = "https://ru.wikipedia.org/w/api.php?" + urllib.parse.urlencode(params)
+    data = _wiki_api_get(params, timeout=10)
     
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "TARS-Bot/1.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode('utf-8'))
-        
-        pages = data.get("query", {}).get("pages", {})
-        links = []
-        for page in pages.values():
-            for link in page.get("links", []):
-                links.append(link["title"])
-        return links
-    except Exception:
-        return []
+    pages = data.get("query", {}).get("pages", {})
+    links = []
+    for page in pages.values():
+        for link in page.get("links", []):
+            links.append(link["title"])
+    return links
 
 
 def clean_wiki_text(text: str) -> str:
@@ -309,7 +331,7 @@ def download_corpus(count: int = 100000, output_path: str = None) -> str:
         for future in as_completed(futures):
             title, text = future.result()
             done += 1
-            if text and len(text) > 200:
+            if text and len(text) > 100:
                 articles.append(text)
                 titles_done.add(title)
             if done % 50 == 0:
