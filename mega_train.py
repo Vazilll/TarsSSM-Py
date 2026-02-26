@@ -104,6 +104,7 @@ def run(cmd: list, cwd=None, retries=3, check=True) -> bool:
 
 def gpu_info():
     """Возвращает информацию о GPU."""
+    # Попытка 1: import torch в текущем процессе
     try:
         import torch
         if torch.cuda.is_available():
@@ -112,6 +113,25 @@ def gpu_info():
             return name, vram
     except Exception:
         pass
+    
+    # Попытка 2: через venv Python (если PYTHON указывает на venv)
+    try:
+        code = (
+            "import torch; "
+            "print(torch.cuda.is_available()); "
+            "print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else ''); "
+            "print(torch.cuda.get_device_properties(0).total_mem / 1024**3 if torch.cuda.is_available() else 0)"
+        )
+        r = subprocess.run([PYTHON, "-c", code], capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            lines = r.stdout.strip().split('\n')
+            if len(lines) >= 3 and lines[0].strip() == "True":
+                name = lines[1].strip()
+                vram = float(lines[2].strip())
+                return name, vram
+    except Exception:
+        pass
+    
     return None, 0
 
 
@@ -187,10 +207,66 @@ def phase_0_install():
     pip_cmd = [str(venv_pip)]
     logger.info(f"  🐍 Python: {PYTHON}")
     
-    # Обязательные пакеты
+    # ═══ Определяем версию CUDA для установки PyTorch ═══
+    def _detect_cuda_version():
+        """Определяет версию CUDA через nvidia-smi."""
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                # nvidia-smi работает → GPU есть, определяем CUDA version
+                result2 = subprocess.run(
+                    ["nvidia-smi"], capture_output=True, text=True, timeout=10
+                )
+                output = result2.stdout
+                # Ищем "CUDA Version: XX.Y"
+                import re
+                match = re.search(r'CUDA Version:\s*(\d+)\.(\d+)', output)
+                if match:
+                    major = int(match.group(1))
+                    minor = int(match.group(2))
+                    # PyTorch wheels: cu124 (latest), cu121, cu118
+                    # CUDA 13.x обратно совместима с cu124
+                    if major >= 13 or (major == 12 and minor >= 4):
+                        return "cu124"
+                    elif major == 12:
+                        return "cu121"
+                    elif major >= 11:
+                        return "cu118"
+                return "cu124"  # default для новых драйверов
+        except Exception:
+            pass
+        return None
+    
+    cuda_tag = _detect_cuda_version()
+    
+    # ═══ Установка PyTorch (отдельно, с CUDA) ═══
+    check_torch = [PYTHON, "-c", "import torch; print(torch.cuda.is_available())"]
+    try:
+        r = subprocess.run(check_torch, capture_output=True, text=True, timeout=30)
+        torch_ok = r.returncode == 0
+        torch_has_cuda = "True" in r.stdout
+    except Exception:
+        torch_ok = False
+        torch_has_cuda = False
+    
+    if torch_ok and (torch_has_cuda or cuda_tag is None):
+        logger.info(f"  ✅ torch — уже установлен (CUDA: {torch_has_cuda})")
+    else:
+        if cuda_tag:
+            logger.info(f"  📦 Установка PyTorch с CUDA ({cuda_tag})...")
+            torch_url = f"https://download.pytorch.org/whl/{cuda_tag}"
+            run(pip_cmd + ["install", "torch", "--index-url", torch_url, "--quiet"], check=False)
+        else:
+            logger.info("  📦 Установка PyTorch (CPU)...")
+            run(pip_cmd + ["install", "torch", "--quiet"], check=False)
+    
+    # Обязательные пакеты (без torch — уже установлен выше)
     packages = [
         # Ядро
-        "torch", "numpy", "einops", "tqdm",
+        "numpy", "einops", "tqdm",
         # Токенайзеры
         "sentencepiece", "tokenizers",
         # Память (LEANN)
@@ -201,13 +277,11 @@ def phase_0_install():
         "psutil",
     ]
     
-    logger.info("Проверка и установка пакетов...")
+    logger.info("Проверка и установка остальных пакетов...")
     
     for pkg in packages:
-        # Проверяем через venv python
         check_cmd = [PYTHON, "-c", f"import {pkg.replace('-', '_')}"]
         try:
-            subprocess.run(check_cmd, capture_output=True, timeout=10)
             result_ok = subprocess.run(check_cmd, capture_output=True, timeout=10).returncode == 0
         except Exception:
             result_ok = False
@@ -679,6 +753,12 @@ def main():
     
     # Фаза 0: Зависимости
     results["install"] = phase_0_install()
+    
+    # Переопределяем device после установки torch с CUDA в venv
+    gpu_name, vram = gpu_info()
+    device = "cuda" if gpu_name else "cpu"
+    if gpu_name:
+        logger.info(f"  🖥️  GPU обнаружен: {gpu_name} ({vram:.1f} GB VRAM)")
     
     # Фаза 1: Данные
     if not args.skip_download:
