@@ -92,7 +92,10 @@ class TarsBlock(nn.Module):
         x_prev: Optional[torch.Tensor] = None,
         memory_vec: Optional[torch.Tensor] = None,
         rag_state: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+        ssd_state: Optional[torch.Tensor] = None,
+        conv_state: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict,
+               Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Args:
             x: [B, L, d_model]
@@ -100,21 +103,25 @@ class TarsBlock(nn.Module):
             x_prev: [B, 1, d_model] — last token for time-shift
             memory_vec: [B, 384] — LEANN/RAG vector
             rag_state: [B, d_state, d_state] — compressed knowledge
+            ssd_state: [B, nheads, headdim, d_state] — SSD recurrent state
+            conv_state: [B, conv_dim, d_conv] — conv1d rolling state
         
         Returns:
-            output, wkv_state, x_prev, stats
+            output, wkv_state, x_prev, stats, ssd_state, conv_state
         """
         residual = x
         
         # ═══ 1. Deep Hybrid Core ═══
-        core_out, wkv_state, x_prev = self.core(
-            self.norm(x), wkv_state, x_prev
+        core_out, wkv_state, x_prev, ssd_state, conv_state = self.core(
+            self.norm(x), wkv_state, x_prev, ssd_state, conv_state
         )
         x = residual + core_out
         
+        # ═══ Cache h_mean once (used by RAG, NoveltyGate, Memory) ═══
+        h_mean = x.mean(dim=1)  # [B, d_model]
+        
         # ═══ RAG injection ═══
         if rag_state is not None:
-            h_mean = x.mean(dim=1)                                    # [B, d_model]
             q = self.rag_query(h_mean)                                # [B, d_state]
             info = torch.bmm(rag_state, q.unsqueeze(-1)).squeeze(-1)  # [B, d_state]
             x = x + 0.1 * self.rag_out(info).unsqueeze(1)
@@ -122,8 +129,8 @@ class TarsBlock(nn.Module):
         # ═══ 2. Ω-SSM ═══
         x = self.omega(x)
         
-        # ═══ 3. MoLE ═══
-        x = self.mole(x)
+        # ═══ 3. MoLE (returns aux_loss for load balancing) ═══
+        x, mole_aux_loss = self.mole(x)
         
         # ═══ 4. NoveltyGate — adaptive residual ═══
         h_old = residual.mean(dim=1)                             # [B, d_model]
@@ -133,24 +140,18 @@ class TarsBlock(nn.Module):
         x = n * x + (1 - n) * residual
         
         # ═══ 5. Dynamic Memory Injection (спинной мозг → кора) ═══
-        # Каждый слой САМОСТОЯТЕЛЬНО запрашивает память через своё
-        # текущее скрытое состояние, а не через один статичный вектор.
         mem_relevance = 0.0
         if memory_vec is not None:
-            h_mean = x.mean(dim=1)                                    # [B, d_model]
-            # Проецируем текущее состояние слоя в пространство памяти
-            h_query = self.mem_query_proj(h_mean)                     # [B, 384]
-            # Вычисляем релевантность: косинусное сходство + гейт
+            # Re-compute h_mean after novelty gate changed x
+            h_mean_post = x.mean(dim=1)                               # [B, d_model]
+            h_query = self.mem_query_proj(h_mean_post)                # [B, 384]
             similarity = F.cosine_similarity(h_query, memory_vec, dim=-1)  # [B]
-            gate_input = torch.cat([h_mean, memory_vec], dim=-1)      # [B, d_model+384]
+            gate_input = torch.cat([h_mean_post, memory_vec], dim=-1) # [B, d_model+384]
             gate = self.mem_gate(gate_input).squeeze(-1)              # [B]
-            # Итоговая сила инъекции = similarity × gate
-            mem_strength = (similarity * gate).unsqueeze(-1).unsqueeze(-1)  # [B, 1, 1]
+            mem_strength = (similarity * gate).unsqueeze(-1).unsqueeze(-1)
             mem_signal = self.mem_proj(memory_vec).unsqueeze(1)       # [B, 1, d_model]
             x = x + mem_strength * mem_signal
             mem_relevance = similarity.mean().item()
-            # Surprise для Titans: чем больше гейт открыт, тем больше
-            # информации было нужно — значит модель «удивлена»
             self.last_surprise = gate.mean().item()
         
         # Stats
@@ -160,6 +161,7 @@ class TarsBlock(nn.Module):
             "has_rag": rag_state is not None,
             "mem_relevance": mem_relevance,
             "surprise": self.last_surprise,
+            "mole_aux_loss": mole_aux_loss,
         }
         
-        return x, wkv_state, x_prev, self.last_stats
+        return x, wkv_state, x_prev, self.last_stats, ssd_state, conv_state

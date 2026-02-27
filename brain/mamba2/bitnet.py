@@ -228,15 +228,15 @@ class UniversalLinear(nn.Module):
             # Обучение: STE квантование (каждый forward пересчитывает)
             return STEWeightQuant.apply(self.weight)
         else:
-            # Инференс: кешируем тернарные веса
+            # Инференс: кешируем уже перемноженный результат w_q * scale
             if not self._cache_valid:
                 with torch.no_grad():
                     w_q, scale = _weight_quant_ternary(self.weight)
-                    self._cached_ternary_w = w_q
+                    self._cached_ternary_w = w_q * scale  # pre-multiplied!
                     self._cached_scale = scale
                     self._cache_valid = True
                     
-            return self._cached_ternary_w * self._cached_scale
+            return self._cached_ternary_w
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """

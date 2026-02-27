@@ -333,10 +333,8 @@ def train(args):
         print("[Phase 1] Full pre-training: ALL components")
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     elif args.phase == 2:
-        # Phase 2: Freeze SSD-specific params. Train: WKV + Fusion + Ω-SSM + MoLE
-        # В TarsCoreBlock SSD и WKV делят общую in_proj, 
-        # но мы можем заморозить SSD-специфичные: A_log, D, dt_bias, conv1d
-        print("[Phase 2] Fine-tune: WKV + Fusion + Ω-SSM + MoLE (SSD params frozen)")
+        # Phase 2: Freeze SSD-specific params. Train: WKV + Fusion + Ω-SSM + MoLE + NoveltyGate
+        print("[Phase 2] Fine-tune: WKV + Fusion + Ω-SSM + MoLE + NoveltyGate (SSD params frozen)")
         for block in model.blocks:
             core = block.core
             # Freeze SSD-specific parameters
@@ -349,42 +347,66 @@ def train(args):
         print(f"  Trainable: {sum(p.numel() for p in trainable):,} params")
         optimizer = torch.optim.AdamW(trainable, lr=args.lr * 0.1, weight_decay=0.01)
     elif args.phase == 3:
-        # Phase 3: Freeze everything. Train: MoLE (per-block) + MatrixPool
-        print("[Phase 3] Fine-tune: MoLE + MatrixPool (rest frozen)")
+        # Phase 3: MoLE + MatrixPool + WaveMerge + WaveGate + NoveltyGate
+        print("[Phase 3] Fine-tune: MoLE + MatrixPool + WaveMerge + WaveGate + NoveltyGate")
         for p in model.parameters():
             p.requires_grad = False
         for block in model.blocks:
             for p in block.mole.parameters():
                 p.requires_grad = True
+            # NoveltyGate — обучаемый порог (Tars.txt §6.1)
+            for p in block.novelty_gate.parameters():
+                p.requires_grad = True
         for p in model.matrix_pool.parameters():
             p.requires_grad = True
+        # WaveMerge + WaveGate — обучаемые (Tars.txt §1.4)
+        for wm in model.wave_merges:
+            for p in wm.parameters():
+                p.requires_grad = True
+        for wg in model.wave_gates:
+            for p in wg.parameters():
+                p.requires_grad = True
         trainable = [p for p in model.parameters() if p.requires_grad]
         print(f"  Trainable: {sum(p.numel() for p in trainable):,} params")
         optimizer = torch.optim.AdamW(trainable, lr=args.lr * 0.01, weight_decay=0.01)
     elif args.phase == 4:
-        # Phase 4: Fine-tune WKV fusion gate + time_mix only (для RAG State Tracking)
-        print("[Phase 4] Fine-tune: WKV fusion + time_mix only (для RAG State Tracking)")
+        # Phase 4: WKV fusion + RAG + Dynamic Memory Injection + NoveltyGate + Ω-SSM
+        print("[Phase 4] Fine-tune: WKV + RAG + Dynamic Memory + NoveltyGate + Ω-SSM")
         for p in model.parameters():
             p.requires_grad = False
         for block in model.blocks:
             core = block.core
-            # Train WKV-related: fusion gate, wkv_up, time_mix
+            # WKV-related: fusion gate, wkv_up, time_mix
             for p in core.fusion_gate.parameters():
                 p.requires_grad = True
             for p in core.wkv_up.parameters():
                 p.requires_grad = True
             core.time_mix.requires_grad = True
-            # Train RAG projections
+            # RAG projections
             for p in block.rag_query.parameters():
                 p.requires_grad = True
             for p in block.rag_out.parameters():
+                p.requires_grad = True
+            # Dynamic Memory Injection (Tars.txt §4.3): mem_query, mem_proj, mem_gate
+            for p in block.mem_query_proj.parameters():
+                p.requires_grad = True
+            for p in block.mem_proj.parameters():
+                p.requires_grad = True
+            for p in block.mem_gate.parameters():
+                p.requires_grad = True
+            # NoveltyGate
+            for p in block.novelty_gate.parameters():
+                p.requires_grad = True
+            # Ω-SSM (Cayley transform parameters)
+            for p in block.omega.parameters():
                 p.requires_grad = True
         trainable = [p for p in model.parameters() if p.requires_grad]
         print(f"  Trainable: {sum(p.numel() for p in trainable):,} params")
         optimizer = torch.optim.AdamW(trainable, lr=args.lr * 0.05, weight_decay=0.01)
     
-    # Scheduler
-    total_steps = (len(train_in) // args.batch + 1) * args.epochs
+    # Scheduler (estimate total steps from corpus size)
+    estimated_samples = max(100, len(corpus.encode('cp1251', errors='replace')) // max(args.seq_len // 2, 1))
+    total_steps = (estimated_samples // args.batch + 1) * args.epochs
     warmup = total_steps // 10
     
     def lr_fn(step):
@@ -460,19 +482,23 @@ def train(args):
             if use_amp:
                 with torch.amp.autocast('cuda'):
                     logits = model(batch_in)
-                    loss = F.cross_entropy(
+                    lm_loss = F.cross_entropy(
                         logits.view(-1, actual_vocab),
                         batch_tgt.view(-1),
                         label_smoothing=args.label_smoothing,
-                    ) / accum_steps
+                    )
+                    # MoLE auxiliary loss (load balancing + z-loss)
+                    loss = (lm_loss + model.mole_aux_loss) / accum_steps
                 scaler.scale(loss).backward()
             else:
                 logits = model(batch_in)
-                loss = F.cross_entropy(
+                lm_loss = F.cross_entropy(
                     logits.view(-1, actual_vocab),
                     batch_tgt.view(-1),
                     label_smoothing=args.label_smoothing,
-                ) / accum_steps
+                )
+                # MoLE auxiliary loss (load balancing + z-loss)
+                loss = (lm_loss + model.mole_aux_loss) / accum_steps
                 loss.backward()
             
             total_loss += loss.item() * accum_steps
@@ -516,27 +542,36 @@ def train(args):
               f"Eval: {eval_loss:.4f} | PPL: {ppl:.1f} | "
               f"{tok_per_sec:.0f} tok/s | {elapsed:.1f}s")
         
-        # Save best
-        if eval_loss < best_loss:
-            best_loss = eval_loss
-            os.makedirs(args.save_dir, exist_ok=True)
-            torch.save({
-                'model_state_dict': model.state_dict(),
-                'config': {
-                    'd_model': args.d_model,
-                    'n_layers': args.n_layers,
-                    'vocab_size': actual_vocab,
-                    'quant_mode': quant_mode,
-                },
+        # Save checkpoint
+        os.makedirs(args.save_dir, exist_ok=True)
+        checkpoint = {
+            'model_state_dict': model.state_dict(),
+            'config': {
                 'd_model': args.d_model,
                 'n_layers': args.n_layers,
                 'vocab_size': actual_vocab,
-                'epoch': epoch,
-                'eval_loss': eval_loss,
-                'phase': args.phase,
                 'quant_mode': quant_mode,
-            }, str(save_path))
-            print(f"  ✓ Saved: {save_path} ({quant_mode})")
+            },
+            'd_model': args.d_model,
+            'n_layers': args.n_layers,
+            'vocab_size': actual_vocab,
+            'epoch': epoch,
+            'eval_loss': eval_loss,
+            'phase': args.phase,
+            'quant_mode': quant_mode,
+        }
+        
+        # Per-epoch checkpoint (защита от потери прогресса при крашах)
+        epoch_path = save_path.with_suffix(f'.epoch{epoch+1}.pt')
+        torch.save(checkpoint, str(epoch_path))
+        
+        # Best checkpoint
+        if eval_loss < best_loss:
+            best_loss = eval_loss
+            torch.save(checkpoint, str(save_path))
+            print(f"  ✓ Best saved: {save_path} ({quant_mode})")
+        else:
+            print(f"  ↺ Epoch checkpoint: {epoch_path.name}")
     
     print(f"\n{'═'*60}")
     print(f"  Done! Best eval loss: {best_loss:.4f}")

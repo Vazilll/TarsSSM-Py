@@ -72,7 +72,7 @@ class TopicRouter(nn.Module):
         # Gate для балансировки нагрузки
         self.gate = UniversalLinear(d_model, n_experts, bias=True, mode=quant_mode)
     
-    def route(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def route(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Определяет top-k экспертов для текущего состояния.
         
@@ -81,6 +81,7 @@ class TopicRouter(nn.Module):
         Returns:
             indices: [B, top_k] — индексы экспертов
             weights: [B, top_k] — веса (нормализованные)
+            logits:  [B, n_experts] — сырые логиты (для aux loss)
         """
         # Gate logits
         logits = self.gate(h)  # [B, n_experts]
@@ -89,7 +90,7 @@ class TopicRouter(nn.Module):
         weights, indices = logits.topk(self.top_k, dim=-1)
         weights = F.softmax(weights, dim=-1)
         
-        return indices, weights
+        return indices, weights, logits
 
 
 class MoLELayer(nn.Module):
@@ -97,47 +98,109 @@ class MoLELayer(nn.Module):
     MoLE: Mixture of LoRA Experts.
     
     Применяет top-k LoRA адаптеров к входу, взвешивая по routing weights.
+    
+    Auxiliary losses (Switch Transformer / GShard):
+      - Load Balancing: штрафует неравномерную нагрузку на экспертов
+      - Z-Loss: стабилизирует логиты роутера
     """
     
     def __init__(self, d_model: int = 768, n_experts: int = 8, 
                  rank: int = 8, top_k: int = 2,
-                 quant_mode: str = "fp16"):
+                 quant_mode: str = "fp16",
+                 balance_coeff: float = 0.01,
+                 z_loss_coeff: float = 0.001):
         super().__init__()
         self.router = TopicRouter(d_model, n_experts, top_k, quant_mode=quant_mode)
         self.experts = nn.ModuleList([
             LoRAAdapter(d_model, rank, quant_mode=quant_mode) for _ in range(n_experts)
         ])
         self.norm = nn.LayerNorm(d_model)
+        self.balance_coeff = balance_coeff
+        self.z_loss_coeff = z_loss_coeff
+        self.n_experts = n_experts
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _compute_aux_loss(
+        self,
+        indices: torch.Tensor,
+        weights: torch.Tensor,
+        logits: torch.Tensor,
+    ) -> torch.Tensor:
         """
-        x: [B, L, d_model] → x + sparse LoRA delta
+        Вычисляет вспомогательные потери для обучения MoLE.
+        
+        1. Load Balancing Loss (Switch Transformer, Fedus et al. 2021):
+           L_balance = N × Σ_i (f_i × P_i)
+           f_i = fraction of tokens routed to expert i
+           P_i = mean router probability for expert i
+           
+        2. Router Z-Loss (ST-MoE, Zoph et al. 2022):
+           L_z = (1/B) × Σ_b (log Σ_j exp(logits_bj))²
+        """
+        B = logits.shape[0]
+        device = logits.device
+        
+        # ═══ 1. Load Balancing Loss ═══
+        # f_i: доля сэмплов, где эксперт i в top-k
+        # Считаем сколько раз каждый эксперт был выбран
+        expert_counts = torch.zeros(self.n_experts, device=device)
+        for i in range(self.router.top_k):
+            counts = torch.bincount(indices[:, i], minlength=self.n_experts).float()
+            expert_counts += counts
+        f = expert_counts / (B * self.router.top_k)  # [n_experts]
+        
+        # P_i: средняя вероятность роутера для эксперта i
+        router_probs = F.softmax(logits, dim=-1)  # [B, n_experts]
+        P = router_probs.mean(dim=0)  # [n_experts]
+        
+        # L_balance = N × Σ(f_i × P_i)
+        load_balance_loss = self.n_experts * (f * P).sum()
+        
+        # ═══ 2. Router Z-Loss ═══
+        # Штрафует слишком большие логиты → стабильнее обучение
+        log_z = torch.logsumexp(logits, dim=-1)  # [B]
+        z_loss = (log_z ** 2).mean()
+        
+        # Итого
+        aux_loss = self.balance_coeff * load_balance_loss + self.z_loss_coeff * z_loss
+        return aux_loss
+    
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        x: [B, L, d_model] → (x + sparse LoRA delta, aux_loss)
+        
+        Returns:
+            output: [B, L, d_model] — обогащённый тензор
+            aux_loss: scalar — вспомогательная потеря для обучения роутера
         """
         # Route по среднему состоянию
         h_mean = x.mean(dim=1)  # [B, d_model]
-        indices, weights = self.router.route(h_mean)  # [B, k], [B, k]
+        indices, weights, logits = self.router.route(h_mean)  # [B, k], [B, k], [B, N]
         
-        # Применяем top-k экспертов
+        # Auxiliary loss для обучения роутера
+        aux_loss = self._compute_aux_loss(indices, weights, logits)
+        
+        # Применяем top-k экспертов (batched, без Python loop по batch)
         batch_size = x.shape[0]
-        delta = torch.zeros_like(x[:, 0])  # [B, d_model]
+        delta = torch.zeros_like(h_mean)  # [B, d_model]
         
         for i in range(self.router.top_k):
-            expert_idx = indices[:, i]  # [B]
-            weight = weights[:, i].unsqueeze(-1)  # [B, 1]
+            expert_idx = indices[:, i]      # [B]
+            weight = weights[:, i:i+1]      # [B, 1]
             
-            # Собираем вклад каждого эксперта
-            for b in range(batch_size):
-                eidx = expert_idx[b].item()
-                expert_out = self.experts[eidx](h_mean[b:b+1])
-                delta[b] += weight[b] * expert_out.squeeze(0)
+            # Группируем по экспертам — один forward на всех samples с общим экспертом
+            for eidx in range(len(self.experts)):
+                mask = (expert_idx == eidx)  # [B] bool
+                if mask.any():
+                    expert_out = self.experts[eidx](h_mean[mask])  # [N_selected, d_model]
+                    delta[mask] = delta[mask] + weight[mask] * expert_out
         
         # Добавляем delta ко всем позициям (broadcast)
-        return self.norm(x + delta.unsqueeze(1))
+        return self.norm(x + delta.unsqueeze(1)), aux_loss
     
     def get_active_experts(self, x: torch.Tensor) -> List[str]:
         """Возвращает имена активных экспертов (для логирования)."""
         h_mean = x.mean(dim=1)
-        indices, weights = self.router.route(h_mean)
+        indices, weights, _ = self.router.route(h_mean)
         names = []
         for i in range(self.router.top_k):
             idx = indices[0, i].item()

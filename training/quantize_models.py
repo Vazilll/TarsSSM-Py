@@ -108,12 +108,11 @@ def quantize_brain(input_path: str = None, output_path: str = None,
         logger.info(f"\n[3/4] Дообучение 1.58-bit модели ({epochs} эпох)...")
         
         # Загрузка корпуса
-        from training.train_mamba2 import load_corpus, load_tokenizer
+        from training.train_mamba2 import load_corpus
         corpus = load_corpus()
-        tokenizer = load_tokenizer()
         
-        # Токенизация
-        tokens = tokenizer.encode(corpus[:500000])  # Первые 500K символов
+        # Byte-level tokenization (cp1251, vocab=256) — как в train_mamba2.py
+        tokens = list(corpus[:500000].encode('cp1251', errors='replace'))
         token_tensor = torch.tensor(tokens, dtype=torch.long)
         
         seq_len = 256  # Короче для fine-tune

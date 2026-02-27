@@ -104,6 +104,22 @@ PRESETS = {
             "format": "instruct",
         },
     ],
+    
+    # ─── Русский reasoning и качественные корпуса ───
+    "russian": [
+        {
+            "name": "IlyaGusev/ru_turbo_alpaca",
+            "desc": "Высококачественные русские инструкции (GPT-4 генерация)",
+            "count": 30000,
+            "format": "instruct",
+        },
+        {
+            "name": "Vikhrmodels/GrandMaster-PRO-MAX",
+            "desc": "Сложный русский reasoning + многошаговые задачи",
+            "count": 30000,
+            "format": "chat",
+        },
+    ],
 }
 
 

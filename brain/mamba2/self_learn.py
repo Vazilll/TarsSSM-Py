@@ -225,7 +225,29 @@ class SelfLearner:
                 self.logger.info(
                     f"SelfLearn: Fine-tune на {len(good_sessions)} сессиях..."
                 )
-                # TODO: подготовка данных из сессий и fine-tune
+                total_loss = 0.0
+                n_steps = 0
+                for session in good_sessions[-20:]:  # Последние 20 хороших
+                    input_text = session.get("input", "")
+                    response_text = session.get("response", "")
+                    if not input_text or not response_text:
+                        continue
+                    # Токенизация через cp1251 byte-level
+                    combined = f"{input_text}\n{response_text}"
+                    tokens = list(combined.encode('cp1251', errors='replace'))
+                    if len(tokens) < 8:
+                        continue
+                    token_tensor = torch.tensor(tokens, dtype=torch.long, device=device)
+                    input_ids = token_tensor[:-1].unsqueeze(0)
+                    labels = token_tensor[1:].unsqueeze(0)
+                    loss = self.fine_tune_step(input_ids, labels)
+                    total_loss += loss
+                    n_steps += 1
+                if n_steps > 0:
+                    self.logger.info(
+                        f"SelfLearn: Fine-tune done: {n_steps} steps, "
+                        f"avg_loss={total_loss / n_steps:.4f}"
+                    )
         
         self.logger.info("SelfLearn: 💤 Фаза сна завершена")
     

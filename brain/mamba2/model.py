@@ -195,6 +195,9 @@ class TarsMamba2LM(nn.Module):
         
         # Gradient checkpointing flag
         self.use_checkpointing = False
+        
+        # MoLE auxiliary loss (accumulated during forward)
+        self.mole_aux_loss = torch.tensor(0.0)
     
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -223,6 +226,11 @@ class TarsMamba2LM(nn.Module):
         
         wkv_states = [None] * self.n_layers
         x_prevs = [None] * self.n_layers
+        ssd_states = [None] * self.n_layers
+        conv_states = [None] * self.n_layers
+        
+        # Accumulate MoLE aux loss from all blocks
+        mole_aux_total = torch.tensor(0.0, device=input_ids.device)
         
         # Parallel Wave through TarsBlocks
         n_waves = self.n_layers // 2
@@ -236,23 +244,36 @@ class TarsMamba2LM(nn.Module):
             
             # 2 блока параллельно
             if self.use_checkpointing and self.training:
-                x_left, wkv_states[b_left], x_prevs[b_left], _ = grad_checkpoint(
+                x_left, wkv_states[b_left], x_prevs[b_left], stats_l, \
+                    ssd_states[b_left], conv_states[b_left] = grad_checkpoint(
                     self.blocks[b_left], x, wkv_states[b_left],
                     x_prevs[b_left], memory_vec, rag_state,
+                    ssd_states[b_left], conv_states[b_left],
                     use_reentrant=False
                 )
-                x_right, wkv_states[b_right], x_prevs[b_right], _ = grad_checkpoint(
+                x_right, wkv_states[b_right], x_prevs[b_right], stats_r, \
+                    ssd_states[b_right], conv_states[b_right] = grad_checkpoint(
                     self.blocks[b_right], x, wkv_states[b_right],
                     x_prevs[b_right], memory_vec, rag_state,
+                    ssd_states[b_right], conv_states[b_right],
                     use_reentrant=False
                 )
             else:
-                x_left, wkv_states[b_left], x_prevs[b_left], _ = self.blocks[b_left](
-                    x, wkv_states[b_left], x_prevs[b_left], memory_vec, rag_state
+                x_left, wkv_states[b_left], x_prevs[b_left], stats_l, \
+                    ssd_states[b_left], conv_states[b_left] = self.blocks[b_left](
+                    x, wkv_states[b_left], x_prevs[b_left], memory_vec, rag_state,
+                    ssd_states[b_left], conv_states[b_left]
                 )
-                x_right, wkv_states[b_right], x_prevs[b_right], _ = self.blocks[b_right](
-                    x, wkv_states[b_right], x_prevs[b_right], memory_vec, rag_state
+                x_right, wkv_states[b_right], x_prevs[b_right], stats_r, \
+                    ssd_states[b_right], conv_states[b_right] = self.blocks[b_right](
+                    x, wkv_states[b_right], x_prevs[b_right], memory_vec, rag_state,
+                    ssd_states[b_right], conv_states[b_right]
                 )
+            
+            # Collect MoLE aux losses from both blocks
+            for stats in [stats_l, stats_r]:
+                if isinstance(stats, dict) and "mole_aux_loss" in stats:
+                    mole_aux_total = mole_aux_total + stats["mole_aux_loss"]
             
             # Wave Merge: gate + correction
             h_left = x_left.mean(dim=1)
@@ -264,23 +285,43 @@ class TarsMamba2LM(nn.Module):
             
             correction = self.wave_merges[wave_idx](gate_input).unsqueeze(1)
             x = x_merged + 0.1 * correction
+            
+            # ═══ Спинной мозг: обновление памяти между волнами (Tars.txt §2.4) ═══
+            # Без этого to_memory_space, mem_query_proj, mem_gate не получают
+            # градиенты. Каждая следующая волна должна получать обогащённый контекст.
+            if wave_idx < n_waves - 1:
+                h_curr = x.mean(dim=1)  # [B, d_model]
+                h_for_mem = self.to_memory_space(h_curr)  # [B, 384]
+                if memory_vec is None:
+                    # Первая волна — инициализируем memory_vec из вычислений мозга
+                    memory_vec = h_for_mem
+                else:
+                    # Спинной мозг: 70% старая память + 30% новые выводы (§2.4)
+                    memory_vec = 0.7 * memory_vec + 0.3 * h_for_mem
         
         # Handle odd number of blocks
         if self.n_layers % 2 == 1:
             last_block = self.blocks[-1]
-            x, _, _, _ = last_block(x, None, None, memory_vec, rag_state)
+            x, _, _, stats_last, _, _ = last_block(x, None, None, memory_vec, rag_state)
+            if isinstance(stats_last, dict) and "mole_aux_loss" in stats_last:
+                mole_aux_total = mole_aux_total + stats_last["mole_aux_loss"]
+        
+        # Store for external access (training loop)
+        self.mole_aux_loss = mole_aux_total
         
         # Output
         x = self.norm_f(x)
         logits = self.lm_head(x)
         
         if labels is not None:
-            loss = F.cross_entropy(
+            lm_loss = F.cross_entropy(
                 logits.view(-1, self.vocab_size),
                 labels.view(-1),
                 ignore_index=-100
             )
-            return logits, loss
+            # Combine LM loss + MoLE auxiliary loss (load balancing + z-loss)
+            total_loss = lm_loss + mole_aux_total
+            return logits, total_loss
         
         return logits
     
@@ -357,6 +398,8 @@ class TarsMamba2LM(nn.Module):
         
         wkv_states = [None] * self.n_layers   # WKV state per block
         x_prevs = [None] * self.n_layers      # time-shift per block
+        ssd_states = [None] * self.n_layers   # SSD recurrent state per block
+        conv_states = [None] * self.n_layers  # Conv1d rolling state per block
         h_prev = x.mean(dim=1).detach()
         
         block_stats = []
@@ -380,11 +423,15 @@ class TarsMamba2LM(nn.Module):
                 break
             
             # ── 2 блока работают ПАРАЛЛЕЛЬНО на одном входе ──
-            x_left, wkv_states[b_left], x_prevs[b_left], stats_l = self.blocks[b_left](
-                x, wkv_states[b_left], x_prevs[b_left], memory_vec, rag_state
+            x_left, wkv_states[b_left], x_prevs[b_left], stats_l, \
+                ssd_states[b_left], conv_states[b_left] = self.blocks[b_left](
+                x, wkv_states[b_left], x_prevs[b_left], memory_vec, rag_state,
+                ssd_states[b_left], conv_states[b_left]
             )
-            x_right, wkv_states[b_right], x_prevs[b_right], stats_r = self.blocks[b_right](
-                x, wkv_states[b_right], x_prevs[b_right], memory_vec, rag_state
+            x_right, wkv_states[b_right], x_prevs[b_right], stats_r, \
+                ssd_states[b_right], conv_states[b_right] = self.blocks[b_right](
+                x, wkv_states[b_right], x_prevs[b_right], memory_vec, rag_state,
+                ssd_states[b_right], conv_states[b_right]
             )
             block_stats.extend([stats_l, stats_r])
             blocks_executed += 2

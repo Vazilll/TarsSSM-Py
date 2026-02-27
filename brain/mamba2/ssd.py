@@ -25,6 +25,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from functools import lru_cache
 from brain.mamba2.bitnet import UniversalLinear
 from einops import rearrange, repeat
 from typing import Optional, Tuple
@@ -34,11 +35,17 @@ from typing import Optional, Tuple
 # Утилиты SSD (без изменений)
 # ═══════════════════════════════════════════
 
+# Global cache for tril masks: key = (T, device_str)
+_TRIL_MASK_CACHE: dict = {}
+
 def _get_tril_masks(T: int, device: torch.device):
     """Cached lower-triangular masks for segsum."""
-    mask_exclusive = torch.tril(torch.ones(T, T, device=device, dtype=torch.bool), diagonal=-1)
-    mask_inclusive = torch.tril(torch.ones(T, T, device=device, dtype=torch.bool), diagonal=0)
-    return mask_exclusive, mask_inclusive
+    key = (T, str(device))
+    if key not in _TRIL_MASK_CACHE:
+        mask_exclusive = torch.tril(torch.ones(T, T, device=device, dtype=torch.bool), diagonal=-1)
+        mask_inclusive = torch.tril(torch.ones(T, T, device=device, dtype=torch.bool), diagonal=0)
+        _TRIL_MASK_CACHE[key] = (mask_exclusive, mask_inclusive)
+    return _TRIL_MASK_CACHE[key]
 
 
 def segsum(x: torch.Tensor) -> torch.Tensor:
@@ -50,6 +57,31 @@ def segsum(x: torch.Tensor) -> torch.Tensor:
     x_segsum = torch.cumsum(x, dim=-2)
     x_segsum = x_segsum.masked_fill(~mask_incl, -torch.inf)
     return x_segsum
+
+
+@torch.no_grad()
+def ssd_step(
+    x: torch.Tensor,     # [B, H, P]  — input (one token)
+    A: torch.Tensor,     # [B, H]     — decay
+    B: torch.Tensor,     # [B, H, N]  — input projection
+    C: torch.Tensor,     # [B, H, N]  — output projection
+    D: torch.Tensor,     # [H]        — skip connection
+    state: torch.Tensor, # [B, H, P, N] — recurrent state
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    SSD recurrent step for L=1 inference. O(1) per token.
+    
+    h_new = exp(A·dt) * h_old + B ⊗ x
+    y = C · h_new + D · x
+    """
+    decay = torch.exp(A).unsqueeze(-1).unsqueeze(-1)   # [B, H, 1, 1]
+    # State update: h = decay * h + outer(x, B)
+    state = decay * state + torch.einsum("bhp,bhn->bhpn", x, B)
+    # Output: y = inner(C, state) for each head
+    y = torch.einsum("bhn,bhpn->bhp", C, state)        # [B, H, P]
+    # Skip connection
+    y = y + x * D.unsqueeze(0).unsqueeze(-1)            # [B, H, P]
+    return y, state
 
 
 def ssd_scan(X, A, B, C, chunk_size=64, initial_states=None):
@@ -315,17 +347,23 @@ class TarsCoreBlock(nn.Module):
         u: torch.Tensor,
         wkv_state: Optional[torch.Tensor] = None,
         x_prev: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ssd_state: Optional[torch.Tensor] = None,
+        conv_state: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Args:
             u: [B, L, d_model] — input
             wkv_state: [B, d_state, d_state] — RWKV state (carry)
             x_prev: [B, 1, d_model] — last token of prev chunk (time-shift)
+            ssd_state: [B, nheads, headdim, d_state] — SSD recurrent state (inference)
+            conv_state: [B, conv_dim, d_conv] — conv1d state (inference)
         
         Returns:
             output: [B, L, d_model]
             wkv_state: [B, d_state, d_state] — updated state
             x_last: [B, 1, d_model] — last token for next chunk
+            ssd_state: SSD state (for recurrent inference)
+            conv_state: conv1d state (for recurrent inference)
         """
         batch, seqlen, _ = u.shape
         
@@ -353,7 +391,33 @@ class TarsCoreBlock(nn.Module):
         )
         
         dt = F.softplus(dt + self.dt_bias)
-        xBC = self.act(self.conv1d(xBC))
+        
+        # ═══ Conv1d with state caching for step mode ═══
+        conv_dim = self.d_inner + 2 * self.ngroups * self.d_state
+        if seqlen == 1 and conv_state is not None:
+            # Step mode: update rolling conv state
+            xBC_raw = xBC.squeeze(1)  # [B, conv_dim]
+            conv_state = torch.cat([conv_state[:, :, 1:], xBC_raw.unsqueeze(-1)], dim=-1)
+            # Apply conv weights manually
+            xBC_conv = torch.sum(conv_state * self.conv1d.conv.weight.squeeze(1), dim=-1)  # [B, conv_dim]
+            if self.conv1d.conv.bias is not None:
+                xBC_conv = xBC_conv + self.conv1d.conv.bias
+            xBC = self.act(xBC_conv).unsqueeze(1)  # [B, 1, conv_dim]
+        else:
+            xBC = self.act(self.conv1d(xBC))
+            # Initialize conv_state from last d_conv tokens for future step mode
+            if seqlen >= self.d_conv:
+                # Extract raw xBC before conv for state
+                raw_xBC = torch.split(
+                    mamba_proj,
+                    [self.d_inner,
+                     self.d_inner + 2 * self.ngroups * self.d_state,
+                     self.nheads],
+                    dim=-1
+                )[1]
+                conv_state = raw_xBC[:, -self.d_conv:, :].transpose(1, 2)  # [B, conv_dim, d_conv]
+            elif conv_state is None:
+                conv_state = torch.zeros(batch, conv_dim, self.d_conv, device=u.device, dtype=u.dtype)
         
         x_mamba, B, C = torch.split(
             xBC,
@@ -365,31 +429,57 @@ class TarsCoreBlock(nn.Module):
         
         A = -torch.exp(self.A_log)
         
-        x_heads = rearrange(x_mamba, "b l (h p) -> b l h p", p=self.headdim)
-        B_groups = rearrange(B, "b l (g n) -> b l g n", g=self.ngroups)
-        C_groups = rearrange(C, "b l (g n) -> b l g n", g=self.ngroups)
-        
-        if self.ngroups < self.nheads:
-            hpg = self.nheads // self.ngroups
-            B_heads = repeat(B_groups, "b l g n -> b l (g r) n", r=hpg)
-            C_heads = repeat(C_groups, "b l g n -> b l (g r) n", r=hpg)
+        # ═══ Step mode: SSD recurrent (L=1) ═══
+        if seqlen == 1:
+            x_heads = x_mamba.view(batch, self.nheads, self.headdim)  # [B, H, P]
+            B_groups = B.view(batch, self.ngroups, self.d_state)      # [B, G, N]
+            C_groups = C.view(batch, self.ngroups, self.d_state)      # [B, G, N]
+            
+            if self.ngroups < self.nheads:
+                hpg = self.nheads // self.ngroups
+                B_heads = B_groups.repeat_interleave(hpg, dim=1)      # [B, H, N]
+                C_heads = C_groups.repeat_interleave(hpg, dim=1)      # [B, H, N]
+            else:
+                B_heads = B_groups
+                C_heads = C_groups
+            
+            A_dt = A * dt.squeeze(1)  # [B, H]
+            x_dt = x_heads * dt.squeeze(1).unsqueeze(-1)  # [B, H, P]
+            
+            if ssd_state is None:
+                ssd_state = torch.zeros(batch, self.nheads, self.headdim, self.d_state,
+                                       device=u.device, dtype=u.dtype)
+            
+            y_ssd, ssd_state = ssd_step(x_dt, A_dt, B_heads, C_heads, self.D, ssd_state)
+            y_ssd = y_ssd.view(batch, 1, self.d_inner)  # [B, 1, d_inner]
         else:
-            B_heads = B_groups
-            C_heads = C_groups
-        
-        A_dt = repeat(A, "h -> b l h", b=batch, l=seqlen) * dt
-        x_dt = x_heads * dt.unsqueeze(-1)
-        
-        # Adaptive chunk size: smaller for short sequences
-        effective_chunk = min(self.chunk_size, max(seqlen, 8))
-        
-        y_ssd, _ = ssd_scan(
-            x_dt, A_dt, B_heads, C_heads,
-            chunk_size=effective_chunk
-        )
-        
-        y_ssd = y_ssd + x_heads * self.D.view(1, 1, -1, 1)
-        y_ssd = rearrange(y_ssd, "b l h p -> b l (h p)")  # [B, L, d_inner]
+            # ═══ Full parallel scan mode (training / prefill) ═══
+            x_heads = rearrange(x_mamba, "b l (h p) -> b l h p", p=self.headdim)
+            B_groups = rearrange(B, "b l (g n) -> b l g n", g=self.ngroups)
+            C_groups = rearrange(C, "b l (g n) -> b l g n", g=self.ngroups)
+            
+            if self.ngroups < self.nheads:
+                hpg = self.nheads // self.ngroups
+                B_heads = repeat(B_groups, "b l g n -> b l (g r) n", r=hpg)
+                C_heads = repeat(C_groups, "b l g n -> b l (g r) n", r=hpg)
+            else:
+                B_heads = B_groups
+                C_heads = C_groups
+            
+            A_dt = repeat(A, "h -> b l h", b=batch, l=seqlen) * dt
+            x_dt = x_heads * dt.unsqueeze(-1)
+            
+            # Adaptive chunk size: smaller for short sequences
+            effective_chunk = min(self.chunk_size, max(seqlen, 8))
+            
+            y_ssd, final_ssd_state = ssd_scan(
+                x_dt, A_dt, B_heads, C_heads,
+                chunk_size=effective_chunk
+            )
+            ssd_state = final_ssd_state  # Save for future step mode
+            
+            y_ssd = y_ssd + x_heads * self.D.view(1, 1, -1, 1)
+            y_ssd = rearrange(y_ssd, "b l h p -> b l (h p)")  # [B, L, d_inner]
         
         # ═══════════════════════════════════
         # 2B. RWKV-7 WKV PATH
@@ -423,7 +513,7 @@ class TarsCoreBlock(nn.Module):
         
         x_last = u[:, -1:, :]
         
-        return output, wkv_state, x_last
+        return output, wkv_state, x_last, ssd_state, conv_state
 
 
 # ═══════════════════════════════════════════
