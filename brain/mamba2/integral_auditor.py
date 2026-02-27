@@ -33,6 +33,7 @@ class IntegralAuditor(nn.Module):
         super().__init__()
         self.window = window
         self.default_threshold = default_threshold
+        self.threshold = default_threshold  # Динамически переопределяется MetaAuditor
         self.logger = logging.getLogger("Tars.IA")
         
         # История f(t) для текущего запроса
@@ -45,6 +46,7 @@ class IntegralAuditor(nn.Module):
         """Сброс между запросами."""
         self.history.clear()
         self.low_p_streak = 0
+        self.threshold = self.default_threshold
     
     def observe(self, h_new: torch.Tensor, h_old: torch.Tensor) -> dict:
         """
@@ -107,8 +109,8 @@ class IntegralAuditor(nn.Module):
         result["p"] = p
         result["r_squared"] = r_squared
         
-        # Сходимость
-        if p > self.default_threshold and r_squared > 0.85:
+        # Сходимость (threshold переопределяется MetaAuditor)
+        if p > self.threshold and r_squared > 0.85:
             result["converged"] = True
         
         # IDME expansion trigger

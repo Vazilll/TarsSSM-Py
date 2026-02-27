@@ -85,8 +85,23 @@ class MatrixPool(nn.Module):
         self._expanded_embeddings: List[torch.Tensor] = []
     
     def reset(self):
-        """Сброс между запросами."""
+        """
+        Мягкий сброс между запросами.
+        
+        Сохраняет:
+          - efficiency (Recirculation scores) — накопленный опыт
+          - _expanded (рекрутированные IDME матрицы) — обученные блоки
+        
+        Сбрасывает:
+          - used_mask — все матрицы снова доступны
+        """
         self.used_mask.zero_()
+        # НЕ сбрасываем efficiency и _expanded — они обновляются по мере работы
+    
+    def hard_reset(self):
+        """Полный сброс (Ctrl+C или перезагрузка)."""
+        self.used_mask.zero_()
+        self.efficiency.zero_()
         self._expanded.clear()
         self._expanded_embeddings.clear()
     

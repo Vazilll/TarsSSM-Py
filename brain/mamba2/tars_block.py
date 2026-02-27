@@ -162,6 +162,7 @@ class TarsBlock(nn.Module):
             "mem_relevance": mem_relevance,
             "surprise": self.last_surprise,
             "mole_aux_loss": mole_aux_loss,
+            "mole_experts": getattr(self.mole, '_last_expert_names', []),
         }
         
         return x, wkv_state, x_prev, self.last_stats, ssd_state, conv_state

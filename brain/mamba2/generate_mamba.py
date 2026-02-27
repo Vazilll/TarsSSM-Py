@@ -129,6 +129,7 @@ class TarsGenerator:
 
         # Initial forward pass (prefill) — use forward() for speed
         # think() IDME stats are shown separately in CLI
+        self.model.reset_cache()  # Init SSM state cache
         prefill_result = self.model(input_ids)
         if isinstance(prefill_result, tuple):
             logits = prefill_result[0]
@@ -243,13 +244,9 @@ class TarsGenerator:
                         break
             prev_hidden = current_hidden
 
-            # Next forward step (use forward() — cheaper, no IDME)
+            # Next forward step — use step() for cached SSM inference
             token_tensor = torch.tensor([[token_id]], dtype=torch.long, device=device)
-            fwd_result = self.model(token_tensor)
-            if isinstance(fwd_result, tuple):
-                logits = fwd_result[0]
-            else:
-                logits = fwd_result
+            logits = self.model.step(token_tensor)
 
         # Build result
         elapsed = (time.time() - t0) * 1000

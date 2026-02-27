@@ -310,12 +310,17 @@ def run_cli():
             # ── Отображение метрик мозга ──
             print(f"\n  🧠 ═══ Brain Think (Deep WuNeng Core: Mamba-2 + RWKV-7) ═══")
             print(f"  │ Task Type:     {stats.get('task_type', '?')}")
-            be = stats.get('blocks_executed', '?')
-            ed = stats.get('estimated_depth', '?')
-            tb = stats.get('total_blocks', '?')
-            print(f"  │ Depth:         {be}/{tb} blocks (target: {ed})")
-            print(f"  │ p-convergence: {stats.get('final_p', 0):.4f}  (порог: {stats.get('p_threshold', 1.2):.1f})")
-            print(f"  │ Converged:     {'✅ Да' if stats.get('converged', False) else '❌ Нет'}")
+            waves = stats.get('waves', 0)
+            max_waves = stats.get('total_blocks', 12) // 2
+            print(f"  │ Depth:         {waves}/{max_waves} waves (2 blocks + merge + spine each)")
+            r2 = stats.get('r_squared', 0)
+            print(f"  │ p-convergence: {stats.get('final_p', 0):.4f}  (порог: {stats.get('p_threshold', 1.2):.1f}, R²={r2:.2f})")
+            converged = stats.get('converged', False)
+            if converged:
+                print(f"  │ Converged:     ✅ Да")
+            else:
+                reason = "R²<0.85" if r2 < 0.85 else f"p<{stats.get('p_threshold', 1.2):.1f}"
+                print(f"  │ Converged:     ❌ Нет ({reason})")
             print(f"  │ IDME Rounds:   {stats.get('expansion_rounds', 0)}")
             bt = stats.get('branches_tested', 0)
             bw = stats.get('branches_won', 0)
@@ -325,11 +330,35 @@ def run_cli():
             print(f"  │ RWKV State:    {rwkv_mb:.2f} MB (O(1) memory)")
             print(f"  │ Hankel Collapses: {stats.get('hankel_collapses', 0)}")
 
-            # Эксперты
-            experts = stats.get('active_experts', [])
-            if experts:
-                expert_str = ", ".join(experts) if isinstance(experts[0], str) else str(experts)
-                print(f"  │ MoLE Experts:  {expert_str}")
+            # Эксперты — полный цикл волны: experts → merge → spine
+            per_wave = stats.get('per_wave_experts', [])
+            if per_wave:
+                print(f"  │ Waves ({len(per_wave)}):")
+                for we in per_wave:
+                    wave_num = we.get("wave", "?")
+                    # 1) Experts: merge left+right → top-2
+                    all_experts = we.get("left", []) + we.get("right", [])
+                    import re as _re
+                    expert_weights = {}
+                    for e in all_experts:
+                        m = _re.match(r'(\w+)\((\d+)%\)', e)
+                        if m:
+                            name, pct = m.group(1), int(m.group(2))
+                            expert_weights[name] = expert_weights.get(name, 0) + pct
+                    sorted_exp = sorted(expert_weights.items(), key=lambda kv: -kv[1])[:2]
+                    total_wt = sum(wt for _, wt in sorted_exp) or 1
+                    exp_str = " + ".join(f"{n}({wt*100//total_wt}%)" for n, wt in sorted_exp)
+                    # 2) Merge gate alpha
+                    alpha = we.get("merge_alpha", 0.5)
+                    balance = f"L{(1-alpha)*100:.0f}/R{alpha*100:.0f}"
+                    # 3) Spine
+                    spine = "✅" if we.get("spine_updated", False) else "—"
+                    print(f"  │   W{wave_num}: {exp_str} → merge({balance}) → spine({spine})")
+            else:
+                experts = stats.get('active_experts', [])
+                if experts:
+                    expert_str = ", ".join(experts) if isinstance(experts[0], str) else str(experts)
+                    print(f"  │ MoLE Experts:  {expert_str}")
 
             print(f"  │ Think Time:    {stats.get('total_ms', think_time):.0f}ms")
             print(f"  │ Logits Shape:  {list(logits.shape)}")

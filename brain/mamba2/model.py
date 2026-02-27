@@ -43,6 +43,88 @@ from brain.mamba2.bitnet import (
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+class WaveConsolidation(nn.Module):
+    """
+    Полноценный слой консолидации волны.
+    
+    Заменяет лёгкий WaveMerge+WaveGate.
+    Это «большой» слой, который объединяет результаты обоих блоков
+    и рефлексы (MoLE experts) в единый выход.
+    
+    Архитектура:
+      1. Dimension-wise Gate: σ(W · [h_L; h_R]) ∈ (0,1)^d
+         — не скаляр, а полный d_model gate
+      2. Deep Fusion MLP: [h_L; h_R] → 2d → SiLU → d → d
+         — глубокая нелинейная коррекция
+      3. Reflex integration: сигнал от MoLE stats обоих блоков
+      4. Output: gate * x_left + (1-gate) * x_right + fusion + reflex
+    """
+    
+    def __init__(self, d_model: int = 768):
+        super().__init__()
+        self.d_model = d_model
+        
+        # 1. Dimension-wise gate (полный, не скаляр)
+        self.gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.Sigmoid(),
+        )
+        
+        # 2. Deep Fusion MLP (большой слой)
+        self.fusion = nn.Sequential(
+            nn.Linear(d_model * 2, d_model * 2),
+            nn.SiLU(),
+            nn.Linear(d_model * 2, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, d_model),
+        )
+        
+        # 3. Reflex integration gate (MoLE expert signals)
+        self.reflex_gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.Tanh(),
+        )
+        
+        # 4. Output normalization
+        self.norm = nn.LayerNorm(d_model)
+        
+        # Масштаб fusion и reflex
+        self.fusion_scale = nn.Parameter(torch.tensor(0.1))
+        self.reflex_scale = nn.Parameter(torch.tensor(0.05))
+    
+    def forward(
+        self,
+        x_left: torch.Tensor,
+        x_right: torch.Tensor,
+        stats_l: dict = None,
+        stats_r: dict = None,
+    ) -> Tuple[torch.Tensor, float]:
+        """
+        x_left, x_right: [B, L, d_model]
+        Returns: (x_merged [B, L, d_model], alpha_mean: float)
+        """
+        h_left = x_left.mean(dim=1)   # [B, d_model]
+        h_right = x_right.mean(dim=1)  # [B, d_model]
+        h_cat = torch.cat([h_left, h_right], dim=-1)  # [B, 2*d_model]
+        
+        # 1. Dimension-wise gate
+        alpha = self.gate(h_cat)  # [B, d_model]
+        alpha_3d = alpha.unsqueeze(1)  # [B, 1, d_model]
+        x_gated = (1 - alpha_3d) * x_left + alpha_3d * x_right
+        
+        # 2. Deep fusion correction
+        fusion = self.fusion(h_cat)  # [B, d_model]
+        
+        # 3. Reflex integration
+        reflex_signal = self.reflex_gate(h_cat)  # [B, d_model]
+        
+        # Combine
+        x = x_gated + self.fusion_scale * fusion.unsqueeze(1) \
+                     + self.reflex_scale * reflex_signal.unsqueeze(1)
+        
+        return self.norm(x), alpha.mean().item()
+
+
 class TarsMamba2LM(nn.Module):
     """
     ТАРС v3: Deep WuNeng Core (Mamba-2 + RWKV-7 inside one kernel).
@@ -140,24 +222,14 @@ class TarsMamba2LM(nn.Module):
             for i in range(n_layers)
         ])
         
-        # ═══ Wave Merge Gates (6 gates для 12/2=6 волн) ═══
-        # Каждый merge сливает 2 параллельных блока в один выход
+        # ═══ Wave Consolidation (6 слоёв для 12/2=6 волн) ═══
+        # Каждый consolidation — полноценный слой слияния:
+        #   1. Dimension-wise gate (не скаляр, а полный d_model)
+        #   2. Deep fusion MLP (2d → 2d → d → d) 
+        #   3. Reflex integration (MoLE expert signal)
         n_waves = n_layers // 2
-        self.wave_merges = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(d_model * 2, d_model),
-                nn.SiLU(),
-                nn.Linear(d_model, d_model),
-            )
-            for _ in range(n_waves)
-        ])
-        # Обучаемый гейт: сколько от каждого из 2 блоков взять
-        self.wave_gates = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(d_model * 2, 1),
-                nn.Sigmoid(),
-            )
-            for _ in range(n_waves)
+        self.wave_consolidations = nn.ModuleList([
+            WaveConsolidation(d_model) for _ in range(n_waves)
         ])
         
         # ═══ IDME Matrix Pool (48+, бесконечное расширение) ═══
@@ -198,6 +270,81 @@ class TarsMamba2LM(nn.Module):
         
         # MoLE auxiliary loss (accumulated during forward)
         self.mole_aux_loss = torch.tensor(0.0)
+        
+        # ═══ Cached SSM states for fast generation ═══
+        self._gen_cache = None  # Initialized by reset_cache()
+    
+    def reset_cache(self):
+        """Сброс кеша SSM-состояний (вызывать перед новым промптом)."""
+        self._gen_cache = {
+            "wkv_states": [None] * self.n_layers,
+            "x_prevs": [None] * self.n_layers,
+            "ssd_states": [None] * self.n_layers,
+            "conv_states": [None] * self.n_layers,
+            "memory_vec": None,
+        }
+    
+    @torch.no_grad()
+    def step(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Fast single-step forward для генерации.
+        
+        Использует кешированные SSM-состояния — не пересоздаёт их.
+        Вызывать после reset_cache() + prefill через forward().
+        
+        token_ids: [B, L] (обычно L=1 для авторегрессии)
+        Returns: logits [B, L, vocab_size]
+        """
+        if self._gen_cache is None:
+            self.reset_cache()
+        
+        c = self._gen_cache
+        x = self.embedding(token_ids)
+        
+        n_waves = self.n_layers // 2
+        
+        for wave_idx in range(n_waves):
+            b_left = wave_idx * 2
+            b_right = wave_idx * 2 + 1
+            
+            x_left, c["wkv_states"][b_left], c["x_prevs"][b_left], _, \
+                c["ssd_states"][b_left], c["conv_states"][b_left] = self.blocks[b_left](
+                    x, c["wkv_states"][b_left], c["x_prevs"][b_left],
+                    c["memory_vec"], None,
+                    c["ssd_states"][b_left], c["conv_states"][b_left]
+                )
+            x_right, c["wkv_states"][b_right], c["x_prevs"][b_right], _, \
+                c["ssd_states"][b_right], c["conv_states"][b_right] = self.blocks[b_right](
+                    x, c["wkv_states"][b_right], c["x_prevs"][b_right],
+                    c["memory_vec"], None,
+                    c["ssd_states"][b_right], c["conv_states"][b_right]
+                )
+            
+            # Wave Consolidation (full merge layer)
+            x, _ = self.wave_consolidations[wave_idx](x_left, x_right)
+            
+            # Spine: обновляем память между волнами
+            if wave_idx < n_waves - 1 and hasattr(self, 'to_memory_space'):
+                try:
+                    h_curr = x.mean(dim=1)
+                    h_for_mem = self.to_memory_space(h_curr)
+                    if c["memory_vec"] is None:
+                        c["memory_vec"] = h_for_mem
+                    else:
+                        c["memory_vec"] = 0.7 * c["memory_vec"] + 0.3 * h_for_mem
+                except Exception:
+                    pass
+        
+        # Final memory injection + output
+        if c["memory_vec"] is not None and hasattr(self, 'from_memory_space'):
+            try:
+                mem_signal = self.from_memory_space(c["memory_vec"])
+                x = x + 0.1 * mem_signal.unsqueeze(1)
+            except Exception:
+                pass
+        
+        x = self.norm_f(x)
+        return self.lm_head(x)
     
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -217,7 +364,7 @@ class TarsMamba2LM(nn.Module):
         """
         Forward pass (для обучения и генерации).
         Использует Parallel Wave Merge: [B0||B1] → gate → merge → ...
-        Все wave_merges и wave_gates обучаются через backprop.
+        Все wave_consolidations обучаются через backprop.
         
         input_ids: [B, L]
         Returns: logits [B, L, vocab_size]
@@ -275,16 +422,8 @@ class TarsMamba2LM(nn.Module):
                 if isinstance(stats, dict) and "mole_aux_loss" in stats:
                     mole_aux_total = mole_aux_total + stats["mole_aux_loss"]
             
-            # Wave Merge: gate + correction
-            h_left = x_left.mean(dim=1)
-            h_right = x_right.mean(dim=1)
-            gate_input = torch.cat([h_left, h_right], dim=-1)
-            
-            alpha = self.wave_gates[wave_idx](gate_input).unsqueeze(1)
-            x_merged = (1 - alpha) * x_left + alpha * x_right
-            
-            correction = self.wave_merges[wave_idx](gate_input).unsqueeze(1)
-            x = x_merged + 0.1 * correction
+            # Wave Consolidation: full merge with reflex integration
+            x, _ = self.wave_consolidations[wave_idx](x_left, x_right, stats_l, stats_r)
             
             # ═══ Спинной мозг: обновление памяти между волнами (Tars.txt §2.4) ═══
             # Без этого to_memory_space, mem_query_proj, mem_gate не получают
@@ -407,6 +546,7 @@ class TarsMamba2LM(nn.Module):
         surprise_signals = []
         converged_early = False
         wave_count = 0
+        per_wave_experts = []  # [{"wave": 1, "left": [...], "right": [...]}]
         
         max_waves = self.n_layers // 2   # 12/2 = 6 волн
         
@@ -436,20 +576,21 @@ class TarsMamba2LM(nn.Module):
             block_stats.extend([stats_l, stats_r])
             blocks_executed += 2
             
-            # ── Merge: обучаемый гейт сливает два выхода ──
-            h_left = x_left.mean(dim=1)   # [B, d_model]
-            h_right = x_right.mean(dim=1)
-            gate_input = torch.cat([h_left, h_right], dim=-1)  # [B, 2*d_model]
+            # Собираем экспертов с каждой волны
+            wave_experts = {
+                "wave": wave_count,
+                "left": stats_l.get("mole_experts", []),
+                "right": stats_r.get("mole_experts", []),
+            }
+            per_wave_experts.append(wave_experts)
             
-            # Гейт: 0.0=только левый, 1.0=только правый
-            alpha = self.wave_gates[wave_idx](gate_input)  # [B, 1]
-            alpha = alpha.unsqueeze(1)                       # [B, 1, 1]
-            x_merged = (1 - alpha) * x_left + alpha * x_right
+            # ── WaveConsolidation: полный слой слияния ──
+            x, merge_alpha = self.wave_consolidations[wave_idx](
+                x_left, x_right, stats_l, stats_r
+            )
             
-            # Residual: добавляем обучаемую нелинейную коррекцию
-            merge_input = torch.cat([h_left, h_right], dim=-1)
-            correction = self.wave_merges[wave_idx](merge_input)  # [B, d_model]
-            x = x_merged + 0.1 * correction.unsqueeze(1)
+            # Записываем merge данные в wave_experts
+            wave_experts["merge_alpha"] = merge_alpha
             
             # Собираем surprise
             for stats in [stats_l, stats_r]:
@@ -486,11 +627,18 @@ class TarsMamba2LM(nn.Module):
                 break
             
             # ── Спинной мозг обновляет память между волнами ──
+            spine_updated = False
             if wave_idx < max_waves - 1:
-                if hasattr(self, 'to_memory_space') and memory_vec is not None:
+                if hasattr(self, 'to_memory_space'):
                     try:
                         h_for_mem = self.to_memory_space(h_curr)
-                        memory_vec = 0.7 * memory_vec + 0.3 * h_for_mem.detach()
+                        if memory_vec is None:
+                            # Первая волна — инициализируем memory_vec
+                            memory_vec = h_for_mem.detach()
+                        else:
+                            # Спинной мозг: 70% старая + 30% новая (§2.4)
+                            memory_vec = 0.7 * memory_vec + 0.3 * h_for_mem.detach()
+                        spine_updated = True
                     except Exception:
                         pass
                 
@@ -504,6 +652,8 @@ class TarsMamba2LM(nn.Module):
                             self.titans_memory.forward(h_for_titans)
                         except Exception:
                             pass
+            
+            wave_experts["spine_updated"] = spine_updated
         
         # ═══ Titans Feedback: финальный сигнал ═══
         if hasattr(self, 'titans_memory') and self.titans_memory is not None:
@@ -519,12 +669,11 @@ class TarsMamba2LM(nn.Module):
                 except Exception as e:
                     self.logger.debug(f"Titans feedback error: {e}")
         
-        # Собираем экспертов из последнего выполненного блока
-        last_idx = min(blocks_executed - 1, len(self.blocks) - 1)
-        try:
-            active_experts = self.blocks[last_idx].mole.get_active_experts(x)
-        except Exception:
-            active_experts = []
+        # Собираем всех уникальных экспертов по всем волнам
+        all_expert_names = []
+        for we in per_wave_experts:
+            all_expert_names.extend(we.get("left", []))
+            all_expert_names.extend(we.get("right", []))
         
         # ═══ 2. Speculative Matrix Routing (IDME) ═══
         h_curr = x.mean(dim=1).detach()
@@ -612,6 +761,15 @@ class TarsMamba2LM(nn.Module):
             prev_p = ia_result["p"]
         
         # ═══ 3. Output ═══
+        # Финальная инъекция памяти спинного мозга в выход
+        # (без этого контекст, накопленный между волнами, теряется)
+        if memory_vec is not None and hasattr(self, 'from_memory_space'):
+            try:
+                mem_signal = self.from_memory_space(memory_vec)  # [B, d_model]
+                x = x + 0.1 * mem_signal.unsqueeze(1)  # [B, L, d_model]
+            except Exception:
+                pass
+        
         x = self.norm_f(x)
         logits = self.lm_head(x)
         
@@ -633,10 +791,10 @@ class TarsMamba2LM(nn.Module):
             "total_matrices": self.n_layers + total_matrices_recruited,
             "branches_tested": branches_tested,
             "branches_won": len(branches_won),
-            "active_experts": active_experts,
+            "per_wave_experts": per_wave_experts,
             "hankel_collapses": self.hankel.collapse_count,
             "surprise_layers": len(surprise_signals),
-            "rwkv_state_size_mb": (wkv_state.numel() * 4 / 1024 / 1024) if wkv_state is not None else 0,
+            "rwkv_state_size_mb": sum(s.numel() * 4 / 1024 / 1024 for s in wkv_states if s is not None),
             "total_ms": total_time,
         }
         
@@ -645,7 +803,6 @@ class TarsMamba2LM(nn.Module):
         win_ratio = f"{len(branches_won)}/{branches_tested}" if branches_tested > 0 else "0/0"
         self.logger.info(
             f"Think: {task_type} | p={stats['final_p']:.3f} | "
-            f"branches={win_ratio} | experts={active_experts} | {total_time:.0f}ms"
         )
         
         return logits, stats

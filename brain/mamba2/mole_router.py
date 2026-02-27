@@ -179,6 +179,13 @@ class MoLELayer(nn.Module):
         # Auxiliary loss для обучения роутера
         aux_loss = self._compute_aux_loss(indices, weights, logits)
         
+        # Запоминаем активных экспертов для логирования
+        self._last_expert_names = []
+        for i in range(self.router.top_k):
+            idx = indices[0, i].item()
+            w = weights[0, i].item()
+            self._last_expert_names.append(f"{TopicRouter.EXPERT_NAMES[idx]}({w:.0%})")
+        
         # Применяем top-k экспертов (batched, без Python loop по batch)
         batch_size = x.shape[0]
         delta = torch.zeros_like(h_mean)  # [B, d_model]
