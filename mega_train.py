@@ -27,6 +27,7 @@
 
 import os
 import sys
+import re
 import time
 import json
 import shutil
@@ -109,7 +110,7 @@ def gpu_info():
         import torch
         if torch.cuda.is_available():
             name = torch.cuda.get_device_name(0)
-            vram = torch.cuda.get_device_properties(0).total_mem / 1024**3
+            vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
             return name, vram
     except Exception as e:
         logger.debug(f"  gpu_info torch attempt failed: {e}")
@@ -120,7 +121,7 @@ def gpu_info():
             "import torch; "
             "print(torch.cuda.is_available()); "
             "print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else ''); "
-            "print(torch.cuda.get_device_properties(0).total_mem / 1024**3 if torch.cuda.is_available() else 0)"
+            "print(torch.cuda.get_device_properties(0).total_memory / 1024**3 if torch.cuda.is_available() else 0)"
         )
         r = subprocess.run([PYTHON, "-c", code], capture_output=True, text=True, timeout=30)
         if r.returncode == 0:
@@ -136,7 +137,6 @@ def gpu_info():
     
     # Попытка 3: напрямую через nvidia-smi (не зависит от PyTorch)
     try:
-        import re
         r = subprocess.run(
             ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=10
@@ -166,7 +166,12 @@ def get_ram_gb():
             class MEMORYSTATUSEX(ctypes.Structure):
                 _fields_ = [("dwLength", ctypes.c_ulong),
                            ("dwMemoryLoad", ctypes.c_ulong),
-                           ("ullTotalPhys", ctypes.c_ulonglong)]
+                           ("ullTotalPhys", ctypes.c_ulonglong),
+                           ("ullAvailPhys", ctypes.c_ulonglong),
+                           ("ullTotalPageFile", ctypes.c_ulonglong),
+                           ("ullAvailPageFile", ctypes.c_ulonglong),
+                           ("ullTotalVirtual", ctypes.c_ulonglong),
+                           ("ullAvailVirtual", ctypes.c_ulonglong)]
             stat = MEMORYSTATUSEX()
             stat.dwLength = ctypes.sizeof(stat)
             kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
@@ -191,7 +196,7 @@ def _detect_cuda_version():
                 ["nvidia-smi"], capture_output=True, text=True, timeout=10
             )
             output = result2.stdout
-            import re
+
             match = re.search(r'CUDA Version:\s*(\d+)\.(\d+)', output)
             if match:
                 major = int(match.group(1))
@@ -387,12 +392,13 @@ def phase_1_download():
 #  ФАЗА 2: РЕФЛЕКСЫ (TIER 1)
 # ═════════════════════════════════════════════════════════════════════════
 
-def phase_2_reflex():
+def phase_2_reflex(quick: bool = False):
     """Обучение рефлексного классификатора."""
     banner(2, "Рефлексы (MinGRU Classifier)")
     
+    epochs = "10" if quick else "100"
     return run([PYTHON, TRAINING / "train_reflex.py",
-        "--epochs", "100",          # 100 эпох для максимальной точности
+        "--epochs", epochs,
         "--lr", "0.002",
     ])
 
@@ -401,9 +407,20 @@ def phase_2_reflex():
 #  ФАЗА 3: MinGRU LANGUAGE MODEL (TIER 1 / System 1)
 # ═════════════════════════════════════════════════════════════════════════
 
-def phase_3_mingru(device: str):
+def phase_3_mingru(device: str, quick: bool = False):
     """Обучение MinGRU LM — быстрый языковой генератор."""
     banner(3, "MinGRU Language Model (System 1)")
+    
+    if quick:
+        logger.info("  ⚡ Quick mode: dim=256, layers=4, 3 эпохи")
+        return run([PYTHON, TRAINING / "train_mingru.py",
+            "--epochs", "3",
+            "--lr", "3e-3",
+            "--dim", "256",
+            "--layers", "4",
+            "--batch", "16",
+            "--seq_len", "128",
+        ])
     
     return run([PYTHON, TRAINING / "train_mingru.py",
         "--epochs", "25",           # 25 эпох (быстро на GPU)
@@ -420,7 +437,7 @@ def phase_3_mingru(device: str):
 #  ФАЗА 4: MAMBA-2 BRAIN (TIER 2 / System 2) — ОСНОВНОЕ ОБУЧЕНИЕ
 # ═════════════════════════════════════════════════════════════════════════
 
-def phase_4_mamba2(device: str, resume: bool = False):
+def phase_4_mamba2(device: str, resume: bool = False, quick: bool = False):
     """
     Обучение Mamba-2 brain — полная архитектура.
     
@@ -453,16 +470,30 @@ def phase_4_mamba2(device: str, resume: bool = False):
             logger.warning(f"  ⚠ Transfer failed: {e}")
     
     # ═══ Базовые аргументы для RTX 4090 ═══
-    base = [
-        "--d_model", "768",         # Полная модель
-        "--n_layers", "12",         # 12 блоков TarsBlock
-        "--vocab_size", "256",      # cp1251 байты
-        "--batch", "16",            # 16 × seq → 24GB VRAM OK
-        "--accum_steps", "4",       # Effective batch = 64
-        "--device", device,
-        "--curriculum",             # Curriculum learning (64→128→256)
-        "--label_smoothing", "0.1",
-    ]
+    if quick:
+        logger.info("  ⚡ Quick mode: d_model=256, n_layers=4, 1 эпоха на фазу")
+        base = [
+            "--d_model", "256",
+            "--n_layers", "4",
+            "--vocab_size", "256",
+            "--batch", "8",
+            "--accum_steps", "2",
+            "--device", device,
+            "--curriculum",
+            "--label_smoothing", "0.1",
+            "--max_samples", "500",
+        ]
+    else:
+        base = [
+            "--d_model", "768",         # Полная модель
+            "--n_layers", "12",         # 12 блоков TarsBlock
+            "--vocab_size", "256",      # cp1251 байты
+            "--batch", "16",            # 16 × seq → 24GB VRAM OK
+            "--accum_steps", "4",       # Effective batch = 64
+            "--device", device,
+            "--curriculum",             # Curriculum learning (64→128→256)
+            "--label_smoothing", "0.1",
+        ]
     if emb_path:
         base += ["--pretrained_emb", emb_path]
     
@@ -470,40 +501,41 @@ def phase_4_mamba2(device: str, resume: bool = False):
     
     # ── Phase 1: Full pretrain (все компоненты) ──
     logger.info("── Phase 1/4: Full pretrain (SSD + WKV + Ω-SSM + MoLE + WaveMerge) ──")
+    quick_epochs = "1"
     results["p1"] = run([PYTHON, TRAINING / "train_mamba2.py"] + base + [
-        "--epochs", "8",            # 8 эпох (24ч сессия → ~6ч на Phase 1)
+        "--epochs", quick_epochs if quick else "5",  # Tars.txt §7.3
         "--lr", "3e-4",
         "--phase", "1",
-        "--seq_len", "256",
+        "--seq_len", "128" if quick else "256",
     ])
     
     # ── Phase 2: Fine-tune WKV + Fusion (SSD frozen) ──
     logger.info("── Phase 2/4: Fine-tune WKV + Fusion (SSD frozen) ──")
     results["p2"] = run([PYTHON, TRAINING / "train_mamba2.py"] + base + [
-        "--epochs", "5",            # 5 эпох (24ч → ~5ч на Phase 2)
+        "--epochs", quick_epochs if quick else "3",  # Tars.txt §7.3
         "--lr", "1e-4",
         "--phase", "2",
-        "--seq_len", "512",         # Длинный контекст
+        "--seq_len", "128" if quick else "512",
         "--resume",
     ])
     
     # ── Phase 3: Fine-tune MoLE + MatrixPool + WaveMerge ──
     logger.info("── Phase 3/4: Fine-tune MoLE + MatrixPool + WaveMerge ──")
     results["p3"] = run([PYTHON, TRAINING / "train_mamba2.py"] + base + [
-        "--epochs", "3",            # 3 эпохи (24ч → ~4ч на Phase 3)
+        "--epochs", quick_epochs if quick else "2",  # Tars.txt §7.3
         "--lr", "3e-5",
         "--phase", "3",
-        "--seq_len", "512",
+        "--seq_len", "128" if quick else "512",
         "--resume",
     ])
     
     # ── Phase 4: Fine-tune WKV RAG State + Memory Integration ──
     logger.info("── Phase 4/4: Fine-tune WKV + RAG + Memory Injection ──")
     results["p4"] = run([PYTHON, TRAINING / "train_mamba2.py"] + base + [
-        "--epochs", "3",            # 3 эпохи (24ч → ~4ч на Phase 4)
+        "--epochs", quick_epochs if quick else "2",  # Tars.txt §7.3
         "--lr", "1.5e-5",
         "--phase", "4",
-        "--seq_len", "512",
+        "--seq_len", "128" if quick else "512",
         "--resume",
     ])
     
@@ -521,7 +553,7 @@ def phase_4_mamba2(device: str, resume: bool = False):
 #  ФАЗА 5: КВАНТИЗАЦИЯ 1.58-bit
 # ═════════════════════════════════════════════════════════════════════════
 
-def phase_5_quantize(device: str):
+def phase_5_quantize(device: str, quick: bool = False):
     """Квантизация FP16 → 1.58-bit + дообучение."""
     banner(5, "Квантизация BitNet 1.58-bit")
     
@@ -542,7 +574,7 @@ def phase_5_quantize(device: str):
         "--n_layers", "12",
         "--batch", "16",
         "--accum_steps", "4",
-        "--epochs", "5",            # 5 эпох STE дообучения (~5ч на 4090)
+        "--epochs", "1" if quick else "3",  # Tars.txt §7.5
         "--lr", "5e-5",
         "--phase", "1",
         "--quant",                  # 1.58-bit режим (STE)
@@ -730,6 +762,9 @@ def main():
     logger.info(f"  ⏰ Start:  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("")
     
+    if args.quick:
+        logger.info("  ⚡ QUICK MODE: уменьшенная модель (256d, 4 слоя, 1 эпоха)")
+    
     if device == "cuda" and vram < 8:
         logger.warning("⚠ VRAM < 8GB — рекомендуется уменьшить batch size")
     
@@ -740,10 +775,10 @@ def main():
     phases = {
         0: ("install", lambda: phase_0_install()),
         1: ("download", lambda: phase_1_download()),
-        2: ("reflex", lambda: phase_2_reflex()),
-        3: ("mingru", lambda: phase_3_mingru(device)),
-        4: ("mamba2", lambda: phase_4_mamba2(device)),
-        5: ("quantize", lambda: phase_5_quantize(device)),
+        2: ("reflex", lambda: phase_2_reflex(quick=args.quick)),
+        3: ("mingru", lambda: phase_3_mingru(device, quick=args.quick)),
+        4: ("mamba2", lambda: phase_4_mamba2(device, quick=args.quick)),
+        5: ("quantize", lambda: phase_5_quantize(device, quick=args.quick)),
         7: ("validate", lambda: phase_7_validate()),
     }
     
@@ -753,6 +788,9 @@ def main():
             name, func = phases[args.phase]
             results[name] = func()
         elif args.phase == 6:
+            # Помечаем все остальные фазы как "skipped"
+            for pn in ["install", "download", "reflex", "mingru", "mamba2", "quantize", "validate"]:
+                results[pn] = "skipped"
             phase_6_consolidate(results, time.time() - t0)
         else:
             logger.error(f"Неизвестная фаза: {args.phase}")
@@ -779,24 +817,23 @@ def main():
         results["download"] = True
     
     # Фаза 2: Рефлексы
-    results["reflex"] = phase_2_reflex()
+    results["reflex"] = phase_2_reflex(quick=args.quick)
     
     # Фаза 3: MinGRU
-    results["mingru"] = phase_3_mingru(device)
+    results["mingru"] = phase_3_mingru(device, quick=args.quick)
     
     # Фаза 4: Mamba-2 (основное обучение)
-    results["mamba2"] = phase_4_mamba2(device)
+    results["mamba2"] = phase_4_mamba2(device, quick=args.quick)
     
     # Фаза 5: Квантизация
     if not args.skip_quantize:
-        results["quantize"] = phase_5_quantize(device)
+        results["quantize"] = phase_5_quantize(device, quick=args.quick)
     else:
         logger.info("⏭ Пропуск квантизации (--skip-quantize)")
         results["quantize"] = True
     
     # Фаза 6: Сборка
-    total_time = time.time() - t0
-    phase_6_consolidate(results, total_time)
+    phase_6_consolidate(results, time.time() - t0)
     
     # Фаза 7: Валидация
     results["validate"] = phase_7_validate()
