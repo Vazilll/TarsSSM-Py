@@ -745,21 +745,40 @@ def phase_5_quantize(device: str, quick: bool = False):
     fp16_size = fp16_path.stat().st_size / 1024 / 1024
     logger.info(f"  Размер FP16: {fp16_size:.1f} MB")
     
-    # Квантизация + дообучение 5 эпох
-    return run([PYTHON, TRAINING / "train_mamba2.py",
-        "--d_model", "768",
-        "--n_layers", "12",
-        "--batch", "16",
-        "--accum_steps", "4",
-        "--epochs", "1" if quick else "3",  # Tars.txt §7.5
+    # Читаем конфиг из чекпоинта (d_model, n_layers могут отличаться в quick mode)
+    try:
+        import torch
+        ckpt = torch.load(str(fp16_path), map_location="cpu", weights_only=False)
+        cfg = ckpt.get("config", {})
+        d_model = str(cfg.get("d_model", 256 if quick else 768))
+        n_layers = str(cfg.get("n_layers", 4 if quick else 12))
+        vocab_size = str(cfg.get("vocab_size", 256))
+        del ckpt
+        logger.info(f"  Конфиг из checkpoint: d_model={d_model}, n_layers={n_layers}")
+    except Exception:
+        d_model = "256" if quick else "768"
+        n_layers = "4" if quick else "12"
+        vocab_size = "256"
+    
+    # Квантизация + дообучение
+    quant_args = [PYTHON, TRAINING / "train_mamba2.py",
+        "--d_model", d_model,
+        "--n_layers", n_layers,
+        "--vocab_size", vocab_size,
+        "--batch", "16" if not quick else "8",
+        "--accum_steps", "4" if not quick else "2",
+        "--epochs", "1" if quick else "3",
         "--lr", "5e-5",
         "--phase", "1",
-        "--quant",                  # 1.58-bit режим (STE)
+        "--quant",
         "--resume",
         "--device", device,
-        "--seq_len", "256",
+        "--seq_len", "128" if quick else "256",
         "--label_smoothing", "0.1",
-    ])
+        "--no_wiki",
+        "--no_compile",
+    ]
+    return run(quant_args)
 
 
 # ═════════════════════════════════════════════════════════════════════════
