@@ -975,7 +975,7 @@ def main():
         if instruct_texts and results.get("mamba2"):
             # Загрузить обученную модель
             from brain.mamba2.model import TarsMamba2LM
-            model_path = ROOT / "models" / "tars_v3" / "brain_mamba2.pt"
+            model_path = ROOT / "models" / "tars_v3" / "mamba2.pt"
             if model_path.exists():
                 import torch
                 state = torch.load(model_path, map_location=device, weights_only=False)

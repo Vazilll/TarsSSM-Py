@@ -93,30 +93,58 @@ def train(args):
 
     # ═══ Данные ═══
     logger.info(f"Загрузка Common Voice Russian ({args.samples} train, {args.val_samples} val)...")
+    ds_train, ds_val = None, None
+    
+    # Попытка 1: Common Voice 17
     try:
         ds_train = load_dataset(
             "mozilla-foundation/common_voice_17_0", "ru",
             split=f"train[:{args.samples}]",
-            trust_remote_code=True,
         )
         ds_val = load_dataset(
             "mozilla-foundation/common_voice_17_0", "ru",
             split=f"validation[:{args.val_samples}]",
-            trust_remote_code=True,
         )
+        logger.info("✅ Common Voice 17 загружен")
     except Exception as e:
         logger.warning(f"Common Voice 17 недоступен: {e}")
-        logger.info("Пробуем Common Voice 11...")
-        ds_train = load_dataset(
-            "mozilla-foundation/common_voice_11_0", "ru",
-            split=f"train[:{args.samples}]",
-            trust_remote_code=True,
-        )
-        ds_val = load_dataset(
-            "mozilla-foundation/common_voice_11_0", "ru",
-            split=f"validation[:{args.val_samples}]",
-            trust_remote_code=True,
-        )
+    
+    # Попытка 2: Common Voice 11
+    if ds_train is None:
+        try:
+            logger.info("Пробуем Common Voice 11...")
+            ds_train = load_dataset(
+                "mozilla-foundation/common_voice_11_0", "ru",
+                split=f"train[:{args.samples}]",
+            )
+            ds_val = load_dataset(
+                "mozilla-foundation/common_voice_11_0", "ru",
+                split=f"validation[:{args.val_samples}]",
+            )
+            logger.info("✅ Common Voice 11 загружен")
+        except Exception as e:
+            logger.warning(f"Common Voice 11 недоступен: {e}")
+    
+    # Попытка 3: Google FLEURS (всегда доступен)
+    if ds_train is None:
+        try:
+            logger.info("Пробуем Google FLEURS (ru_ru)...")
+            ds_train = load_dataset(
+                "google/fleurs", "ru_ru",
+                split=f"train[:{args.samples}]",
+            )
+            ds_val = load_dataset(
+                "google/fleurs", "ru_ru",
+                split=f"validation[:{args.val_samples}]",
+            )
+            # FLEURS uses "transcription" instead of "sentence"
+            ds_train = ds_train.rename_column("transcription", "sentence")
+            ds_val = ds_val.rename_column("transcription", "sentence")
+            logger.info("✅ Google FLEURS загружен")
+        except Exception as e:
+            logger.error(f"FLEURS тоже недоступен: {e}")
+            logger.error("❌ Нет доступных аудио-датасетов. Пропуск Whisper.")
+            return
 
     # Ресемплинг до 16kHz
     ds_train = ds_train.cast_column("audio", Audio(sampling_rate=16000))

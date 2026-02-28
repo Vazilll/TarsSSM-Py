@@ -527,12 +527,14 @@ def train(args):
     print(f"{'═'*60}\n")
     
     # ═══ torch.compile (30-50% ускорение) ═══
+    compiled_model = None
     if hasattr(torch, 'compile') and not args.no_compile and device.type == 'cuda':
         try:
-            model = torch.compile(model, mode="reduce-overhead")
+            compiled_model = torch.compile(model, mode="reduce-overhead")
             print("  ⚡ torch.compile enabled (reduce-overhead mode)")
         except Exception as e:
             print(f"  ⚠ torch.compile failed: {e}")
+    forward_model = compiled_model if compiled_model is not None else model
     
     # ═══ Curriculum Learning ═══
     curriculum_schedule = None
@@ -579,7 +581,7 @@ def train(args):
             
             if use_amp:
                 with torch.amp.autocast('cuda', dtype=amp_dtype):
-                    logits = model(batch_in)
+                    logits = forward_model(batch_in)
                     lm_loss = F.cross_entropy(
                         logits.view(-1, actual_vocab),
                         batch_tgt.view(-1),
@@ -592,7 +594,7 @@ def train(args):
                 else:
                     loss.backward()  # bfloat16: no scaler needed
             else:
-                logits = model(batch_in)
+                logits = forward_model(batch_in)
                 lm_loss = F.cross_entropy(
                     logits.view(-1, actual_vocab),
                     batch_tgt.view(-1),
@@ -626,7 +628,7 @@ def train(args):
             for j in range(0, len(c_test_in), args.batch):
                 test_batch = c_test_in[j:j+args.batch].to(device)
                 test_tgt_batch = c_test_tgt[j:j+args.batch].to(device)
-                logits = model(test_batch)
+                logits = forward_model(test_batch)
                 el = F.cross_entropy(
                     logits.view(-1, actual_vocab),
                     test_tgt_batch.view(-1)
