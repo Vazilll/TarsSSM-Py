@@ -566,14 +566,14 @@ def phase_4_mamba2(device: str, resume: bool = False, quick: bool = False):
             "--d_model", "256",
             "--n_layers", "4",
             "--vocab_size", "256",
-            "--batch", "8",
-            "--accum_steps", "2",
+            "--batch", "32",             # T4: 14.6 GB VRAM, 256d модель = ~2 GB → batch=32 OK
+            "--accum_steps", "1",        # Не накапливаем — прямой step
             "--device", device,
             "--curriculum",
             "--label_smoothing", "0.1",
             "--max_samples", "500",
-            "--no_compile",  # T4 не поддерживает linalg.solve в FP16 через compile
-            "--no_wiki",     # Вики уже пропущена в фазе 1
+            "--no_compile",
+            "--no_wiki",
         ]
     else:
         base = [
@@ -602,7 +602,7 @@ def phase_4_mamba2(device: str, resume: bool = False, quick: bool = False):
         "--epochs", quick_epochs if quick else "5",  # Tars.txt §7.3
         "--lr", "3e-4",
         "--phase", "1",
-        "--seq_len", "128" if quick else "256",
+        "--seq_len", "256" if quick else "256",
     ])
     
     # ── Phase 2: Fine-tune WKV + Fusion (SSD frozen) ──
@@ -611,7 +611,7 @@ def phase_4_mamba2(device: str, resume: bool = False, quick: bool = False):
         "--epochs", quick_epochs if quick else "3",  # Tars.txt §7.3
         "--lr", "1e-4",
         "--phase", "2",
-        "--seq_len", "128" if quick else "512",
+        "--seq_len", "256" if quick else "512",
         "--resume",
     ])
     
@@ -621,7 +621,7 @@ def phase_4_mamba2(device: str, resume: bool = False, quick: bool = False):
         "--epochs", quick_epochs if quick else "2",  # Tars.txt §7.3
         "--lr", "3e-5",
         "--phase", "3",
-        "--seq_len", "128" if quick else "512",
+        "--seq_len", "256" if quick else "512",
         "--resume",
     ])
     
@@ -631,7 +631,7 @@ def phase_4_mamba2(device: str, resume: bool = False, quick: bool = False):
         "--epochs", quick_epochs if quick else "2",  # Tars.txt §7.3
         "--lr", "1.5e-5",
         "--phase", "4",
-        "--seq_len", "128" if quick else "512",
+        "--seq_len", "256" if quick else "512",
         "--resume",
     ])
     
@@ -1143,8 +1143,7 @@ def main():
     # Фаза 7: Валидация мозга
     results["validate"] = phase_7_validate()
     
-    # ═══ ГОЛОСОВОЙ ПАЙПЛАЙН (Фазы 8-10) ═══
-    if not args.skip_voice:
+    if not args.skip_voice and not args.quick:
         # Фаза 8: Whisper STT fine-tune
         results["whisper"] = phase_8_whisper(device, quick=args.quick)
         
@@ -1154,7 +1153,10 @@ def main():
         # Фаза 10: Квантизация голосовых ONNX
         results["voice_quant"] = phase_10_quantize_voice()
     else:
-        logger.info("⏭ Пропуск голосовых фаз (--skip-voice)")
+        if args.quick:
+            logger.info("⏭ Пропуск голосовых фаз (quick mode — нет аудио данных)")
+        else:
+            logger.info("⏭ Пропуск голосовых фаз (--skip-voice)")
         results["whisper"] = True
         results["piper"] = True
         results["voice_quant"] = True
@@ -1187,10 +1189,16 @@ def main():
                     tokens = list(text.encode('cp1251', errors='replace')[:1024])
                     return torch.tensor([tokens], dtype=torch.long)
                 
+                # В quick mode — ограничиваем количество примеров
+                max_instruct = 500 if args.quick else len(instruct_texts)
+                used_texts = instruct_texts[:max_instruct]
+                logger.info(f"  📚 Instruction tuning: {len(used_texts)} примеров" + 
+                           (f" (из {len(instruct_texts)}, quick mode)" if args.quick else ""))
+                
                 model = train_instruct(
-                    model, tokenize_cp1251, instruct_texts,
-                    epochs=2 if args.quick else 3,
-                    lr=5e-5, batch_size=4
+                    model, tokenize_cp1251, used_texts,
+                    epochs=1 if args.quick else 3,
+                    lr=5e-5, batch_size=8 if args.quick else 4
                 )
                 
                 # Сохранить

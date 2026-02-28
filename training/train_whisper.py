@@ -132,12 +132,10 @@ def train(args):
             ds_train = load_dataset(
                 "google/fleurs", "ru_ru",
                 split=f"train[:{args.samples}]",
-                trust_remote_code=True,
             )
             ds_val = load_dataset(
                 "google/fleurs", "ru_ru",
                 split=f"validation[:{args.val_samples}]",
-                trust_remote_code=True,
             )
             # FLEURS uses "transcription" instead of "sentence"
             ds_train = ds_train.rename_column("transcription", "sentence")
