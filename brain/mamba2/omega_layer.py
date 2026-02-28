@@ -25,7 +25,13 @@ def cayley_transform(omega: torch.Tensor) -> torch.Tensor:
     G = (I + Ω/2)(I - Ω/2)⁻¹
     
     Быстрее matrix_exp, не требует eigenvalue decomposition.
+    Note: linalg.solve requires float32 (not supported in Half on CUDA).
     """
+    orig_dtype = omega.dtype
+    # linalg.solve не поддерживает Half — кастим в float32
+    if omega.dtype == torch.float16 or omega.dtype == torch.bfloat16:
+        omega = omega.float()
+    
     n = omega.shape[-1]
     I = torch.eye(n, device=omega.device, dtype=omega.dtype)
     if omega.dim() == 3:
@@ -33,7 +39,7 @@ def cayley_transform(omega: torch.Tensor) -> torch.Tensor:
     
     half_omega = omega * 0.5
     G = torch.linalg.solve(I - half_omega, I + half_omega)
-    return G
+    return G.to(orig_dtype)
 
 
 class OmegaSSMLayer(nn.Module):
