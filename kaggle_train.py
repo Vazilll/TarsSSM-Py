@@ -87,7 +87,7 @@ def setup_workspace():
         # В Colab пользователь может клонировать через git
         if not WORK_DIR.exists():
             print("\n📥 Клонируй репозиторий:")
-            print("  !git clone https://github.com/YOUR/TarsSSM-Py /content/TarsSSM-Py")
+            print("  !git clone https://github.com/Vazilll/TarsSSM-Py /content/TarsSSM-Py")
             return False
         return True
     else:
