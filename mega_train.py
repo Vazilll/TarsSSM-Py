@@ -305,9 +305,6 @@ def phase_0_install():
         "sentence-transformers",
         "datasets",
         "psutil",
-        # ═══ Mamba-2 (CUDA ядра) ═══
-        "causal-conv1d",             # Causal conv1d для Mamba
-        "mamba-ssm",                 # Официальные CUDA-ядра Mamba-2 (FP16)
         # ═══ Voice (фазы 8-10) ═══
         "transformers",          # Whisper model
         "peft",                  # LoRA adapters
