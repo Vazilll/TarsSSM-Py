@@ -146,6 +146,18 @@ def load_corpus(data_path=None, download_wiki=True):
     
     corpus = "\n\n".join(parts)
     
+    # 6. TARS Identity (self-description — модель учит свою структуру)
+    identity_path = ROOT / "data" / "tars_identity.txt"
+    if identity_path.exists():
+        with open(identity_path, 'r', encoding='utf-8') as f:
+            identity_text = f.read()
+        if len(identity_text) > 100:
+            # Повторяем 5x для усиления — модель должна знать свою архитектуру
+            identity_repeated = ("\n\n" + identity_text) * 5
+            corpus = identity_repeated + "\n\n" + corpus
+            print(f"[Data] ТАРС Identity: {len(identity_text):,} символов (×5 для усиления)")
+    
+    
     # Повторяем маленький корпус
     corpus_bytes = len(corpus.encode('utf-8'))
     if corpus_bytes < 200_000:
