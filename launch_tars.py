@@ -118,7 +118,7 @@ def verify():
 
     # 3. Reflex Classifier
     try:
-        from brain.reflex_classifier import ReflexClassifier
+        from brain.reflexes.reflex_classifier import ReflexClassifier
         rc = ReflexClassifier(vocab_size=256, embed_dim=64, hidden_dim=64)
         results["ReflexClassifier"] = f"✅ {rc.count_parameters():,} params"
     except Exception as e:

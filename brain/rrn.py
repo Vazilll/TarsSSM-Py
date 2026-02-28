@@ -315,6 +315,7 @@ class TarsRRN(nn.Module):
         memory = self.rmc.initial_state(B).to(x.device)
         
         actual_steps = 0
+        all_outputs = [] if return_all else None
         for step in range(steps):
             actual_steps = step + 1
             
@@ -331,11 +332,16 @@ class TarsRRN(nn.Module):
             # 4. Этап Интеграции (GRU): слияние памяти и мысли.
             z = self.gru_cell(memory.mean(dim=1), z)
             
+            if return_all:
+                all_outputs.append(z.detach().clone())
+            
             # 5. Ранний выход (Early Exit): если уверенность > порога (напр. 0.9).
             conf = self.confidence(z)
             if n_steps is None and conf.mean().item() > self.confidence_threshold:
                 break
         
+        if return_all:
+            return z, conf, actual_steps, all_outputs
         return z, conf, actual_steps
 
 

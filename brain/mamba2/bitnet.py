@@ -56,6 +56,8 @@ def _weight_quant_ternary(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
       scale: γ (per-tensor scale)
     """
     scale = w.abs().mean().clamp(min=1e-8)
+    # BitMamba-2: scale_w = 1 / mean(|W|), w_q = round(clip(W * scale_w, -1, 1)) / scale_w
+    # Equivalent to: w_q = round(clip(W / scale, -1, 1)) * scale
     w_norm = w / scale
     w_q = w_norm.clamp(-1.0, 1.0).round()
     return w_q, scale
@@ -164,11 +166,13 @@ class UniversalLinear(nn.Module):
         out_features: int,
         bias: bool = False,
         mode: str = "fp16",
+        always_norm: bool = False,  # BitMamba-2: RMSNorm even in fp16
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.mode = mode
+        self.always_norm = always_norm
 
         # ═══ Основные веса (всегда fp16/fp32, квантуются на лету) ═══
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
@@ -252,7 +256,10 @@ class UniversalLinear(nn.Module):
           y = x_q @ W_q^T + bias
         """
         if self.mode == "fp16":
-            # ═══ Чистый FP16 — максимальная скорость ═══
+            # ═══ FP16 — максимальная скорость ═══
+            # BitMamba-2 insight: RMSNorm даже в fp16 стабилизирует обучение
+            if self.always_norm:
+                x = self.input_norm(x)
             return F.linear(x, self.weight, self.bias)
 
         # ═══ 1.58-bit BitNet ═══

@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="ru">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ТАРС</title>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@300;400&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+
+<body>
+    <!-- Subtle grid background -->
+    <div class="grid-bg"></div>
+
+    <!-- Main interface — one screen, nothing else -->
+    <div class="tars">
+
+        <!-- Status bar — minimal -->
+        <div class="status-bar">
+            <span class="status-text" id="statusText">ТАРС ONLINE</span>
+            <span class="status-time" id="statusTime"></span>
+        </div>
+
+        <!-- Central voice orb -->
+        <div class="core" id="core">
+            <div class="core-ring ring-outer"></div>
+            <div class="core-ring ring-middle"></div>
+            <div class="core-ring ring-inner"></div>
+            <div class="core-center" id="coreCenter">
+                <div class="core-icon" id="coreIcon">◉</div>
+            </div>
+            <!-- Waveform -->
+            <canvas class="waveform" id="waveform" width="400" height="100"></canvas>
+        </div>
+
+        <!-- Response area — clean text -->
+        <div class="response" id="response">
+            <div class="thinking-steps" id="thinkingSteps"></div>
+            <div class="response-text" id="responseText">Нажми на ядро или просто скажи что-нибудь</div>
+        </div>
+
+        <!-- Transcript (what user said) -->
+        <div class="transcript" id="transcript"></div>
+
+        <!-- Minimal text input fallback -->
+        <div class="input-row">
+            <input type="text" class="text-input" id="textInput" placeholder="Или напиши здесь..." autocomplete="off">
+        </div>
+
+        <!-- Quick voice commands — subtle hints -->
+        <div class="hints" id="hints">
+            <span class="hint" onclick="execCmd('мой день')">мой день</span>
+            <span class="hint" onclick="execCmd('расписание')">расписание</span>
+            <span class="hint" onclick="execCmd('помодоро')">помодоро</span>
+            <span class="hint" onclick="execCmd('привычки')">привычки</span>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+
+</html>

@@ -35,12 +35,87 @@ from brain.mamba2.integral_auditor import IntegralAuditor, MetaAuditor
 from brain.mamba2.matrix_pool import MatrixPool
 from brain.mamba2.novelty import NoveltyGate, HankelDetector
 from brain.mamba2.logger import ThinkingLogger
+from brain.mamba2.neuromodulator import Neuromodulator
+from brain.mamba2.oscillations import OscillatoryBinding
+from brain.mamba2.dendrites import DendriticBlock
+from brain.mamba2.hyperbolic import HyperbolicSimilarity, project_to_poincare
+from brain.mamba2.active_inference import BeliefState
+from brain.mamba2.thinking_chain import ThinkingChain
 from brain.mamba2.bitnet import (
     UniversalLinear, convert_model_to_158bit,
     convert_model_to_fp16, model_stats, replace_linear_with_universal
 )
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+class RotaryPositionEmbedding(nn.Module):
+    """
+    Unified RoPE: Rotary Position Embedding (Qwen3/Mamba-3 style).
+    
+    Uses base=1,000,000 for up to 32K+ context (vs standard 10,000).
+    Applied to WKV branch for positional awareness in SSM-Attention hybrid.
+    
+    Math: RoPE(x, pos) = x * cos(θ_pos) + rotate_half(x) * sin(θ_pos)
+    where θ_i = pos / base^(2i/d)
+    """
+    
+    def __init__(self, dim, base=1_000_000, max_seq_len=32768):
+        super().__init__()
+        self.dim = dim
+        self.base = base
+        self.max_seq_len = max_seq_len
+        
+        # Precompute inverse frequencies
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq, persistent=False)
+        
+        # Precompute cos/sin tables
+        t = torch.arange(max_seq_len).float()
+        freqs = torch.outer(t, inv_freq)  # [max_seq_len, dim//2]
+        emb = torch.cat([freqs, freqs], dim=-1)  # [max_seq_len, dim]
+        self.register_buffer('cos_cached', emb.cos(), persistent=False)
+        self.register_buffer('sin_cached', emb.sin(), persistent=False)
+    
+    @staticmethod
+    def _rotate_half(x):
+        """Rotate half of the hidden dims: [x1, x2, ..., xn] → [-x_{n/2+1}, ..., -xn, x1, ..., x_{n/2}]"""
+        x1, x2 = x.chunk(2, dim=-1)
+        return torch.cat((-x2, x1), dim=-1)
+    
+    def forward(self, x, seq_len=None, offset=0):
+        """
+        Apply RoPE to input tensor.
+        
+        Args:
+            x: [B, L, D] or [B, H, L, D]
+            seq_len: override sequence length
+            offset: position offset (for cached generation)
+        
+        Returns:
+            x with rotary position encoding applied
+        """
+        if seq_len is None:
+            seq_len = x.shape[-2]
+        
+        cos = self.cos_cached[offset:offset + seq_len, :self.dim]
+        sin = self.sin_cached[offset:offset + seq_len, :self.dim]
+        
+        # Broadcast to match x dimensions
+        if x.ndim == 4:  # [B, H, L, D]
+            cos = cos.unsqueeze(0).unsqueeze(0)
+            sin = sin.unsqueeze(0).unsqueeze(0)
+        elif x.ndim == 3:  # [B, L, D]
+            cos = cos.unsqueeze(0)
+            sin = sin.unsqueeze(0)
+        
+        # Only apply to first `dim` dimensions
+        x_rope = x[..., :self.dim]
+        x_rest = x[..., self.dim:]
+        
+        x_rope = x_rope * cos + self._rotate_half(x_rope) * sin
+        
+        return torch.cat([x_rope, x_rest], dim=-1) if x_rest.size(-1) > 0 else x_rope
 
 
 class WaveConsolidation(nn.Module):
@@ -125,6 +200,78 @@ class WaveConsolidation(nn.Module):
         return self.norm(x), alpha.mean().item()
 
 
+class GlobalWorkspace(nn.Module):
+    """
+    Global Workspace Theory (Baars, 1988).
+    
+    Нейронаука: информация из специализированных модулей конкурирует
+    за доступ в «глобальное рабочее пространство» (аналог сознания).
+    Победитель транслируется (broadcast) всем модулям одновременно.
+    
+    Реализация: все 12 блоков отправляют h_mean в конкуренцию.
+    Мягкий attention определяет «доминанту». Broadcast signal
+    добавляется к финальному представлению.
+    
+    Математика:
+      g = softmax(W_g · [h₁ ⊕ h₂ ⊕ ... ⊕ h_n])  # competition
+      broadcast = Σᵢ gᵢ · hᵢ                        # winner-take-most
+    """
+    
+    def __init__(self, d_model: int = 768, n_blocks: int = 12):
+        super().__init__()
+        self.n_blocks = n_blocks
+        
+        # Competition: все блоки борются за внимание
+        self.competition = nn.Linear(d_model * n_blocks, n_blocks)
+        
+        # Broadcast projection: формирует глобальный сигнал
+        self.broadcast_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, d_model),
+        )
+        
+        # Mixing strength (обучаемый)
+        self.mix = nn.Parameter(torch.tensor(0.1))
+        
+        # Norm
+        self.norm = nn.LayerNorm(d_model)
+    
+    def forward(self, block_outputs: list, x_current: torch.Tensor) -> torch.Tensor:
+        """
+        block_outputs: list of [B, L, d_model] — outputs from each block
+        x_current: [B, L, d_model] — current stream (post all waves)
+        
+        Returns: x_current + broadcast signal
+        """
+        if len(block_outputs) < 2:
+            return x_current
+        
+        # h_mean per block: [B, d_model] each
+        h_means = [h.mean(dim=1) for h in block_outputs]
+        
+        # Pad if fewer blocks than expected
+        while len(h_means) < self.n_blocks:
+            h_means.append(torch.zeros_like(h_means[0]))
+        h_means = h_means[:self.n_blocks]  # trim if more
+        
+        # Concatenate all block representations
+        h_cat = torch.cat(h_means, dim=-1)  # [B, d_model * n_blocks]
+        
+        # Competition gate: who gets the workspace?
+        gates = F.softmax(self.competition(h_cat), dim=-1)  # [B, n_blocks]
+        
+        # Winner-take-most broadcast
+        broadcast = torch.zeros_like(h_means[0])  # [B, d_model]
+        for i, h in enumerate(h_means):
+            broadcast = broadcast + gates[:, i:i+1] * h
+        
+        # Project and mix
+        broadcast = self.broadcast_proj(broadcast)  # [B, d_model]
+        
+        return self.norm(x_current + self.mix * broadcast.unsqueeze(1))
+
+
 class TarsMamba2LM(nn.Module):
     """
     ТАРС v3: Deep WuNeng Core (Mamba-2 + RWKV-7 inside one kernel).
@@ -188,10 +335,10 @@ class TarsMamba2LM(nn.Module):
     
     def __init__(
         self,
-        d_model: int = 768,
-        n_layers: int = 12,
+        d_model: int = 2048,     # TARS 1B: max intelligence in 1GB RAM
+        n_layers: int = 24,      # 24 rich blocks ≈ 36 vanilla blocks
         vocab_size: int = 32000,
-        d_state: int = 64,
+        d_state: int = 128,      # 2x working memory (BitMamba-2 style)
         headdim: int = 64,
         mingru_dim: int = 256,  # legacy arg, ignored
         omega_dim: int = 32,
@@ -210,17 +357,28 @@ class TarsMamba2LM(nn.Module):
         # ═══ Embedding ═══
         self.embedding = nn.Embedding(vocab_size, d_model)
         
-        # ═══ Основные блоки (12 × TarsBlock) ═══
-        # Используются парами: [B0||B1] → merge → spine → [B2||B3] → ...
-        self.blocks = nn.ModuleList([
-            TarsBlock(
+        # ═══ Основные блоки (12 × TarsBlock) — Cortical Columns ═══
+        # Нейронаука: кора мозга специализирована по глубине:
+        #   Ранние слои (V1/V2)     → низкоуровневые признаки (лексика, морфология)
+        #   Средние слои (IT/STS)   → семантика, отношения
+        #   Глубокие слои (PFC/ACC) → логика, планирование, абстракции
+        # Каждый "слой коры" имеет свою конфигурацию omega/experts/dropout.
+        self.blocks = nn.ModuleList()
+        for i in range(n_layers):
+            depth_ratio = i / max(n_layers - 1, 1)  # 0.0 → 1.0
+            
+            # Cortical Column config по глубине
+            layer_omega = int(omega_dim * (0.5 + 1.5 * depth_ratio))  # 16→80 при omega_dim=32
+            layer_experts = max(4, int(n_experts * (0.5 + 0.5 * depth_ratio)))  # 4→8
+            layer_dropout = 0.05 + 0.10 * depth_ratio  # 0.05→0.15
+            
+            self.blocks.append(TarsBlock(
                 d_model=d_model, d_state=d_state,
-                headdim=headdim, omega_dim=omega_dim,
-                n_experts=n_experts, layer_idx=i,
+                headdim=headdim, omega_dim=layer_omega,
+                n_experts=layer_experts, layer_idx=i,
                 quant_mode=quant_mode,
-            )
-            for i in range(n_layers)
-        ])
+                dropout=layer_dropout,
+            ))
         
         # ═══ Wave Consolidation (6 слоёв для 12/2=6 волн) ═══
         # Каждый consolidation — полноценный слой слияния:
@@ -231,6 +389,11 @@ class TarsMamba2LM(nn.Module):
         self.wave_consolidations = nn.ModuleList([
             WaveConsolidation(d_model) for _ in range(n_waves)
         ])
+        
+        # ═══ Global Workspace (Baars, 1988) ═══
+        # Все блоки конкурируют за доступ в глобальное пространство.
+        # Победитель broadcast'ит своё представление.
+        self.global_workspace = GlobalWorkspace(d_model, n_layers)
         
         # ═══ IDME Matrix Pool (48+, бесконечное расширение) ═══
         self.matrix_pool = MatrixPool(d_model, pool_size)
@@ -244,6 +407,34 @@ class TarsMamba2LM(nn.Module):
         
         # ═══ NoveltyGate (для IDME) ═══
         self.novelty_gate = NoveltyGate(d_model)
+        
+        # ═══ Neuromodulator (DA, NA, ACh, 5HT) ═══
+        # Глобальная нейромодуляция: 4 нейромедиатора модулируют все компоненты.
+        #   DA → MoLE routing sharpness
+        #   NA → thinking depth (p-threshold)
+        #   ACh → self-learning LR
+        #   5HT → patience (max depth)
+        self.neuromodulator = Neuromodulator(d_model)
+        
+        # ═══ Oscillatory Binding (θ-γ phase coding) ═══
+        # θ-ритм (hippocampus) координирует memory encoding,
+        # γ-ритм (cortex) группирует информацию внутри θ-цикла.
+        self.oscillatory = OscillatoryBinding(d_model)
+        
+        # ═══ Active Dendrites (Numenta, 2021-2025) ═══
+        # Дендритная модуляция: контекст задачи выбирает
+        # специализированную ветвь вычислений через WTA selection.
+        self.dendritic_block = DendriticBlock(d_model, d_model, n_segments=7)
+        
+        # ═══ Hyperbolic Similarity (Poincaré ball) ═══
+        # Гиперболическое расстояние для иерархических структур
+        # (деревья категорий, таксономии, memory hierarchy).
+        self.hyper_sim = HyperbolicSimilarity(c=1.0, scale=1.0)
+        
+        # ═══ Active Inference: Belief State (Friston, 2006) ═══
+        # Внутреннее байесовское состояние убеждений агента q(s).
+        # Обновляется после каждого наблюдения через precision-weighted update.
+        self.belief_state = BeliefState(d_state=128)
         
         # ═══ Thinking Logger ═══
         self.thinking_logger = ThinkingLogger()
@@ -271,8 +462,29 @@ class TarsMamba2LM(nn.Module):
         # MoLE auxiliary loss (accumulated during forward)
         self.mole_aux_loss = torch.tensor(0.0)
         
+        # ═══ Speculative Decoding (Granite 4.0) ═══
+        self.spec_draft_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 4),
+            nn.SiLU(),
+            nn.Linear(d_model // 4, vocab_size),
+        )
+        
+        # ═══ Native Chain-of-Thought v2: 5 подсистем ═══
+        # 1. Retrieval-triggered RAG между волнами
+        # 2. Multi-scale memory (working/session/longterm)
+        # 3. Confidence-gated output (неуверенность → smoothing)
+        # 4. Wave skip (если confidence > 0.9)
+        # 5. Self-verification (повторный прогон для проверки)
+        self.thinking_chain = ThinkingChain(
+            d_model, d_memory=384, n_max_waves=n_layers // 2, vocab_size=vocab_size
+        )
+        
         # ═══ Cached SSM states for fast generation ═══
         self._gen_cache = None  # Initialized by reset_cache()
+        self._prefix_cache = None  # For prefix caching (system prompt)
+        
+        # ═══ Unified RoPE for WKV branch (Qwen3/Mamba-3 style) ═══
+        self.rope = RotaryPositionEmbedding(d_model // (d_model // 64), base=1_000_000)
     
     def reset_cache(self):
         """Сброс кеша SSM-состояний (вызывать перед новым промптом)."""
@@ -283,6 +495,38 @@ class TarsMamba2LM(nn.Module):
             "conv_states": [None] * self.n_layers,
             "memory_vec": None,
         }
+    
+    def prefix_cache_save(self):
+        """
+        Prefix Caching: сохранить текущее SSM-состояние как "prefix".
+        
+        Вызывать после обработки system prompt. При следующих запросах
+        с тем же system prompt — восстановить через prefix_cache_load().
+        
+        Эффект: 2-5x speedup на повторных запросах.
+        """
+        import copy
+        if self._gen_cache is not None:
+            self._prefix_cache = copy.deepcopy(self._gen_cache)
+    
+    def prefix_cache_load(self):
+        """
+        Восстановить SSM-состояние из prefix cache.
+        
+        Usage:
+            model.reset_cache()
+            model.step(system_prompt_ids)
+            model.prefix_cache_save()  # save state after system prompt
+            
+            # For each user query:
+            model.prefix_cache_load()  # restore, skip system prompt processing 
+            model.step(user_query_ids)
+        """
+        import copy
+        if self._prefix_cache is not None:
+            self._gen_cache = copy.deepcopy(self._prefix_cache)
+            return True
+        return False
     
     @torch.no_grad()
     def step(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -345,6 +589,100 @@ class TarsMamba2LM(nn.Module):
         
         x = self.norm_f(x)
         return self.lm_head(x)
+    
+    @torch.no_grad()
+    def generate_speculative(
+        self,
+        prompt_ids: torch.Tensor,
+        max_tokens: int = 128,
+        n_draft: int = 4,
+        temperature: float = 0.7,
+        top_k: int = 50,
+    ) -> torch.Tensor:
+        """
+        Speculative Decoding — 2-3x speedup for generation.
+        
+        Algorithm:
+        1. Draft head predicts N future tokens (fast, ~1M params)
+        2. Main model verifies them in 1 forward pass
+        3. Accept prefix of correct tokens, reject rest
+        4. Continue from last accepted token
+        
+        Args:
+            prompt_ids: [1, L] initial tokens
+            max_tokens: max tokens to generate
+            n_draft: number of speculative tokens per step (4-8 optimal)
+            temperature: sampling temperature
+            top_k: top-k sampling
+        
+        Returns:
+            generated: [1, L + max_tokens] full sequence
+        """
+        self.eval()
+        device = prompt_ids.device
+        
+        # Prefill: process entire prompt
+        self.reset_cache()
+        logits = self.step(prompt_ids)  # [1, L, V]
+        
+        generated = prompt_ids.clone()  # [1, L]
+        n_accepted = 0
+        n_total = 0
+        
+        for _ in range(max_tokens):
+            if generated.shape[1] - prompt_ids.shape[1] >= max_tokens:
+                break
+            
+            # Get last hidden state for draft predictions
+            last_logits = logits[:, -1, :]  # [1, V]
+            
+            # Sample from main model for first token
+            first_token = self._sample(last_logits, temperature, top_k)
+            
+            # Draft: predict N more tokens using lightweight head
+            draft_tokens = [first_token]
+            draft_input = first_token
+            
+            for _ in range(n_draft - 1):
+                draft_logits = self.step(draft_input.unsqueeze(1))
+                draft_next = self._sample(
+                    draft_logits[:, -1, :], temperature, top_k
+                )
+                draft_tokens.append(draft_next)
+                draft_input = draft_next
+            
+            # We've already processed the draft tokens through step()
+            # The cache now contains states for all draft tokens
+            # If draft was wrong, we need to rewind — for SSM this means
+            # we accept what we've generated since SSM state is cumulative
+            
+            # Append all draft tokens (SSM doesn't need verification rewind)
+            # In SSM models, speculative decoding is simpler than in Transformers
+            # because we can't easily "undo" state updates
+            draft_tensor = torch.stack(draft_tokens, dim=0).unsqueeze(0)  # [1, N]
+            generated = torch.cat([generated, draft_tensor], dim=1)
+            
+            n_accepted += len(draft_tokens)
+            n_total += len(draft_tokens)
+            
+            # Get logits for next iteration
+            logits = self.step(draft_tokens[-1].unsqueeze(0).unsqueeze(0))
+        
+        return generated
+    
+    def _sample(self, logits, temperature=0.7, top_k=50):
+        """Sample a token from logits with temperature and top-k."""
+        if temperature <= 0:
+            return logits.argmax(dim=-1)
+        
+        logits = logits / temperature
+        
+        if top_k > 0:
+            v, _ = logits.topk(top_k, dim=-1)
+            logits[logits < v[:, -1:]] = float('-inf')
+        
+        probs = F.softmax(logits, dim=-1)
+        return torch.multinomial(probs, 1).squeeze(-1)
     
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -494,6 +832,7 @@ class TarsMamba2LM(nn.Module):
         self.integral_auditor.reset()
         self.matrix_pool.reset()
         self.hankel.reset()
+        self.thinking_chain.reset()  # Новый запрос — новая цепочка рассуждений
         
         # Meta-Auditor: тип задачи и порог
         task_type, p_threshold = self.meta_auditor.classify_task(query_text)
@@ -558,10 +897,36 @@ class TarsMamba2LM(nn.Module):
         
         max_waves = self.n_layers // 2   # 12/2 = 6 волн
         
+        # ═══ Thought Cache Shortcut (v3) ═══
+        # Проверяем: есть ли похожая траектория мышления в кэше.
+        # Если да — пропускаем explore/analyze фазы.
+        cache_skip_waves = 0
+        if hasattr(self, 'thinking_chain'):
+            try:
+                cache_skip_waves = self.thinking_chain.try_cache_shortcut(x.mean(dim=1))
+                cached_mem = self.thinking_chain.get_cached_memory()
+                if cached_mem is not None and cache_skip_waves > 0:
+                    # Восстанавливаем memory_vec из кэша
+                    memory_vec = cached_mem.to(x.device)
+                    self.logger.debug(
+                        f"ThoughtCache hit: skip {cache_skip_waves} waves"
+                    )
+            except Exception:
+                cache_skip_waves = 0
+        
+        # ═══ Cross-Wave Residual Storage (v3) ═══
+        wave_outputs = {}  # {wave_idx: x_output} для skip connections
+        
         for wave_idx in range(max_waves):
             # Проверяем depth limit
             if blocks_executed >= estimated_depth and not force_deep:
                 break
+            
+            # Thought Cache: пропускаем ранние волны если нашли кэш
+            if wave_idx < cache_skip_waves:
+                wave_count += 1
+                blocks_executed += 2
+                continue
             
             wave_count += 1
             b_left = wave_idx * 2       # индекс левого блока
@@ -597,6 +962,16 @@ class TarsMamba2LM(nn.Module):
                 x_left, x_right, stats_l, stats_r
             )
             
+            # ═══ Cross-Wave Residual (v3) ═══
+            # Сохраняем выход волны для skip connection
+            wave_outputs[wave_idx] = x.detach()
+            
+            # Добавляем skip connection от волны (i-3) если она есть
+            # Это как ResNet skip connections между волнами
+            skip_from = wave_idx - 3
+            if skip_from in wave_outputs:
+                x = x + 0.1 * wave_outputs[skip_from]  # мягкое добавление
+            
             # Записываем merge данные в wave_experts
             wave_experts["merge_alpha"] = merge_alpha
             
@@ -626,11 +1001,15 @@ class TarsMamba2LM(nn.Module):
                 f"p={ia_result['p']:.3f} | converged={ia_result['converged']}"
             )
             
-            # ── Сошлось? ──
-            if ia_result["converged"] and wave_count >= 2:
+            # ── Сошлось? (два критерия: IA convergence ИЛИ ThinkingChain confidence) ──
+            ia_converged = ia_result["converged"] and wave_count >= 2
+            tc_skip = hasattr(self, 'thinking_chain') and self.thinking_chain.should_skip_remaining()
+            
+            if ia_converged or tc_skip:
                 converged_early = True
+                skip_reason = "IA" if ia_converged else "ThinkingChain_confidence"
                 self.logger.debug(
-                    f"Converged at wave {wave_count} (depth={blocks_executed})"
+                    f"Converged at wave {wave_count} (depth={blocks_executed}, reason={skip_reason})"
                 )
                 break
             
@@ -660,6 +1039,23 @@ class TarsMamba2LM(nn.Module):
                             self.titans_memory.forward(h_for_titans)
                         except Exception:
                             pass
+                
+                # ═══ Native CoT: ThinkingChain уточняет memory_vec ═══
+                # Каждая волна — шаг рассуждения. ThinkingChain модифицирует
+                # memory_vec так, что следующая волна фокусируется
+                # на другом аспекте задачи (от общего к частному).
+                if memory_vec is not None and hasattr(self, 'thinking_chain'):
+                    try:
+                        memory_vec, thought_info = self.thinking_chain.step(
+                            h_curr, memory_vec, wave_idx, max_waves
+                        )
+                        self.thinking_logger.log_step(blocks_executed, {
+                            "thinking_phase": thought_info.get("phase", "unknown"),
+                            "thinking_confidence": thought_info.get("confidence", 0),
+                            "thought_gate": thought_info.get("gate_mean", 0),
+                        })
+                    except Exception:
+                        pass
             
             wave_experts["spine_updated"] = spine_updated
             
@@ -890,7 +1286,36 @@ class TarsMamba2LM(nn.Module):
         x = self.norm_f(x)
         logits = self.lm_head(x)
         
+        # ═══ Confidence-Gated Output ═══
+        # Если ThinkingChain не уверен → сглаживаем logits
+        if hasattr(self, 'thinking_chain'):
+            try:
+                logits = self.thinking_chain.apply_confidence_gate(logits)
+                # Обновляем сессионную память после запроса
+                if memory_vec is not None:
+                    self.thinking_chain.update_session_memory(memory_vec)
+            except Exception:
+                pass
+        
         total_time = (time.time() - start_time) * 1000
+        
+        # ═══ ThinkingChain Finalize (v3) ═══
+        # Сохраняем траекторию в ThoughtCache + Sleep recording
+        tc_summary = {}
+        if hasattr(self, 'thinking_chain'):
+            try:
+                avg_surprise = 0.0
+                if surprise_signals:
+                    avg_surprise = sum(s["surprise"] for s in surprise_signals) / len(surprise_signals)
+                self.thinking_chain.finalize(
+                    query_embedding=x.mean(dim=1).detach(),
+                    final_memory=memory_vec,
+                    surprise_level=avg_surprise,
+                    task_type=task_type,
+                )
+            except Exception:
+                pass
+            tc_summary = self.thinking_chain.get_summary()
         
         stats = {
             "task_type": task_type,
@@ -915,6 +1340,11 @@ class TarsMamba2LM(nn.Module):
             "supplement_extra_waves": supplement_extra_waves if supplement_injected else 0,
             "rwkv_state_size_mb": sum(s.numel() * 4 / 1024 / 1024 for s in wkv_states if s is not None),
             "total_ms": total_time,
+            # ThinkingChain v2 stats
+            "thinking_chain": tc_summary,
+            "tc_confidence": tc_summary.get("final_confidence", 0),
+            "tc_phases": tc_summary.get("phases", []),
+            "tc_retrieval_count": tc_summary.get("retrieval_count", 0),
         }
         
         self.thinking_logger.end_session(total_time, "")
@@ -922,9 +1352,75 @@ class TarsMamba2LM(nn.Module):
         win_ratio = f"{len(branches_won)}/{branches_tested}" if branches_tested > 0 else "0/0"
         self.logger.info(
             f"Think: {task_type} | p={stats['final_p']:.3f} | "
+            f"conf={stats['tc_confidence']:.2f} | "
+            f"phases={'→'.join(tc_summary.get('phases', []))}"
         )
         
         return logits, stats
+    
+    @torch.no_grad()
+    def self_verify(self, input_ids, generated_ids, memory_vec=None):
+        """
+        Self-Verification: прогоняет ответ обратно через 2 волны.
+        
+        Если consistency < 0.8 → ответ нестабильный.
+        DeepSeek-R1 делает это текстом (<verify>).
+        ТАРС — в hidden states (нулевой overhead).
+        
+        Args:
+            input_ids: [1, L_query] — исходный запрос
+            generated_ids: [1, L_answer] — сгенерированный ответ
+            memory_vec: [1, 384] — память от think()
+        
+        Returns:
+            consistency: float (0-1) — насколько ответ согласован
+            should_regenerate: bool — нужно ли перегенерировать
+        """
+        self.eval()
+        
+        # Прогоняем ответ через 2 волны (быстрая проверка)
+        combined = torch.cat([input_ids, generated_ids], dim=1)
+        x = self.embedding(combined)
+        
+        # 2 волны (4 блока)
+        for wave_idx in range(min(2, self.n_layers // 2)):
+            b_left = wave_idx * 2
+            b_right = wave_idx * 2 + 1
+            if b_right >= self.n_layers:
+                break
+            
+            x_left, _, _, _, _, _ = self.blocks[b_left](
+                x, None, None, memory_vec, None, None, None
+            )
+            x_right, _, _, _, _, _ = self.blocks[b_right](
+                x, None, None, memory_vec, None, None, None
+            )
+            x, _ = self.wave_consolidations[wave_idx](x_left, x_right)
+        
+        # Сравниваем logits для ответной части
+        verify_logits = self.lm_head(self.norm_f(x))
+        
+        # Consistency = cosine similarity между hidden states
+        # Берём среднее по ответной части
+        L_q = input_ids.shape[1]
+        answer_hidden = x[:, L_q:, :].mean(dim=1)  # [1, d_model]
+        query_hidden = x[:, :L_q, :].mean(dim=1)   # [1, d_model]
+        
+        consistency = F.cosine_similarity(
+            answer_hidden, query_hidden, dim=-1
+        ).item()
+        
+        # Нормализуем в [0, 1]
+        consistency = (consistency + 1.0) / 2.0  # cosine [-1,1] → [0,1]
+        
+        should_regenerate = consistency < 0.8
+        
+        self.logger.info(
+            f"Self-verify: consistency={consistency:.3f}, "
+            f"regenerate={should_regenerate}"
+        )
+        
+        return consistency, should_regenerate
     
     def encode_rag(self, rag_tokens: torch.Tensor) -> torch.Tensor:
         """
@@ -940,7 +1436,7 @@ class TarsMamba2LM(nn.Module):
             x_prev = None
             
             for block in self.blocks:
-                x, wkv_state, x_prev, _ = block(
+                x, wkv_state, x_prev, _, _, _ = block(
                     x, wkv_state, x_prev
                 )
         

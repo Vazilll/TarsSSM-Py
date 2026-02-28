@@ -203,3 +203,116 @@ class MetaAuditor(nn.Module):
         markers = ["без ограничений", "сколько угодно", "не торопись",
                     "максимально глубоко", "бесконечно", "unlimited"]
         return any(m in text.lower() for m in markers)
+
+
+class TDValueEstimator(nn.Module):
+    """
+    TD-Learning Value Estimator (Temporal Difference, Schultz et al., 1997).
+    
+    Нейронаука: дофаминергические нейроны VTA кодируют
+    prediction error: δ = r + γ·V(s') - V(s).
+    
+    Модуль обучается предсказывать качество ответа (reward)
+    на основе скрытого состояния мозга. TD error используется
+    для адаптации порогов p в MetaAuditor:
+      - δ > 0 → ответ лучше ожиданий → снижаем порог (быстрее выходим)
+      - δ < 0 → ответ хуже → повышаем порог (думаем глубже)
+    
+    Математика:
+      V(s) = value_net(h)          # predicted quality
+      δ = r + γ·V(s') - V(s)       # TD error
+      threshold *= (1 - β · δ)     # adaptive threshold
+    """
+    
+    def __init__(self, d_model: int = 768, gamma: float = 0.95):
+        super().__init__()
+        self.gamma = gamma
+        self.logger = logging.getLogger("Tars.TDValue")
+        
+        # Value network: h_state → predicted quality ∈ (0, 1)
+        self.value_net = nn.Sequential(
+            nn.Linear(d_model, d_model // 4),
+            nn.SiLU(),
+            nn.Linear(d_model // 4, 1),
+            nn.Sigmoid(),
+        )
+        
+        # Online optimizer for TD updates
+        self.lr = 1e-3
+        self._optimizer = None
+        
+        # EMA of TD errors for logging
+        self.td_error_ema = 0.0
+        self.td_momentum = 0.9
+        
+        # Threshold adaptation strength
+        self.beta = 0.05  # conservative adaptation
+    
+    def predict_value(self, h_state: torch.Tensor) -> torch.Tensor:
+        """Предсказывает ожидаемое качество ответа."""
+        return self.value_net(h_state)  # [B, 1]
+    
+    def td_update(
+        self, 
+        h_state: torch.Tensor, 
+        reward: float,
+        h_next: torch.Tensor,
+    ) -> float:
+        """
+        Один шаг TD(0) обновления.
+        
+        Args:
+            h_state: [1, d_model] — состояние перед действием
+            reward: скаляр ∈ [0, 1] — фактическое качество
+            h_next: [1, d_model] — состояние после действия
+        
+        Returns:
+            td_error: float — prediction error (δ)
+        """
+        if self._optimizer is None:
+            self._optimizer = torch.optim.Adam(
+                self.value_net.parameters(), lr=self.lr
+            )
+        
+        # V(s)
+        V_s = self.value_net(h_state)
+        
+        # V(s') — detached (target network)
+        with torch.no_grad():
+            V_next = self.value_net(h_next)
+        
+        # TD target: r + γ · V(s')
+        td_target = reward + self.gamma * V_next
+        
+        # TD error: δ = target - V(s)
+        td_error = (td_target - V_s).item()
+        
+        # Update value network
+        loss = (V_s - td_target.detach()).pow(2).mean()
+        self._optimizer.zero_grad()
+        loss.backward()
+        self._optimizer.step()
+        
+        # EMA tracking
+        self.td_error_ema = (
+            self.td_momentum * self.td_error_ema 
+            + (1 - self.td_momentum) * td_error
+        )
+        
+        self.logger.debug(
+            f"TD: δ={td_error:.3f}, V(s)={V_s.item():.3f}, "
+            f"r={reward:.2f}, EMA(δ)={self.td_error_ema:.3f}"
+        )
+        
+        return td_error
+    
+    def adapt_threshold(self, base_threshold: float, td_error: float) -> float:
+        """
+        Адаптирует порог p на основе TD error.
+        
+        δ > 0 (лучше ожиданий) → снижаем порог → быстрее выходим
+        δ < 0 (хуже ожиданий) → повышаем порог → думаем глубже
+        """
+        adapted = base_threshold * (1.0 - self.beta * td_error)
+        # Clamp to reasonable range
+        return max(0.5, min(3.0, adapted))

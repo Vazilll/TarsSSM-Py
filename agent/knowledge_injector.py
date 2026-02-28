@@ -93,10 +93,29 @@ class KnowledgeInjector:
         if self.leann is None:
             return "[Recall: LEANN не подключен]"
         try:
-            results = self.leann.search(query, top_k=3)
+            import asyncio
+            # leann.search() is async — need to handle from sync context
+            try:
+                loop = asyncio.get_running_loop()
+                # Already in async context — can't use asyncio.run()
+                # Use synchronous fallback: direct embedding search
+                import numpy as np
+                query_emb = self.leann._get_embedding(query)
+                scores = []
+                for i, emb in enumerate(self.leann.embeddings):
+                    score = float(np.dot(query_emb, emb) / 
+                                 (np.linalg.norm(query_emb) * np.linalg.norm(emb) + 1e-8))
+                    scores.append((i, score))
+                scores.sort(key=lambda x: x[1], reverse=True)
+                results = [self.leann.texts[i] for i, _ in scores[:3]]
+            except RuntimeError:
+                # No running loop — safe to use asyncio.run()
+                results = asyncio.run(self.leann.search(query, top_k=3))
+            
             if not results:
                 return "[Recall: ничего не найдено]"
-            texts = [r.get("text", r.get("content", str(r))) for r in results]
+            # leann.search() returns list[str], not list[dict]
+            texts = [r if isinstance(r, str) else r.get("text", str(r)) for r in results]
             return "\n---\n".join(texts)
         except Exception as e:
             return f"[Recall: ошибка — {e}]"

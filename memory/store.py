@@ -83,12 +83,12 @@ class TarsMemoryHub:
     
     async def remember(self, text: str, user_id: str = "tars_user") -> dict:
         """
-        Запомнить новый факт.
+        Запомнить новый факт (Total Memory — НИЧЕГО не удаляем).
         
         1. Добавляет в LEANN (семантический индекс)
         2. Инвалидирует Memo кэш
         3. Отправляет эмбеддинг в Titans для surprise-check
-        4. Логирует в JSON с временной меткой
+        4. Логирует в JSON + SQLite с временной меткой
         
         Returns:
             dict: surprised (bool), fact_id (int)
@@ -106,7 +106,7 @@ class TarsMemoryHub:
         emb_tensor = torch.tensor(emb, dtype=torch.float32).unsqueeze(0)
         titans_result = await self.titans.update(emb_tensor)
         
-        # 4. JSON лог
+        # 4. JSON лог (Total Memory — без жёсткого лимита)
         fact_id = len(self._fact_log)
         self._fact_log.append({
             "id": fact_id,
@@ -116,9 +116,12 @@ class TarsMemoryHub:
             "surprised": titans_result.get("surprised", False),
         })
         
-        # Ограничение размера (последние 1000)
-        if len(self._fact_log) > 1000:
-            self._fact_log = self._fact_log[-1000:]
+        # SQLite архив для бесконечного хранения
+        self._archive_to_sqlite(self._fact_log[-1])
+        
+        # JSON сохраняем последние 50000 (горячий кэш)
+        if len(self._fact_log) > 50000:
+            self._fact_log = self._fact_log[-50000:]
         self._save_facts()
         
         logger.debug(f"Memory: '{text[:50]}...' (surprise={titans_result.get('surprised', False)})")
@@ -127,10 +130,11 @@ class TarsMemoryHub:
     
     async def recall(self, query: str, top_k: int = 5) -> List[str]:
         """
-        Вспомнить релевантные факты.
+        Вспомнить релевантные факты (Total Memory).
         
         1. Проверяем Memo кэш (мгновенно)
         2. Если промах → LEANN.search() → кэшируем
+        3. Дополняем из SQLite архива (full-text search)
         
         Returns:
             list[str] — релевантные факты
@@ -148,17 +152,87 @@ class TarsMemoryHub:
         results = await self.leann.search(query, top_k=top_k)
         search_ms = (time.time() - t0) * 1000
         
-        # 3. Кэшируем
+        # 3. SQLite fallback для старых фактов
+        sqlite_results = self._recall_from_sqlite(query, top_k=3)
+        for sr in sqlite_results:
+            if sr not in results:
+                results.append(sr)
+        
+        # 4. Кэшируем
         self.memo.put(query_emb, results, search_time_ms=search_ms)
         
         return results
     
+    def _archive_to_sqlite(self, fact: dict):
+        """
+        SQLite архив для бесконечного хранения (Total Memory).
+        Каждый факт сохраняется навсегда — ничего не удаляется.
+        """
+        import sqlite3
+        db_path = self.storage_path.replace('.json', '.db')
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS facts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    text TEXT NOT NULL,
+                    user_id TEXT DEFAULT 'tars_user',
+                    timestamp TEXT NOT NULL,
+                    surprised INTEGER DEFAULT 0
+                )
+            """)
+            conn.execute(
+                "INSERT INTO facts (text, user_id, timestamp, surprised) VALUES (?, ?, ?, ?)",
+                (fact["text"], fact.get("user", "tars_user"), 
+                 fact.get("time", ""), int(fact.get("surprised", False)))
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"SQLite archive error: {e}")
+    
+    def _recall_from_sqlite(self, query: str, top_k: int = 3) -> List[str]:
+        """
+        Full-text поиск по SQLite архиву (для старых фактов за пределами JSON).
+        """
+        import sqlite3
+        db_path = self.storage_path.replace('.json', '.db')
+        if not os.path.exists(db_path):
+            return []
+        try:
+            conn = sqlite3.connect(db_path)
+            # Простой LIKE-поиск по ключевым словам
+            keywords = query.split()[:3]  # первые 3 слова
+            conditions = " OR ".join([f"text LIKE ?" for _ in keywords])
+            params = [f"%{kw}%" for kw in keywords]
+            cursor = conn.execute(
+                f"SELECT text FROM facts WHERE {conditions} ORDER BY id DESC LIMIT ?",
+                params + [top_k]
+            )
+            results = [row[0] for row in cursor.fetchall()]
+            conn.close()
+            return results
+        except Exception as e:
+            logger.warning(f"SQLite recall error: {e}")
+            return []
+    
     def get_stats(self) -> dict:
         """Статистика всех подсистем памяти."""
         stats = {
-            "facts": len(self._fact_log),
+            "facts_hot": len(self._fact_log),
             "leann_docs": len(self.leann.texts) if self._leann else 0,
         }
+        # SQLite total count
+        import sqlite3
+        db_path = self.storage_path.replace('.json', '.db')
+        if os.path.exists(db_path):
+            try:
+                conn = sqlite3.connect(db_path)
+                count = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+                conn.close()
+                stats["facts_total_sqlite"] = count
+            except Exception:
+                pass
         if self._memo:
             stats["memo"] = self.memo.get_stats()
         if self._titans:

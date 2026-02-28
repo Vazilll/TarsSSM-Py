@@ -269,17 +269,23 @@ class RAGSensor(BaseSensor):
             return {"found": False, "snippets": [], "memory_vec": None}
         
         try:
-            # Поиск в LEANN
-            results = self.memory.search(query, top_k=3)
-            snippets = []
-            memory_vec = None
+            # LEANN.search() is async, but sensors run in sync ThreadPool.
+            # Use sync fallback: compute embedding + cosine similarity directly.
+            import numpy as np
+            leann = getattr(self.memory, 'leann', self.memory)
+            if not hasattr(leann, '_get_embedding') or not leann.texts:
+                return {"found": False, "snippets": [], "memory_vec": None}
             
-            if results:
-                snippets = [r.get("text", "")[:200] for r in results[:3]]
-                # Если LEANN вернул вектор — используем его
-                if hasattr(results[0], "vector"):
-                    import torch
-                    memory_vec = torch.tensor(results[0]["vector"], dtype=torch.float32)
+            query_emb = leann._get_embedding(query)
+            scores = []
+            for i, emb in enumerate(leann.embeddings):
+                score = float(np.dot(query_emb, emb) / 
+                             (np.linalg.norm(query_emb) * np.linalg.norm(emb) + 1e-8))
+                scores.append((i, score))
+            scores.sort(key=lambda x: x[1], reverse=True)
+            
+            snippets = [leann.texts[i][:200] for i, _ in scores[:3]]
+            memory_vec = None
             
             return {
                 "found": len(snippets) > 0,

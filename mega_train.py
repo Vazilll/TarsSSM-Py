@@ -502,15 +502,19 @@ def phase_4_mamba2(device: str, resume: bool = False, quick: bool = False):
         ]
     else:
         base = [
-            "--d_model", "768",         # Полная модель
-            "--n_layers", "12",         # 12 блоков TarsBlock
+            "--d_model", "2048",        # TARS 1B
+            "--n_layers", "24",         # 24 rich blocks
             "--vocab_size", "256",      # cp1251 байты
-            "--batch", "16",            # 16 × seq → 24GB VRAM OK
-            "--accum_steps", "4",       # Effective batch = 64
+            "--batch", "4",             # 4 × seq → fits 16GB VRAM (bf16+ckpt)
+            "--accum_steps", "16",      # Effective batch = 64
             "--device", device,
             "--curriculum",             # Curriculum learning (64→128→256)
             "--label_smoothing", "0.1",
         ]
+    # ═══ BitMamba-2 optimizations: bf16 + grad checkpoint ═══
+    if device != "cpu" and not quick:
+        base += ["--bf16", "--grad_ckpt"]
+    
     if emb_path:
         base += ["--pretrained_emb", emb_path]
     
@@ -941,6 +945,56 @@ def main():
         results["whisper"] = True
         results["piper"] = True
         results["voice_quant"] = True
+    
+    # ═══ INSTRUCTION TUNING (Фаза 11) ═══
+    banner(11, "Instruction Tuning (→ помощник)", total=11)
+    try:
+        from training.train_instruct import (
+            load_instruction_dataset, train_instruct, download_instruct_datasets
+        )
+        
+        # Скачать datasets если нужно
+        download_instruct_datasets()
+        
+        # Загрузить данные
+        instruct_texts = load_instruction_dataset()
+        
+        if instruct_texts and results.get("mamba2"):
+            # Загрузить обученную модель
+            from brain.mamba2.model import TarsMamba2LM
+            model_path = ROOT / "models" / "tars_v3" / "brain_mamba2.pt"
+            if model_path.exists():
+                import torch
+                state = torch.load(model_path, map_location=device, weights_only=False)
+                config = state.get("config", {})
+                model = TarsMamba2LM(**config).to(device)
+                model.load_state_dict(state["model_state_dict"], strict=False)
+                
+                def tokenize_cp1251(text):
+                    tokens = list(text.encode('cp1251', errors='replace')[:1024])
+                    return torch.tensor([tokens], dtype=torch.long)
+                
+                model = train_instruct(
+                    model, tokenize_cp1251, instruct_texts,
+                    epochs=2 if args.quick else 3,
+                    lr=5e-5, batch_size=4
+                )
+                
+                # Сохранить
+                state["model_state_dict"] = model.state_dict()
+                torch.save(state, model_path)
+                logger.info(f"✅ Instruction-tuned модель сохранена: {model_path}")
+                results["instruct"] = True
+            else:
+                logger.warning("⚠ Модель brain_mamba2.pt не найдена — пропуск instruction tuning")
+                results["instruct"] = False
+        else:
+            logger.info("⏭ Нет данных или модели для instruction tuning")
+            results["instruct"] = len(instruct_texts) == 0
+    except Exception as e:
+        logger.error(f"❌ Instruction tuning failed: {e}")
+        import traceback; traceback.print_exc()
+        results["instruct"] = False
     
     # ═══ ИТОГИ ═══
     total_time = time.time() - t0

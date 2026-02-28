@@ -25,7 +25,10 @@ app = FastAPI(title="Tars Python Hub - Ultimate Stack")
 # Singleton Services
 memory = TarsMemory()           # Vector Search
 titans = TitansMemory()         # Long-Term Neural Memory
-brain = TarsBrain()             # Recursive SSM Brain
+try:
+    brain = TarsBrain.load_pretrained()[0] if TarsBrain else None
+except Exception:
+    brain = None
 moira = MoIRA()                 # Neural Tool Router
 storage = TarsStorage()         # Persona Persistence
 vision = TarsVision()           # YOLO Workspace Analysis
@@ -164,21 +167,18 @@ async def telemetry(websocket: WebSocket):
         await websocket.send_json({
             "vision": v_data,
             "brain": {
-                "model_loaded": brain.llm is not None,
-                "recursive_loops": brain.n_loops,
-                "has_cpp_kernels": hasattr(brain, 'layers'),
-            },
-            "rrn": {
-                "working_memory_size": len(gie.rrn.working_memory),
-                "llm_loaded": gie.rrn.llm is not None,
+                "model_loaded": brain is not None and hasattr(brain, 'blocks'),
+                "n_layers": getattr(brain, 'n_layers', 0),
+                "d_model": getattr(brain, 'd_model', 0),
+                "params": sum(p.numel() for p in brain.parameters()) if brain is not None else 0,
             },
             "memory": {
-                "leann_docs": len(memory.leann.texts),
-                "storage_entries": len(storage.local_memories) if hasattr(storage, 'local_memories') else 0,
+                "leann_docs": len(memory.leann.texts) if hasattr(memory, 'leann') else 0,
+                "storage_facts": len(storage._hub._fact_log) if hasattr(storage, '_hub') else 0,
             },
             "session": {
-                "goals_processed": gie.state["total_processed"],
-                "history_size": len(gie.state["history"]),
+                "goals_processed": gie.state.get("total_processed", 0),
+                "history_size": len(gie.state.get("history", [])),
             },
             "dispatcher": dispatcher.get_stats(),
         })

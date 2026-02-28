@@ -10,9 +10,4 @@ from brain.reflexes.sensors import (
     IntentSensor, ComplexitySensor, RAGSensor,
     SystemSensor, EmotionSensor, ContextSensor, VoiceSensor,
 )
-
-# Re-export ReflexClassifier из brain/ (обратная совместимость)
-try:
-    from brain.reflex_classifier import ReflexClassifier
-except ImportError:
-    ReflexClassifier = None
+from brain.reflexes.reflex_classifier import ReflexClassifier

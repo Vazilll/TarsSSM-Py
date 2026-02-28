@@ -7,10 +7,10 @@
 Сжатие ~10x, скорость инференса ~3x.
 
 Пайплайн:
-  1. Загружает FP16 веса из models/brain/tars_mamba2.pt
+  1. Загружает FP16 веса из models/mamba2/mamba2_omega.pt
   2. Переключает все UniversalLinear → mode="158bit"
   3. Дообучает 1-2 эпохи для адаптации к квантованным весам
-  4. Сохраняет в models/brain/tars_mamba2_158bit.pt
+  4. Сохраняет в models/mamba2/mamba2_omega_158bit.pt
 
 Использование:
   python training/quantize_models.py
@@ -50,9 +50,9 @@ def quantize_brain(input_path: str = None, output_path: str = None,
     from brain.mamba2.bitnet import convert_model_to_158bit, model_stats
     
     if input_path is None:
-        input_path = str(ROOT / "models" / "brain" / "tars_mamba2.pt")
+        input_path = str(ROOT / "models" / "mamba2" / "mamba2_omega.pt")
     if output_path is None:
-        output_path = str(ROOT / "models" / "brain" / "tars_mamba2_158bit.pt")
+        output_path = str(ROOT / "models" / "mamba2" / "mamba2_omega_158bit.pt")
     
     if not os.path.exists(input_path):
         logger.error(f"❌ FP16 модель не найдена: {input_path}")
@@ -80,7 +80,7 @@ def quantize_brain(input_path: str = None, output_path: str = None,
     model = TarsMamba2LM(
         d_model=config.get("d_model", 256),
         n_layers=config.get("n_layers", 4),
-        vocab_size=config.get("vocab_size", 32000),
+        vocab_size=config.get("vocab_size", 256),
         quant_mode="fp16",  # Начинаем в FP16
     )
     

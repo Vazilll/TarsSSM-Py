@@ -15,16 +15,16 @@
 
 Использование:
   # Базовое обучение на встроенном корпусе (~5 мин на 4090)
-  python brain/min_gru/train_mingru.py
+  python training/train_mingru.py
   
   # С augmented данными из HuggingFace (~30 мин на 4090) 
-  python brain/min_gru/train_mingru.py --augment
+  python training/train_mingru.py --augment
   
   # С кастомными параметрами
-  python brain/min_gru/train_mingru.py --dim 512 --layers 6 --epochs 100 --batch 32
+  python training/train_mingru.py --dim 512 --layers 6 --epochs 100 --batch 32
   
   # Дообучение существующей модели
-  python brain/min_gru/train_mingru.py --resume
+  python training/train_mingru.py --resume
 """
 
 import os
@@ -42,7 +42,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from brain.min_gru.mingru_lm import MinGRU_LM
-from brain.min_gru.train_corpus import get_training_text
+from training.train_corpus import get_training_text
 from brain.min_gru.utils import tokenize_text, decode_tokens
 from brain.min_gru.generate import generate_text
 

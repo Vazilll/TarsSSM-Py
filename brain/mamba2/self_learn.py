@@ -249,7 +249,154 @@ class SelfLearner:
                         f"avg_loss={total_loss / n_steps:.4f}"
                     )
         
+        # 4. Synaptic Homeostasis (Tononi, 2003)
+        # Нейронаука: во время бодрствования синапсы усиливаются (LTP).
+        # Во время сна — глобальное ослабление (downscaling), сохраняющее
+        # относительные пропорции. Это улучшает SNR и освобождает ресурсы.
+        self._synaptic_downscaling()
+        
+        # 5. Hippocampal Replay (гиппокампальный реплей)
+        # Нейронаука: гиппокамп прокручивает дневной опыт во сне
+        # в 5-20× ускоренном темпе (sharp-wave ripples),
+        # приоритизируя удивительные/важные эпизоды.
+        self._hippocampal_replay()
+        
         self.logger.info("SelfLearn: 💤 Фаза сна завершена")
+    
+    def _hippocampal_replay(self, n_replays: int = 15, compression: int = 5):
+        """
+        Hippocampal Replay (Wilson & McNaughton, 1994).
+        
+        Нейронаука: во сне гиппокамп прокручивает эпизоды дня
+        в 5-20× ускоренном темпе. Приоритетные эпизоды
+        (удивительные, эмоциональные) воспроизводятся чаще.
+        
+        Математика (Prioritized Experience Replay):
+          P(i) = p_i^α / Σ_k p_k^α       # priority sampling
+          p_i = surprise_i * recency_i     # priority = surprise × recency
+          tokens_replay = tokens[::compression]  # temporal compression
+        """
+        if self.model is None:
+            return
+        
+        device = next(self.model.parameters()).device
+        if device.type != 'cuda':
+            return  # Only on GPU
+        
+        all_sessions = self._load_sessions(min_quality=0.0)
+        if len(all_sessions) < 5:
+            return
+        
+        # Compute priorities: surprise × recency
+        import numpy as np
+        priorities = []
+        for i, s in enumerate(all_sessions):
+            surprise = s.get("quality", 0.5)  # quality as proxy for importance
+            recency = 1.0 / (len(all_sessions) - i + 1)
+            priorities.append((surprise + 0.1) * recency)
+        
+        # Normalize to probability distribution
+        priorities = np.array(priorities)
+        probs = priorities / (priorities.sum() + 1e-8)
+        
+        # Sample sessions proportionally to priority
+        n_replay = min(n_replays, len(all_sessions))
+        indices = np.random.choice(len(all_sessions), size=n_replay, p=probs, replace=False)
+        
+        total_loss = 0.0
+        replayed = 0
+        
+        for idx in indices:
+            session = all_sessions[idx]
+            input_text = session.get("input", "")
+            response_text = session.get("response", "")
+            if not input_text or not response_text:
+                continue
+            
+            combined = f"{input_text}\n{response_text}"
+            tokens = list(combined.encode('cp1251', errors='replace'))
+            
+            # Temporal compression: skip every N-th token (5× faster)
+            tokens = tokens[::compression]
+            
+            if len(tokens) < 4:
+                continue
+            
+            token_tensor = torch.tensor(tokens, dtype=torch.long, device=device)
+            input_ids = token_tensor[:-1].unsqueeze(0)
+            labels = token_tensor[1:].unsqueeze(0)
+            
+            loss = self.fine_tune_step(input_ids, labels)
+            total_loss += loss
+            replayed += 1
+        
+        if replayed > 0:
+            self.logger.info(
+                f"SelfLearn: 🌙 Hippocampal replay: {replayed} episodes "
+                f"(×{compression} compression), avg_loss={total_loss / replayed:.4f}"
+            )
+    
+    def _synaptic_downscaling(self, factor: float = 0.92):
+        """
+        Synaptic Homeostasis (Tononi, 2003).
+        
+        Во время бодрствования синапсы усиливаются (LTP/fine-tune).
+        Во время сна — глобальное ослабление:
+          w_sleep = w_wake × λ,  λ ∈ (0.8, 0.95)
+        
+        Свойства:
+          - Сохраняет w₁/w₂ = const (относительную важность)
+          - Уменьшает ||w|| (энергозатраты, saturation risk)
+          - Улучшает SNR (signal-to-noise ratio)
+        
+        Трогаем ТОЛЬКО адаптивные компоненты (MoLE, Ω-SSM, NoveltyGate,
+        Memory projections), НЕ трогаем core SSD/WKV — они обучены за
+        дорогую фазу full pretrain.
+        """
+        if self.model is None:
+            return
+        
+        downscaled = 0
+        with torch.no_grad():
+            for block in self.model.blocks:
+                # MoLE expert LoRA weights (самые адаптивные)
+                if hasattr(block, 'mole'):
+                    for expert in block.mole.experts:
+                        if hasattr(expert, 'A'):
+                            expert.A.weight.data *= factor
+                        if hasattr(expert, 'B'):
+                            expert.B.weight.data *= factor
+                        downscaled += 1
+                
+                # Ω-SSM projections (Lie algebra)
+                if hasattr(block, 'omega'):
+                    if hasattr(block.omega, 'omega_proj'):
+                        block.omega.omega_proj.weight.data *= factor
+                    if hasattr(block.omega, 'omega_mix'):
+                        block.omega.omega_mix.data *= factor
+                    downscaled += 1
+                
+                # NoveltyGate
+                if hasattr(block, 'novelty_gate'):
+                    for p in block.novelty_gate.parameters():
+                        p.data *= factor
+                    downscaled += 1
+                
+                # Memory injection gates
+                if hasattr(block, 'mem_gate'):
+                    for p in block.mem_gate.parameters():
+                        p.data *= factor
+                    downscaled += 1
+            
+            # MatrixPool efficiency scores (recirculation)
+            if hasattr(self.model, 'matrix_pool'):
+                self.model.matrix_pool.efficiency *= factor
+                downscaled += 1
+        
+        self.logger.info(
+            f"SelfLearn: 🧬 Synaptic downscaling (λ={factor}): "
+            f"{downscaled} components renormalized"
+        )
     
     def _load_sessions(self, min_quality: float = 0.0, 
                        max_quality: float = 1.0) -> List[Dict]:

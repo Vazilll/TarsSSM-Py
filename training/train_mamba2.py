@@ -35,9 +35,9 @@ from brain.mamba2.model import TarsMamba2LM
 
 def parse_args():
     p = argparse.ArgumentParser(description="ТАРС Mamba-2 + RWKV-7 Training (Deep WuNeng Core)")
-    # ═══ Model params (из config.json) ═══
-    p.add_argument('--d_model', type=int, default=768)
-    p.add_argument('--n_layers', type=int, default=12)
+    # ═══ Model params ═══
+    p.add_argument('--d_model', type=int, default=2048)   # TARS 1B
+    p.add_argument('--n_layers', type=int, default=24)    # 24 rich blocks
     p.add_argument('--vocab_size', type=int, default=256)  # cp1251 bytes
     # ═══ Training params ═══
     p.add_argument('--seq_len', type=int, default=256)
@@ -63,6 +63,17 @@ def parse_args():
                    help="Путь к предобученному эмбеддингу (из MinGRU)")
     p.add_argument('--no_compile', action='store_true',
                    help="Отключить torch.compile")
+    # ═══ BitMamba-2 optimizations ═══
+    p.add_argument('--bf16', action='store_true',
+                   help="Использовать bfloat16 AMP (лучше fp16: шире динамический диапазон)")
+    p.add_argument('--grad_ckpt', action='store_true',
+                   help="Gradient checkpointing (50-70%% экономия VRAM, чуть медленнее)")
+    p.add_argument('--muon', action='store_true',
+                   help="Use Muon optimizer (2x faster than AdamW, 50%% less VRAM)")
+    p.add_argument('--wsd', action='store_true',
+                   help="Warmup-Stable-Decay scheduler (SmolLM2, better for long training)")
+    p.add_argument('--mod', action='store_true',
+                   help="Mixture of Depths: skip layers for easy tokens (-30%% compute)")
     return p.parse_args()
 
 
@@ -86,7 +97,7 @@ def load_corpus(data_path=None, download_wiki=True):
     
     # 2. Встроенный корпус (диалоги + технические тексты)
     try:
-        from brain.min_gru.train_corpus import get_training_text
+        from training.train_corpus import get_training_text
         built_in = get_training_text()
         parts.append(built_in)
         print(f"[Data] Встроенный корпус: {len(built_in):,} символов")
@@ -296,6 +307,11 @@ def train(args):
         else:
             print(f"[!] No checkpoint found — training from scratch")
     
+    # ── Gradient Checkpointing (BitMamba-2 style remat) ──
+    if args.grad_ckpt:
+        model.use_checkpointing = True
+        print("  ⚡ Gradient checkpointing enabled (50-70% VRAM savings)")
+    
     model.to(device)
     
     # ── Transfer pre-trained embedding from MinGRU ──
@@ -330,7 +346,7 @@ def train(args):
             convert_model_to_158bit(model)
             stats = model_stats(model)
             quant_mode = "158bit"
-            print(f"  Конвертировано: {stats['universal_linear_count']} слоёв UniversalLinear")
+            print(f"  Конвертировано: {stats['total_layers']} слоёв UniversalLinear")
             print(f"  Разреженность: {stats['avg_sparsity']:.1%}")
             print(f"  Обучение с STE (Straight-Through Estimator)")
         except Exception as e:
@@ -352,7 +368,12 @@ def train(args):
     if args.phase == 1:
         # Phase 1: Pre-train ALL (TarsCoreBlock + Ω-SSM + MoLE)
         print("[Phase 1] Full pre-training: ALL components")
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+        if getattr(args, 'muon', False):
+            from training.muon import Muon
+            optimizer = Muon(model.parameters(), lr=0.02, weight_decay=0.01)
+            print("  ⚡ Optimizer: Muon (2x faster, NS orthogonalization)")
+        else:
+            optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     elif args.phase == 2:
         # Phase 2: Freeze SSD-specific params. Train: WKV + Fusion + Ω-SSM + MoLE + NoveltyGate
         print("[Phase 2] Fine-tune: WKV + Fusion + Ω-SSM + MoLE + NoveltyGate (SSD params frozen)")
@@ -448,17 +469,55 @@ def train(args):
     total_steps = (estimated_samples // args.batch + 1) * args.epochs
     warmup = total_steps // 10
     
-    def lr_fn(step):
-        if step < warmup:
-            return step / max(warmup, 1)
-        progress = (step - warmup) / max(total_steps - warmup, 1)
-        return 0.5 * (1.0 + np.cos(np.pi * progress))
+    if getattr(args, 'wsd', False):
+        # ═══ WSD: Warmup-Stable-Decay (SmolLM2/MiniCPM) ═══
+        stable_end = int(total_steps * 0.7)  # 70% at stable LR
+        def lr_fn(step):
+            if step < warmup:
+                return step / max(warmup, 1)
+            elif step < stable_end:
+                return 1.0  # stable phase — full LR
+            else:
+                # decay phase: linear decay to 0.1
+                progress = (step - stable_end) / max(total_steps - stable_end, 1)
+                return max(0.1, 1.0 - 0.9 * progress)
+        print("  ⚡ Scheduler: WSD (warmup → stable → decay)")
+    else:
+        # Standard cosine annealing
+        def lr_fn(step):
+            if step < warmup:
+                return step / max(warmup, 1)
+            progress = (step - warmup) / max(total_steps - warmup, 1)
+            return 0.5 * (1.0 + np.cos(np.pi * progress))
     
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_fn)
     
-    # AMP
+    # ═══ Mixture of Depths (-30% compute) ═══
+    if getattr(args, 'mod', False):
+        from brain.mamba2.mixture_of_depths import add_mod_to_model
+        model = add_mod_to_model(model, capacity_factor=0.5)
+    
+    # ═══ torch.compile for 30% speedup ═══
+    if not args.no_compile and hasattr(torch, 'compile'):
+        try:
+            model = torch.compile(model, mode='reduce-overhead')
+            print("  ⚡ torch.compile: enabled (reduce-overhead mode)")
+        except Exception as e:
+            print(f"  ⚠ torch.compile failed: {e} — continuing without")
+    
+    # ═══ AMP (BitMamba-2: bfloat16 по умолчанию на TPU/GPU) ═══
     use_amp = device.type == 'cuda'
-    scaler = torch.amp.GradScaler('cuda') if use_amp else None
+    if use_amp and args.bf16:
+        amp_dtype = torch.bfloat16
+        scaler = None  # bfloat16 не нуждается в GradScaler
+        print("  ⚡ AMP: bfloat16 (no scaler needed, wider dynamic range)")
+    elif use_amp:
+        amp_dtype = torch.float16
+        scaler = torch.amp.GradScaler('cuda')
+        print("  ⚡ AMP: float16 + GradScaler")
+    else:
+        amp_dtype = torch.float32
+        scaler = None
     
     best_loss = float('inf')
     
@@ -519,7 +578,7 @@ def train(args):
             batch_tgt = train_tgt_s[i:i+args.batch].to(device)
             
             if use_amp:
-                with torch.amp.autocast('cuda'):
+                with torch.amp.autocast('cuda', dtype=amp_dtype):
                     logits = model(batch_in)
                     lm_loss = F.cross_entropy(
                         logits.view(-1, actual_vocab),
@@ -528,7 +587,10 @@ def train(args):
                     )
                     # MoLE auxiliary loss (load balancing + z-loss)
                     loss = (lm_loss + model.mole_aux_loss) / accum_steps
-                scaler.scale(loss).backward()
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()  # bfloat16: no scaler needed
             else:
                 logits = model(batch_in)
                 lm_loss = F.cross_entropy(
@@ -546,10 +608,10 @@ def train(args):
             
             # Gradient accumulation step
             if n_batches % accum_steps == 0 or i + args.batch >= len(train_in_s):
-                if use_amp:
+                if scaler is not None:
                     scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                if use_amp:
+                if scaler is not None:
                     scaler.step(optimizer)
                     scaler.update()
                 else:

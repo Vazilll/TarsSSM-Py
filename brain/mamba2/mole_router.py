@@ -76,6 +76,10 @@ class TopicRouter(nn.Module):
         """
         Определяет top-k экспертов для текущего состояния.
         
+        Dropless Routing (Granite 4.0):
+        - Capacity factor ensures no tokens are dropped
+        - Jitter noise for exploration during training
+        
         Args:
             h: [B, d_model]
         Returns:
@@ -86,7 +90,12 @@ class TopicRouter(nn.Module):
         # Gate logits
         logits = self.gate(h)  # [B, n_experts]
         
-        # Top-k
+        # Jitter noise for exploration (training only)
+        if self.training:
+            noise = torch.empty_like(logits).uniform_(-0.01, 0.01)
+            logits = logits + noise
+        
+        # Top-k selection
         weights, indices = logits.topk(self.top_k, dim=-1)
         weights = F.softmax(weights, dim=-1)
         
@@ -160,8 +169,25 @@ class MoLELayer(nn.Module):
         log_z = torch.logsumexp(logits, dim=-1)  # [B]
         z_loss = (log_z ** 2).mean()
         
+        # ═══ 3. Rényi Diversity Loss (α=2, collision entropy) ═══
+        # Нейронаука: мозг максимизирует информационное разнообразие
+        # нейронных ансамблей (sparse distributed representations).
+        # Rényi H_α = log(Σ pᵢ^α) / (1-α) более чувствительна к
+        # доминирующим экспертам, чем Shannon entropy.
+        # α=2 → collision entropy: штрафует ситуацию, когда один
+        # эксперт получает непропорционально большую долю нагрузки.
+        renyi_alpha = 2.0
+        expert_probs = (f + 1e-8)  # prevent log(0)
+        expert_probs = expert_probs / expert_probs.sum()  # normalize to distribution
+        renyi_entropy = torch.log(expert_probs.pow(renyi_alpha).sum()) / (1 - renyi_alpha)
+        # Maximize entropy → minimize negative entropy
+        renyi_loss = -renyi_entropy
+        
         # Итого
-        aux_loss = self.balance_coeff * load_balance_loss + self.z_loss_coeff * z_loss
+        renyi_coeff = 0.01  # conservative coefficient
+        aux_loss = (self.balance_coeff * load_balance_loss 
+                   + self.z_loss_coeff * z_loss 
+                   + renyi_coeff * renyi_loss)
         return aux_loss
     
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

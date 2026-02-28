@@ -302,7 +302,7 @@ def build_dataset(max_len=64, augment=True):
 
 
 def train(args):
-    from brain.reflex_classifier import ReflexClassifier
+    from brain.reflexes.reflex_classifier import ReflexClassifier
 
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     logger.info(f"Device: {device}")

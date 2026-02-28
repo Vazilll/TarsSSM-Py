@@ -359,7 +359,7 @@ class TarsVoice:
                 # VAD проверка
                 has_speech = False
                 if self.vad_model is not None:
-                    has_speech, vad_state = self._detect_speech_silero(
+                    has_speech, vad_state, _ = self._detect_speech_silero(
                         chunk, vad_state, sr
                     )
                 else:

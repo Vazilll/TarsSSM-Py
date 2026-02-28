@@ -1,0 +1,541 @@
+/* ═══════════════════════════════════════════════════
+   ТАРС — Minimalist Voice Interface
+   Inspired by Interstellar TARS
+   ═══════════════════════════════════════════════════ */
+
+*,
+*::before,
+*::after {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+:root {
+    --bg: #050508;
+    --surface: rgba(12, 12, 20, 0.9);
+    --accent: #818cf8;
+    --accent-dim: rgba(129, 140, 248, 0.12);
+    --accent-glow: rgba(129, 140, 248, 0.25);
+    --cyan: #67e8f9;
+    --cyan-dim: rgba(103, 232, 249, 0.08);
+    --text: rgba(255, 255, 255, 0.88);
+    --text-dim: rgba(255, 255, 255, 0.35);
+    --text-muted: rgba(255, 255, 255, 0.15);
+    --green: #34d399;
+    --red: #f87171;
+    --ring-color: rgba(129, 140, 248, 0.06);
+    --font: 'Inter', -apple-system, sans-serif;
+    --mono: 'JetBrains Mono', monospace;
+}
+
+html,
+body {
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+}
+
+/* ═══ Grid Background ═══ */
+.grid-bg {
+    position: fixed;
+    inset: 0;
+    background-image:
+        linear-gradient(rgba(129, 140, 248, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(129, 140, 248, 0.03) 1px, transparent 1px);
+    background-size: 60px 60px;
+    pointer-events: none;
+    z-index: 0;
+}
+
+/* ═══ Main Container ═══ */
+.tars {
+    position: relative;
+    z-index: 1;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 24px;
+    padding: 20px;
+}
+
+/* ═══ Status Bar ═══ */
+.status-bar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    display: flex;
+    justify-content: space-between;
+    padding: 16px 24px;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    z-index: 10;
+}
+
+.status-text {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.status-text::before {
+    content: '';
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 8px var(--green);
+    animation: pulse-dot 2s ease-in-out infinite;
+}
+
+@keyframes pulse-dot {
+
+    0%,
+    100% {
+        opacity: 1;
+    }
+
+    50% {
+        opacity: 0.4;
+    }
+}
+
+/* ═══ Voice Core ═══ */
+.core {
+    position: relative;
+    width: 220px;
+    height: 220px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+.core-ring {
+    position: absolute;
+    border-radius: 50%;
+    border: 1px solid var(--ring-color);
+    transition: all 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.ring-outer {
+    width: 220px;
+    height: 220px;
+    animation: rotate-slow 30s linear infinite;
+}
+
+.ring-middle {
+    width: 170px;
+    height: 170px;
+    border-color: rgba(129, 140, 248, 0.1);
+    animation: rotate-slow 20s linear infinite reverse;
+}
+
+.ring-inner {
+    width: 120px;
+    height: 120px;
+    border-color: rgba(129, 140, 248, 0.15);
+    animation: rotate-slow 15s linear infinite;
+}
+
+@keyframes rotate-slow {
+    from {
+        transform: rotate(0deg);
+    }
+
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.core-center {
+    width: 80px;
+    height: 80px;
+    border-radius: 50%;
+    background: radial-gradient(circle, var(--accent-dim), transparent 70%);
+    border: 1px solid rgba(129, 140, 248, 0.2);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.4s ease;
+    z-index: 2;
+}
+
+.core-icon {
+    font-size: 28px;
+    color: var(--accent);
+    opacity: 0.7;
+    transition: all 0.3s ease;
+}
+
+/* Hover state */
+.core:hover .core-center {
+    background: radial-gradient(circle, rgba(129, 140, 248, 0.2), transparent 70%);
+    border-color: rgba(129, 140, 248, 0.4);
+    box-shadow: 0 0 40px var(--accent-glow);
+    transform: scale(1.05);
+}
+
+.core:hover .core-icon {
+    opacity: 1;
+}
+
+.core:hover .ring-outer {
+    border-color: rgba(129, 140, 248, 0.15);
+    transform: rotate(0deg) scale(1.05);
+}
+
+/* ═══ Listening State ═══ */
+.core.listening .core-center {
+    background: radial-gradient(circle, rgba(52, 211, 153, 0.25), transparent 70%);
+    border-color: rgba(52, 211, 153, 0.5);
+    box-shadow: 0 0 60px rgba(52, 211, 153, 0.2);
+    animation: core-breathe 1.5s ease-in-out infinite;
+}
+
+.core.listening .core-icon {
+    color: var(--green);
+    opacity: 1;
+}
+
+.core.listening .ring-outer {
+    border-color: rgba(52, 211, 153, 0.15);
+    animation-duration: 8s;
+}
+
+.core.listening .ring-middle {
+    border-color: rgba(52, 211, 153, 0.2);
+    animation-duration: 5s;
+}
+
+.core.listening .ring-inner {
+    border-color: rgba(52, 211, 153, 0.25);
+    animation-duration: 3s;
+}
+
+@keyframes core-breathe {
+
+    0%,
+    100% {
+        transform: scale(1);
+    }
+
+    50% {
+        transform: scale(1.08);
+    }
+}
+
+/* ═══ Thinking State ═══ */
+.core.thinking .core-center {
+    background: radial-gradient(circle, rgba(251, 191, 36, 0.2), transparent 70%);
+    border-color: rgba(251, 191, 36, 0.4);
+    box-shadow: 0 0 50px rgba(251, 191, 36, 0.15);
+    animation: core-think 0.8s ease-in-out infinite;
+}
+
+.core.thinking .core-icon {
+    color: #fbbf24;
+}
+
+.core.thinking .ring-outer {
+    animation-duration: 3s;
+}
+
+.core.thinking .ring-middle {
+    animation-duration: 2s;
+}
+
+.core.thinking .ring-inner {
+    animation-duration: 1s;
+}
+
+@keyframes core-think {
+
+    0%,
+    100% {
+        transform: scale(1);
+    }
+
+    50% {
+        transform: scale(1.03);
+    }
+}
+
+/* ═══ Speaking State ═══ */
+.core.speaking .core-center {
+    background: radial-gradient(circle, var(--accent-dim), transparent 70%);
+    border-color: rgba(129, 140, 248, 0.5);
+    box-shadow: 0 0 60px var(--accent-glow);
+}
+
+.core.speaking .core-icon {
+    color: var(--accent);
+    opacity: 1;
+    animation: icon-pulse 0.6s ease-in-out infinite;
+}
+
+@keyframes icon-pulse {
+
+    0%,
+    100% {
+        transform: scale(1);
+    }
+
+    50% {
+        transform: scale(1.15);
+    }
+}
+
+/* ═══ Waveform ═══ */
+.waveform {
+    position: absolute;
+    bottom: -20px;
+    left: 50%;
+    transform: translateX(-50%);
+    opacity: 0;
+    transition: opacity 0.4s ease;
+    pointer-events: none;
+}
+
+.core.listening .waveform,
+.core.speaking .waveform {
+    opacity: 0.6;
+}
+
+/* ═══ Response ═══ */
+.response {
+    max-width: 600px;
+    text-align: center;
+    min-height: 80px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+}
+
+/* ═══ Thinking Steps ═══ */
+.thinking-steps {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    min-height: 0;
+    transition: all 0.4s ease;
+}
+
+.thinking-steps.active {
+    min-height: 40px;
+}
+
+.think-step {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 300;
+    letter-spacing: 1.5px;
+    color: var(--cyan);
+    opacity: 0;
+    transform: translateY(6px);
+    animation: step-in 0.3s ease-out forwards;
+    white-space: nowrap;
+}
+
+.think-step.dim {
+    color: var(--text-muted);
+    animation: step-dim 0.3s ease-out forwards;
+}
+
+@keyframes step-in {
+    to {
+        opacity: 0.6;
+        transform: translateY(0);
+    }
+}
+
+@keyframes step-dim {
+    to {
+        opacity: 0.2;
+        transform: translateY(0);
+    }
+}
+
+.thinking-steps.done .think-step {
+    animation: step-out 0.4s ease-out forwards;
+}
+
+@keyframes step-out {
+    to {
+        opacity: 0;
+        transform: translateY(-4px);
+    }
+}
+
+.response-text {
+    font-size: 15px;
+    font-weight: 300;
+    line-height: 1.8;
+    color: var(--text);
+    opacity: 0.8;
+    white-space: pre-wrap;
+    font-family: var(--mono);
+    letter-spacing: 0.3px;
+    animation: text-appear 0.5s ease-out;
+}
+
+@keyframes text-appear {
+    from {
+        opacity: 0;
+        transform: translateY(8px);
+    }
+
+    to {
+        opacity: 0.8;
+        transform: translateY(0);
+    }
+}
+
+/* Long responses — left-aligned */
+.response-text.long {
+    text-align: left;
+    font-size: 13px;
+    line-height: 1.7;
+    max-height: 40vh;
+    overflow-y: auto;
+    padding: 0 20px;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.1) transparent;
+}
+
+/* ═══ Transcript (what user said) ═══ */
+.transcript {
+    font-size: 12px;
+    color: var(--text-dim);
+    text-align: center;
+    font-style: italic;
+    min-height: 20px;
+    letter-spacing: 0.5px;
+}
+
+/* ═══ Text Input (fallback) ═══ */
+.input-row {
+    width: 100%;
+    max-width: 480px;
+}
+
+.text-input {
+    width: 100%;
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid var(--text-muted);
+    padding: 12px 0;
+    font-family: var(--mono);
+    font-size: 14px;
+    font-weight: 300;
+    color: var(--text);
+    outline: none;
+    text-align: center;
+    letter-spacing: 0.5px;
+    transition: border-color 0.3s ease;
+}
+
+.text-input::placeholder {
+    color: var(--text-muted);
+    font-style: italic;
+}
+
+.text-input:focus {
+    border-color: var(--accent-dim);
+}
+
+/* ═══ Hints ═══ */
+.hints {
+    display: flex;
+    gap: 16px;
+    opacity: 0.3;
+    transition: opacity 0.3s ease;
+}
+
+.hints:hover {
+    opacity: 0.6;
+}
+
+.hint {
+    font-size: 11px;
+    font-family: var(--mono);
+    color: var(--text-dim);
+    cursor: pointer;
+    letter-spacing: 1px;
+    padding: 4px 0;
+    border-bottom: 1px solid transparent;
+    transition: all 0.2s ease;
+}
+
+.hint:hover {
+    color: var(--accent);
+    border-color: var(--accent-dim);
+}
+
+/* ═══ Scrollbar ═══ */
+::-webkit-scrollbar {
+    width: 4px;
+}
+
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 2px;
+}
+
+/* ═══ Responsive ═══ */
+@media (max-width: 600px) {
+    .core {
+        width: 160px;
+        height: 160px;
+    }
+
+    .ring-outer {
+        width: 160px;
+        height: 160px;
+    }
+
+    .ring-middle {
+        width: 120px;
+        height: 120px;
+    }
+
+    .ring-inner {
+        width: 80px;
+        height: 80px;
+    }
+
+    .core-center {
+        width: 60px;
+        height: 60px;
+    }
+
+    .core-icon {
+        font-size: 22px;
+    }
+
+    .response-text {
+        font-size: 13px;
+    }
+
+    .hints {
+        flex-wrap: wrap;
+        justify-content: center;
+    }
+}

@@ -21,6 +21,7 @@ from brain.mamba2.omega_layer import OmegaSSMLayer
 from brain.mamba2.mole_router import MoLELayer
 from brain.mamba2.novelty import NoveltyGate
 from brain.mamba2.bitnet import UniversalLinear
+from brain.mamba2.neuromodulator import PredictiveCodingLayer
 
 
 class TarsBlock(nn.Module):
@@ -87,6 +88,12 @@ class TarsBlock(nn.Module):
         # Стандартный 0.1 для SSM-моделей. При eval автоматически отключается.
         self.drop = nn.Dropout(dropout)
         
+        # ═══ 8. Predictive Coding (Rao & Ballard, 1999) ═══
+        # Каждый слой коры предсказывает вход следующего слоя.
+        # Обрабатывается только precision-weighted prediction error.
+        # ~80% корковых top-down соединений → предсказание, не обработка.
+        self.predictive_coding = PredictiveCodingLayer(d_model)
+        
         # Stats
         self.last_stats = {}
         self.last_surprise = 0.0  # Для Titans feedback
@@ -100,6 +107,7 @@ class TarsBlock(nn.Module):
         rag_state: Optional[torch.Tensor] = None,
         ssd_state: Optional[torch.Tensor] = None,
         conv_state: Optional[torch.Tensor] = None,
+        x_prev_layer: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict,
                Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
@@ -111,11 +119,15 @@ class TarsBlock(nn.Module):
             rag_state: [B, d_state, d_state] — compressed knowledge
             ssd_state: [B, nheads, headdim, d_state] — SSD recurrent state
             conv_state: [B, conv_dim, d_conv] — conv1d rolling state
+            x_prev_layer: [B, L, d_model] — output of previous layer (для predictive coding)
         
         Returns:
             output, wkv_state, x_prev, stats, ssd_state, conv_state
         """
         residual = x
+        
+        # ═══ 0. Predictive Coding — process only prediction error ═══
+        x, pred_error = self.predictive_coding(x, x_prev_layer)
         
         # ═══ 1. Deep Hybrid Core ═══
         core_out, wkv_state, x_prev, ssd_state, conv_state = self.core(
@@ -170,6 +182,7 @@ class TarsBlock(nn.Module):
             "surprise": self.last_surprise,
             "mole_aux_loss": mole_aux_loss,
             "mole_experts": getattr(self.mole, '_last_expert_names', []),
+            "pred_error": pred_error.mean().item() if isinstance(pred_error, torch.Tensor) else 0.0,
         }
         
         return x, wkv_state, x_prev, self.last_stats, ssd_state, conv_state
