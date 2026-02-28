@@ -268,12 +268,20 @@ def phase_0_install():
             subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
             logger.info(f"  ✅ venv создан: {venv_dir}")
             use_venv = True
-        except subprocess.CalledProcessError as e:
+        except (subprocess.CalledProcessError, Exception) as e:
             logger.warning(f"  ⚠ venv не удалось создать: {e}")
-            logger.info("  💡 Установите: sudo apt install python3.12-venv")
+            # Удаляем сломанный venv если он частично создался
+            if venv_dir.exists():
+                shutil.rmtree(str(venv_dir), ignore_errors=True)
+                logger.info("  🗑 Сломанный venv удалён")
             logger.info("  Используем системный pip + --break-system-packages")
-    else:
+    elif venv_pip.exists():
         use_venv = True
+    else:
+        # venv_python есть, но pip нет — сломанный venv
+        logger.warning("  ⚠ venv сломан (нет pip), удаляем...")
+        shutil.rmtree(str(venv_dir), ignore_errors=True)
+        logger.info("  Используем системный pip + --break-system-packages")
     
     if use_venv:
         PYTHON = str(venv_python)
@@ -342,33 +350,38 @@ def phase_0_install():
 #  ФАЗА 1: СКАЧИВАНИЕ ДАННЫХ
 # ═════════════════════════════════════════════════════════════════════════
 
-def phase_1_download():
+def phase_1_download(quick: bool = False):
     """Скачивает все данные для обучения."""
     banner(1, "Скачивание данных")
     
     success = True
+    wiki_count = "500" if quick else "100000"
     
     # 1.1 Wikipedia
     wiki_path = DATA / "wiki_ru.txt"
-    if wiki_path.exists() and wiki_path.stat().st_size > 1_000_000:
+    min_size = 100_000 if quick else 1_000_000
+    if wiki_path.exists() and wiki_path.stat().st_size > min_size:
         wiki_mb = wiki_path.stat().st_size / 1024 / 1024
         logger.info(f"  📚 Wikipedia: уже есть ({wiki_mb:.1f} MB)")
     else:
-        logger.info("  📚 Скачивание Wikipedia (100 000 статей)...")
-        if not run([PYTHON, TRAINING / "download_wiki.py", "--count", "100000"], check=False):
+        logger.info(f"  📚 Скачивание Wikipedia ({wiki_count} статей)...")
+        if not run([PYTHON, TRAINING / "download_wiki.py", "--count", wiki_count], check=False):
             logger.warning("  ⚠ Wikipedia не скачана — продолжаем")
             success = False
     
     # 1.2 HuggingFace датасеты
-    hf_files = list(DATA.glob("hf_*.txt"))
-    if len(hf_files) >= 3:
-        total_mb = sum(f.stat().st_size for f in hf_files) / 1024 / 1024
-        logger.info(f"  🤗 HuggingFace: уже есть ({len(hf_files)} файлов, {total_mb:.0f} MB)")
+    if quick:
+        logger.info("  🤗 HuggingFace: пропуск (quick mode)")
     else:
-        logger.info("  🤗 Скачивание HuggingFace датасетов (код + чат + агенты)...")
-        if not run([PYTHON, TRAINING / "download_hf_dataset.py", "--preset", "all"], check=False):
-            logger.warning("  ⚠ HuggingFace не скачан — продолжаем")
-            success = False
+        hf_files = list(DATA.glob("hf_*.txt"))
+        if len(hf_files) >= 3:
+            total_mb = sum(f.stat().st_size for f in hf_files) / 1024 / 1024
+            logger.info(f"  🤗 HuggingFace: уже есть ({len(hf_files)} файлов, {total_mb:.0f} MB)")
+        else:
+            logger.info("  🤗 Скачивание HuggingFace датасетов (код + чат + агенты)...")
+            if not run([PYTHON, TRAINING / "download_hf_dataset.py", "--preset", "all"], check=False):
+                logger.warning("  ⚠ HuggingFace не скачан — продолжаем")
+                success = False
     
     # 1.3 LEANN embedding model
     emb_path = MODELS / "embeddings"
@@ -863,7 +876,7 @@ def main():
     # ═══ Выполнение фаз ═══
     phases = {
         0: ("install", lambda: phase_0_install()),
-        1: ("download", lambda: phase_1_download()),
+        1: ("download", lambda: phase_1_download(quick=args.quick)),
         2: ("reflex", lambda: phase_2_reflex(quick=args.quick)),
         3: ("mingru", lambda: phase_3_mingru(device, quick=args.quick)),
         4: ("mamba2", lambda: phase_4_mamba2(device, quick=args.quick)),
@@ -903,7 +916,7 @@ def main():
     
     # Фаза 1: Данные
     if not args.skip_download:
-        results["download"] = phase_1_download()
+        results["download"] = phase_1_download(quick=args.quick)
     else:
         logger.info("⏭ Пропуск скачивания данных (--skip-download)")
         results["download"] = True
