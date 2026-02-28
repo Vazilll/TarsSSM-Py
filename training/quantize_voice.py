@@ -72,16 +72,27 @@ def main():
     # ═══ Whisper ONNX (encoder + decoder) ═══
     whisper_dir = VOICE_DIR / "whisper"
     if whisper_dir.exists():
-        results["whisper_encoder"] = quantize_onnx(
-            str(whisper_dir / "tiny-encoder.onnx"),
-            str(whisper_dir / "tiny-encoder-int8.onnx"),
-            "Whisper Encoder",
-        )
-        results["whisper_decoder"] = quantize_onnx(
-            str(whisper_dir / "tiny-decoder.onnx"),
-            str(whisper_dir / "tiny-decoder-int8.onnx"),
-            "Whisper Decoder",
-        )
+        # Поддержка всех размеров: tiny, base, small
+        whisper_found = False
+        for model_size in ["tiny", "base", "small"]:
+            enc_path = whisper_dir / f"{model_size}-encoder.onnx"
+            dec_path = whisper_dir / f"{model_size}-decoder.onnx"
+            if enc_path.exists():
+                results[f"whisper_{model_size}_encoder"] = quantize_onnx(
+                    str(enc_path),
+                    str(whisper_dir / f"{model_size}-encoder-int8.onnx"),
+                    f"Whisper {model_size} Encoder",
+                )
+                whisper_found = True
+            if dec_path.exists():
+                results[f"whisper_{model_size}_decoder"] = quantize_onnx(
+                    str(dec_path),
+                    str(whisper_dir / f"{model_size}-decoder-int8.onnx"),
+                    f"Whisper {model_size} Decoder",
+                )
+                whisper_found = True
+        if not whisper_found:
+            logger.info("  ⏭ Whisper ONNX не найден в whisper/ (LoRA режим)")
     else:
         logger.info("  ⏭ Whisper ONNX не найден (используется faster-whisper)")
 

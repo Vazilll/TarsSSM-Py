@@ -274,6 +274,15 @@ def train(args):
         print(f"[Model] Loading checkpoint: {save_path}")
         checkpoint = torch.load(str(save_path), map_location='cpu', weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    elif args.resume and args.quant:
+        # Quant mode but no 158bit checkpoint → load FP16 as fallback
+        fp16_path = Path(args.save_dir) / "mamba2_omega.pt"
+        if fp16_path.exists():
+            print(f"[Model] Quant: loading FP16 base → {fp16_path}")
+            checkpoint = torch.load(str(fp16_path), map_location='cpu', weights_only=False)
+            model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        else:
+            print(f"[!] No checkpoint found — training from scratch")
     
     model.to(device)
     

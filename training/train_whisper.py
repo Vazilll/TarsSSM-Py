@@ -77,7 +77,7 @@ def train(args):
     model.config.suppress_tokens = []
 
     total_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"Whisper Tiny: {total_params:,} параметров")
+    logger.info(f"Whisper {args.model}: {total_params:,} параметров")
 
     # ═══ LoRA ═══
     logger.info(f"Применение LoRA (r={args.lora_r})...")
@@ -195,7 +195,7 @@ def train(args):
     )
 
     logger.info(f"\n{'='*60}")
-    logger.info(f"  Whisper Tiny LoRA Fine-tune (Russian)")
+    logger.info(f"  Whisper {args.model} LoRA Fine-tune (Russian)")
     logger.info(f"  Epochs: {args.epochs} | Batch: {args.batch} | LR: {args.lr}")
     logger.info(f"{'='*60}\n")
 
