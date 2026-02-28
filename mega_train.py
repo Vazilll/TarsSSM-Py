@@ -305,6 +305,9 @@ def phase_0_install():
         "sentence-transformers",
         "datasets",
         "psutil",
+        # ═══ Mamba-2 (CUDA ядра) ═══
+        "causal-conv1d",             # Causal conv1d для Mamba
+        "mamba-ssm",                 # Официальные CUDA-ядра Mamba-2 (FP16)
         # ═══ Voice (фазы 8-10) ═══
         "transformers",          # Whisper model
         "peft",                  # LoRA adapters
@@ -355,17 +358,16 @@ def phase_1_download(quick: bool = False):
     banner(1, "Скачивание данных")
     
     success = True
-    wiki_count = "500" if quick else "100000"
-    
     # 1.1 Wikipedia
     wiki_path = DATA / "wiki_ru.txt"
-    min_size = 100_000 if quick else 1_000_000
-    if wiki_path.exists() and wiki_path.stat().st_size > min_size:
+    if quick:
+        logger.info("  📚 Wikipedia: пропуск (quick mode, используем встроенный корпус)")
+    elif wiki_path.exists() and wiki_path.stat().st_size > 1_000_000:
         wiki_mb = wiki_path.stat().st_size / 1024 / 1024
         logger.info(f"  📚 Wikipedia: уже есть ({wiki_mb:.1f} MB)")
     else:
-        logger.info(f"  📚 Скачивание Wikipedia ({wiki_count} статей)...")
-        if not run([PYTHON, TRAINING / "download_wiki.py", "--count", wiki_count], check=False):
+        logger.info("  📚 Скачивание Wikipedia (100000 статей)...")
+        if not run([PYTHON, TRAINING / "download_wiki.py", "--count", "100000"], check=False):
             logger.warning("  ⚠ Wikipedia не скачана — продолжаем")
             success = False
     
@@ -406,6 +408,67 @@ def phase_1_download(quick: bool = False):
         logger.info("  ✅ LEANN заполнена")
     except Exception as e:
         logger.info(f"  ℹ LEANN: {e} (не критично)")
+    
+    # 1.5 Голосовые модели (Whisper CTranslate2 + Piper ONNX + Silero VAD)
+    voice_dir = MODELS / "voice"
+    voice_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 1.5.1 faster-whisper CTranslate2 (для runtime STT)
+    whisper_ct2 = voice_dir / "whisper_tiny"
+    if (whisper_ct2 / "model.bin").exists():
+        logger.info(f"  🎙 Whisper CTranslate2: уже есть ({whisper_ct2})")
+    else:
+        logger.info("  🎙 Скачивание Whisper Tiny (CTranslate2) для STT...")
+        try:
+            from faster_whisper import WhisperModel
+            _m = WhisperModel("tiny", device="cpu", compute_type="int8",
+                              download_root=str(voice_dir))
+            # faster-whisper кеширует модель, копируем в нужное место
+            import huggingface_hub
+            cached = huggingface_hub.snapshot_download("guillaumekln/faster-whisper-tiny")
+            if not (whisper_ct2 / "model.bin").exists():
+                shutil.copytree(cached, str(whisper_ct2), dirs_exist_ok=True)
+            del _m
+            logger.info(f"  ✅ Whisper Tiny CTranslate2 сохранён: {whisper_ct2}")
+        except Exception as e:
+            logger.warning(f"  ⚠ Whisper CTranslate2: {e}")
+    
+    # 1.5.2 Piper TTS ONNX (русский голос для синтеза речи)
+    piper_models = [
+        ("ru_RU-irina-medium.onnx",
+         "https://huggingface.co/rhasspy/piper-voices/resolve/main/ru/ru_RU/irina/medium/ru_RU-irina-medium.onnx"),
+        ("ru_RU-irina-medium.onnx.json",
+         "https://huggingface.co/rhasspy/piper-voices/resolve/main/ru/ru_RU/irina/medium/ru_RU-irina-medium.onnx.json"),
+    ]
+    for fname, url in piper_models:
+        dst = voice_dir / fname
+        if dst.exists():
+            size_mb = dst.stat().st_size / 1024 / 1024
+            logger.info(f"  🗣 Piper {fname}: уже есть ({size_mb:.1f} MB)")
+        else:
+            logger.info(f"  🗣 Скачивание Piper {fname}...")
+            try:
+                import urllib.request
+                urllib.request.urlretrieve(url, str(dst))
+                size_mb = dst.stat().st_size / 1024 / 1024
+                logger.info(f"  ✅ {fname}: {size_mb:.1f} MB")
+            except Exception as e:
+                logger.warning(f"  ⚠ Piper {fname}: {e}")
+    
+    # 1.5.3 Silero VAD ONNX (детекция голоса)
+    vad_path = voice_dir / "silero_vad.onnx"
+    if vad_path.exists():
+        logger.info(f"  👂 Silero VAD: уже есть")
+    else:
+        logger.info("  👂 Скачивание Silero VAD...")
+        try:
+            vad_url = "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx"
+            import urllib.request
+            urllib.request.urlretrieve(vad_url, str(vad_path))
+            size_mb = vad_path.stat().st_size / 1024 / 1024
+            logger.info(f"  ✅ Silero VAD: {size_mb:.1f} MB")
+        except Exception as e:
+            logger.warning(f"  ⚠ Silero VAD: {e}")
     
     # Сводка данных
     total_data = 0
@@ -512,6 +575,7 @@ def phase_4_mamba2(device: str, resume: bool = False, quick: bool = False):
             "--curriculum",
             "--label_smoothing", "0.1",
             "--max_samples", "500",
+            "--no_compile",  # T4 не поддерживает linalg.solve в FP16 через compile
         ]
     else:
         base = [
@@ -593,10 +657,91 @@ def phase_5_quantize(device: str, quick: bool = False):
     
     # Ищем обученную FP16 модель
     fp16_path = MODELS / "mamba2" / "mamba2_omega.pt"
+    
     if not fp16_path.exists():
-        logger.warning(f"  ⚠ FP16 модель не найдена: {fp16_path}")
-        logger.warning("  Пропускаем квантизацию")
-        return False
+        logger.info("  🔍 FP16 модель не найдена локально, скачиваем из HuggingFace...")
+        fp16_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        downloaded = False
+        # Пробуем скачать pre-trained Mamba-2 из state-spaces
+        hf_models = [
+            "state-spaces/mamba2-130m",
+            "state-spaces/mamba2-370m",
+            "state-spaces/mamba-130m",
+        ]
+        
+        for hf_model in hf_models:
+            try:
+                logger.info(f"  📥 Скачивание {hf_model}...")
+                from transformers import AutoModelForCausalLM
+                import torch
+                
+                hf_m = AutoModelForCausalLM.from_pretrained(
+                    hf_model, torch_dtype=torch.float16, trust_remote_code=True
+                )
+                
+                # Сохраняем в формате, совместимом с TarsMamba2LM
+                # Извлекаем конфиг из HF модели
+                hf_cfg = hf_m.config
+                d_model = getattr(hf_cfg, 'd_model', getattr(hf_cfg, 'hidden_size', 768))
+                n_layers = getattr(hf_cfg, 'n_layer', getattr(hf_cfg, 'num_hidden_layers', 24))
+                vocab_size = getattr(hf_cfg, 'vocab_size', 50280)
+                
+                # Создаём TarsMamba2LM с подходящими размерами
+                from brain.mamba2.model import TarsMamba2LM
+                tars_model = TarsMamba2LM(
+                    d_model=d_model, n_layers=n_layers,
+                    vocab_size=vocab_size, quant_mode="fp16",
+                )
+                
+                # Переносим совместимые веса
+                hf_state = hf_m.state_dict()
+                tars_state = tars_model.state_dict()
+                loaded = 0
+                for key in tars_state:
+                    # Пробуем найти соответствие по имени или форме
+                    for hf_key, hf_val in hf_state.items():
+                        if hf_val.shape == tars_state[key].shape:
+                            if key.split('.')[-1] == hf_key.split('.')[-1]:
+                                tars_state[key] = hf_val
+                                loaded += 1
+                                break
+                
+                tars_model.load_state_dict(tars_state, strict=False)
+                
+                # Сохраняем
+                checkpoint = {
+                    "model_state_dict": tars_model.state_dict(),
+                    "config": {
+                        "d_model": d_model,
+                        "n_layers": n_layers,
+                        "vocab_size": vocab_size,
+                        "quant_mode": "fp16",
+                    },
+                    "d_model": d_model,
+                    "n_layers": n_layers,
+                    "vocab_size": vocab_size,
+                    "source": hf_model,
+                }
+                torch.save(checkpoint, str(fp16_path))
+                
+                size_mb = fp16_path.stat().st_size / 1024 / 1024
+                logger.info(f"  ✅ {hf_model} скачан и конвертирован: {size_mb:.1f} MB")
+                logger.info(f"  📊 d_model={d_model}, n_layers={n_layers}, vocab={vocab_size}")
+                logger.info(f"  🔗 Перенесено {loaded} тензоров")
+                
+                del hf_m, tars_model
+                downloaded = True
+                break
+                
+            except Exception as e:
+                logger.warning(f"  ⚠ {hf_model}: {e}")
+                continue
+        
+        if not downloaded:
+            logger.warning(f"  ⚠ Не удалось скачать Mamba-2 из HuggingFace")
+            logger.warning("  Пропускаем квантизацию")
+            return False
     
     logger.info(f"  Исходная модель: {fp16_path}")
     fp16_size = fp16_path.stat().st_size / 1024 / 1024
@@ -624,7 +769,7 @@ def phase_5_quantize(device: str, quick: bool = False):
 # ═════════════════════════════════════════════════════════════════════════
 
 def phase_6_consolidate(results: dict, total_time: float):
-    """Собирает все модели в models/tars_v3/."""
+    """Собирает все модели в models/tars_v3/ и генерирует config.json."""
     banner(6, "Финальная сборка")
     
     TARS_V3.mkdir(parents=True, exist_ok=True)
@@ -646,6 +791,52 @@ def phase_6_consolidate(results: dict, total_time: float):
         else:
             logger.info(f"  ⏭ {name}: не найден ({src.name})")
     
+    # ═══ Генерация config.json (нужен для load_pretrained) ═══
+    # Пытаемся прочитать конфиг из checkpoint, иначе — дефолт
+    model_config = {
+        "d_model": 768, "n_layers": 12, "vocab_size": 256,
+        "d_state": 64, "headdim": 64, "omega_dim": 32,
+        "pool_size": 48, "n_experts": 8,
+    }
+    # Ищем конфиг в .pt файле
+    for pt_name in ["mamba2.pt", "mamba2_158bit.pt"]:
+        pt_path = TARS_V3 / pt_name
+        if pt_path.exists():
+            try:
+                import torch
+                ckpt = torch.load(str(pt_path), map_location="cpu", weights_only=False)
+                if "config" in ckpt and isinstance(ckpt["config"], dict):
+                    cfg = ckpt["config"]
+                    model_config.update({
+                        "d_model": cfg.get("d_model", model_config["d_model"]),
+                        "n_layers": cfg.get("n_layers", model_config["n_layers"]),
+                        "vocab_size": cfg.get("vocab_size", model_config["vocab_size"]),
+                    })
+                    logger.info(f"  📄 config из {pt_name}: d={model_config['d_model']}, L={model_config['n_layers']}")
+                elif "d_model" in ckpt:
+                    model_config["d_model"] = ckpt["d_model"]
+                    model_config["n_layers"] = ckpt.get("n_layers", model_config["n_layers"])
+                    model_config["vocab_size"] = ckpt.get("vocab_size", model_config["vocab_size"])
+                    logger.info(f"  📄 config из {pt_name}: d={model_config['d_model']}, L={model_config['n_layers']}")
+                del ckpt
+                break
+            except Exception as e:
+                logger.warning(f"  ⚠ Не удалось прочитать config из {pt_name}: {e}")
+    
+    config_json = {
+        "name": "tars_v3",
+        "version": "3.0",
+        "encoding": "cp1251",
+        "models": {
+            "mamba2": {
+                "params": model_config
+            }
+        }
+    }
+    config_path = TARS_V3 / "config.json"
+    config_path.write_text(json.dumps(config_json, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info(f"  📄 config.json сохранён: {config_path}")
+    
     # Лог обучения
     log_entry = {
         "timestamp": datetime.now().isoformat(),
@@ -653,15 +844,7 @@ def phase_6_consolidate(results: dict, total_time: float):
         "total_time_human": f"{total_time/3600:.1f} часов",
         "results": {k: ("ok" if v else "failed") for k, v in results.items()},
         "models_consolidated": consolidated,
-        "config": {
-            "encoding": "cp1251",
-            "vocab_size": 256,
-            "d_model": 768,
-            "n_layers": 12,
-            "n_experts": 8,
-            "omega_dim": 32,
-            "pool_size": 48,
-        },
+        "config": model_config,
     }
     
     log_path = TARS_V3 / "training_log.json"
