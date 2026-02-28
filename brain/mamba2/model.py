@@ -473,6 +473,7 @@ class TarsMamba2LM(nn.Module):
         force_deep: bool = False,
         max_expansion_rounds: int = 12,
         reflex_ctx: Any = None,
+        supplement_queue = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Адаптивный forward с Integral Auditor и Speculative Matrix Routing.
@@ -481,6 +482,11 @@ class TarsMamba2LM(nn.Module):
           - trivial (depth=4): проходим только 4 блока
           - simple (depth=6):  6 блоков
           - complex (depth=12): все 12 блоков + IDME
+        
+        supplement_queue: thread-safe Queue с дополнениями от голоса.
+          Между волнами проверяется на новые фрагменты речи.
+          Если есть — инжектим через 2 блока + WaveConsolidation + spine.
+          После инжекции — 3 дополнительные волны (6 блоков).
         """
         start_time = time.time()
         
@@ -547,6 +553,8 @@ class TarsMamba2LM(nn.Module):
         converged_early = False
         wave_count = 0
         per_wave_experts = []  # [{"wave": 1, "left": [...], "right": [...]}]
+        supplement_injected = False
+        supplement_extra_waves = 0  # сколько допволн осталось
         
         max_waves = self.n_layers // 2   # 12/2 = 6 волн
         
@@ -654,6 +662,115 @@ class TarsMamba2LM(nn.Module):
                             pass
             
             wave_experts["spine_updated"] = spine_updated
+            
+            # ═══ Supplement Injection: проверяем очередь голосовых дополнений ═══
+            if supplement_queue is not None and not supplement_queue.empty():
+                try:
+                    supplement = supplement_queue.get_nowait()
+                    sup_text = supplement.get("text", "")
+                    sup_tokens = supplement.get("tokens")  # pre-tokenized
+                    
+                    if sup_text or sup_tokens is not None:
+                        self.logger.info(
+                            f"🎤 Supplement injection at wave {wave_count}: "
+                            f"'{sup_text[:50]}...'"
+                        )
+                        
+                        # Токенизация дополнения
+                        if sup_tokens is None:
+                            sup_ids = input_ids  # fallback
+                        else:
+                            sup_ids = sup_tokens.to(x.device)
+                        
+                        # Пропускаем дополнение через 2 блока текущей волны
+                        x_sup = self.embedding(sup_ids)
+                        
+                        # 2 блока параллельно (те же веса что текущая волна)
+                        xs_l, _, _, _, _, _ = self.blocks[b_left](
+                            x_sup, None, None, memory_vec, rag_state, None, None
+                        )
+                        xs_r, _, _, _, _, _ = self.blocks[b_right](
+                            x_sup, None, None, memory_vec, rag_state, None, None
+                        )
+                        
+                        # WaveConsolidation: суммирующая матрица
+                        x_sup_merged, _ = self.wave_consolidations[wave_idx](
+                            xs_l, xs_r, {}, {}
+                        )
+                        
+                        # Обновляем основное состояние: спинной мозг инжектирует
+                        h_sup = x_sup_merged.mean(dim=1).detach()
+                        if hasattr(self, 'to_memory_space'):
+                            h_sup_mem = self.to_memory_space(h_sup)
+                            if memory_vec is not None:
+                                # 50/50 смесь старого + дополнения
+                                memory_vec = 0.5 * memory_vec + 0.5 * h_sup_mem.detach()
+                            else:
+                                memory_vec = h_sup_mem.detach()
+                        
+                        # Сбрасываем сходимость — надо переоценить
+                        self.integral_auditor.reset()
+                        converged_early = False
+                        h_prev = h_sup
+                        
+                        supplement_injected = True
+                        supplement_extra_waves = 3  # +6 блоков
+                        
+                        self.logger.info(
+                            f"✅ Supplement merged. +3 extra waves scheduled."
+                        )
+                except Exception as e:
+                    self.logger.warning(f"Supplement injection error: {e}")
+        
+        # ═══ Extra waves после supplement (половина от 12 = 6 блоков = 3 волны) ═══
+        if supplement_injected and supplement_extra_waves > 0:
+            self.logger.info(
+                f"🔄 Running {supplement_extra_waves} extra waves for supplement"
+            )
+            for extra_idx in range(supplement_extra_waves):
+                # Используем первые 3 волны (блоки 0-5) повторно
+                b_l = extra_idx * 2
+                b_r = extra_idx * 2 + 1
+                if b_r >= self.n_layers:
+                    break
+                
+                wave_count += 1
+                x_left, wkv_states[b_l], x_prevs[b_l], stats_l, \
+                    ssd_states[b_l], conv_states[b_l] = self.blocks[b_l](
+                    x, wkv_states[b_l], x_prevs[b_l], memory_vec, rag_state,
+                    ssd_states[b_l], conv_states[b_l]
+                )
+                x_right, wkv_states[b_r], x_prevs[b_r], stats_r, \
+                    ssd_states[b_r], conv_states[b_r] = self.blocks[b_r](
+                    x, wkv_states[b_r], x_prevs[b_r], memory_vec, rag_state,
+                    ssd_states[b_r], conv_states[b_r]
+                )
+                blocks_executed += 2
+                
+                x, merge_alpha = self.wave_consolidations[extra_idx](
+                    x_left, x_right, stats_l, stats_r
+                )
+                
+                # Spine update
+                h_curr = x.mean(dim=1).detach()
+                if hasattr(self, 'to_memory_space'):
+                    try:
+                        h_for_mem = self.to_memory_space(h_curr)
+                        memory_vec = 0.7 * memory_vec + 0.3 * h_for_mem.detach()
+                    except Exception:
+                        pass
+                
+                ia_result = self.integral_auditor.observe(h_curr, h_prev)
+                h_prev = h_curr
+                
+                self.logger.debug(
+                    f"Extra wave {extra_idx+1}/{supplement_extra_waves}: "
+                    f"p={ia_result['p']:.3f}"
+                )
+                
+                if ia_result["converged"]:
+                    converged_early = True
+                    break
         
         # ═══ Titans Feedback: финальный сигнал ═══
         if hasattr(self, 'titans_memory') and self.titans_memory is not None:
@@ -794,6 +911,8 @@ class TarsMamba2LM(nn.Module):
             "per_wave_experts": per_wave_experts,
             "hankel_collapses": self.hankel.collapse_count,
             "surprise_layers": len(surprise_signals),
+            "supplement_injected": supplement_injected,
+            "supplement_extra_waves": supplement_extra_waves if supplement_injected else 0,
             "rwkv_state_size_mb": sum(s.numel() * 4 / 1024 / 1024 for s in wkv_states if s is not None),
             "total_ms": total_time,
         }

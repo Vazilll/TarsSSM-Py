@@ -1,6 +1,6 @@
 """
 ═══════════════════════════════════════════════════════════════
-  Sensor Agents — 6 параллельных сенсоров Спинного Мозга TARS
+  Sensor Agents — 7 параллельных сенсоров Спинного Мозга TARS
 ═══════════════════════════════════════════════════════════════
 
 Каждый сенсор — ультралёгкий (без GPU, <10 мс), работает параллельно
@@ -12,8 +12,9 @@
   2. ComplexitySensor  — оценка необходимой глубины мышления
   3. RAGSensor         — поиск релевантных знаний в памяти
   4. SystemSensor      — мониторинг ресурсов (CPU/RAM/GPU)
-  5. EmotionSensor     — определение тона/эмоции
+  5. EmotionSensor     — определение тона/эмоции (текст)
   6. ContextSensor     — управление контекстом сессии
+  7. VoiceSensor       — анализ интонации/эмоции из аудио (DSP)
 """
 
 import time
@@ -25,18 +26,22 @@ from dataclasses import dataclass, field
 logger = logging.getLogger("Tars.Reflexes")
 
 
+from abc import ABC, abstractmethod
+
+
 # ═══════════════════════════════════════════
 # Базовый класс сенсора
 # ═══════════════════════════════════════════
 
-class BaseSensor:
+class BaseSensor(ABC):
     """Базовый класс для всех сенсоров."""
     
     name: str = "base"
     
+    @abstractmethod
     def process(self, query: str, **kwargs) -> Dict[str, Any]:
         """Обработка запроса. Возвращает dict с результатами."""
-        raise NotImplementedError
+        ...
 
 
 # ═══════════════════════════════════════════
@@ -442,3 +447,92 @@ class ContextSensor(BaseSensor):
             "last_intent": last_intent,
             "context_summary": context_summary,
         }
+
+
+# ═══════════════════════════════════════════
+# 7. VoiceSensor — Анализ интонации из аудио
+# ═══════════════════════════════════════════
+
+class VoiceSensor(BaseSensor):
+    """
+    Принимает результаты IntonationSensor (DSP-анализ аудио) и
+    обогащает ReflexContext голосовой информацией:
+      - voice_emotion: question / excited / calm / whisper / neutral
+      - is_question: повышающий тон → вопрос
+      - pitch_trend: rising / falling / flat
+      - is_supplement: пользователь дополняет предыдущий запрос
+      - urgency_boost: повышение срочности из-за интонации
+    
+    Данные передаются через kwargs["intonation_data"]
+    от IntonationSensor.analyze(audio_chunk).
+    """
+    
+    name = "voice"
+    
+    # Слова-маркеры дополнения (supplement detection)
+    SUPPLEMENT_MARKERS = [
+        "и ещё", "а также", "добавь", "уточню", "подожди",
+        "дополню", "ещё момент", "кстати", "забыл сказать",
+        "и также", "плюс", "подожди", "стой", "секунду",
+        "вот ещё", "а да", "и да", "ещё вот",
+    ]
+    
+    def process(self, query: str, **kwargs) -> Dict[str, Any]:
+        intonation = kwargs.get("intonation_data", {})
+        
+        # Базовые значения если нет аудио-данных
+        result = {
+            "voice_emotion": "neutral",
+            "is_question": False,
+            "pitch_trend": "flat",
+            "pitch_mean": 0.0,
+            "energy": 0.0,
+            "speech_rate": 0.0,
+            "urgency_boost": 0.0,
+            "is_supplement": False,
+            "has_audio": bool(intonation),
+        }
+        
+        if not intonation:
+            # Проверяем хотя бы текст на маркеры дополнения
+            query_lower = query.lower()
+            for marker in self.SUPPLEMENT_MARKERS:
+                if marker in query_lower:
+                    result["is_supplement"] = True
+                    break
+            return result
+        
+        # ═══ Данные от IntonationSensor ═══
+        result["voice_emotion"] = intonation.get("emotion", "neutral")
+        result["is_question"] = intonation.get("is_question", False)
+        result["pitch_trend"] = intonation.get("pitch_trend", "flat")
+        result["pitch_mean"] = intonation.get("pitch_mean", 0.0)
+        result["energy"] = intonation.get("energy", 0.0)
+        result["speech_rate"] = intonation.get("speech_rate", 0.0)
+        
+        # ═══ Urgency boost от голоса ═══
+        boost = 0.0
+        emotion = result["voice_emotion"]
+        if emotion == "excited":
+            boost += 0.3
+        elif emotion == "whisper":
+            boost += 0.1  # шёпот = что-то деликатное
+        
+        # Высокая энергия = срочность
+        if result["energy"] > 0.3:
+            boost += 0.2
+        
+        # Быстрая речь = срочность
+        if result["speech_rate"] > 5.0:
+            boost += 0.15
+        
+        result["urgency_boost"] = min(1.0, boost)
+        
+        # ═══ Supplement detection ═══
+        query_lower = query.lower()
+        for marker in self.SUPPLEMENT_MARKERS:
+            if marker in query_lower:
+                result["is_supplement"] = True
+                break
+        
+        return result

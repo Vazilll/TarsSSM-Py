@@ -359,13 +359,16 @@ def train(args):
                 p.requires_grad = True
         for p in model.matrix_pool.parameters():
             p.requires_grad = True
-        # WaveMerge + WaveGate — обучаемые (Tars.txt §1.4)
-        for wm in model.wave_merges:
-            for p in wm.parameters():
+        # WaveConsolidation — обучаемые (Tars.txt §1.4)
+        for wc in model.wave_consolidations:
+            for p in wc.parameters():
                 p.requires_grad = True
-        for wg in model.wave_gates:
-            for p in wg.parameters():
-                p.requires_grad = True
+        # Model-level NoveltyGate (IDME branch-and-bound в think())
+        for p in model.novelty_gate.parameters():
+            p.requires_grad = True
+        # norm_f — должен адаптироваться при смене внутренних представлений
+        for p in model.norm_f.parameters():
+            p.requires_grad = True
         trainable = [p for p in model.parameters() if p.requires_grad]
         print(f"  Trainable: {sum(p.numel() for p in trainable):,} params")
         optimizer = torch.optim.AdamW(trainable, lr=args.lr * 0.01, weight_decay=0.01)
@@ -400,6 +403,21 @@ def train(args):
             # Ω-SSM (Cayley transform parameters)
             for p in block.omega.parameters():
                 p.requires_grad = True
+        # ═══ Model-level spine projections (Tars.txt §2.4) ═══
+        # Без этого to_memory_space/from_memory_space не учатся в Phase 4
+        for p in model.to_memory_space.parameters():
+            p.requires_grad = True
+        for p in model.from_memory_space.parameters():
+            p.requires_grad = True
+        # WaveConsolidation — суммирующие матрицы между волнами
+        for wc in model.wave_consolidations:
+            for p in wc.parameters():
+                p.requires_grad = True
+        # Model-level NoveltyGate (IDME) + norm_f
+        for p in model.novelty_gate.parameters():
+            p.requires_grad = True
+        for p in model.norm_f.parameters():
+            p.requires_grad = True
         trainable = [p for p in model.parameters() if p.requires_grad]
         print(f"  Trainable: {sum(p.numel() for p in trainable):,} params")
         optimizer = torch.optim.AdamW(trainable, lr=args.lr * 0.05, weight_decay=0.01)

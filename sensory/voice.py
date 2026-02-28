@@ -1,16 +1,18 @@
 """
-voice.py — TARS v3 Voice System.
+voice.py — TARS v3 Voice System + Сенсорная интеграция.
 
 Architecture:
   VAD:  Silero VAD (ONNX) — voice activity detection
   STT:  Whisper Tiny (faster-whisper) — speech recognition
   TTS:  Piper (ONNX, piper-tts) — speech synthesis
+  DSP:  IntonationSensor — pitch/эмоция/вопрос
 
 Flow:
-  1. Silero VAD listens mic (~1MB model)
-  2. Speech detected -> record audio
-  3. Speech ended -> send to Whisper
-  4. Whisper transcribes -> return text
+  1. Silero VAD слушает микрофон (~1MB)
+  2. Речь обнаружена → Whisper + IntonationSensor параллельно
+  3. Текст + эмоция → ReflexDispatcher → Brain
+  4. При дополнении → supplement_queue → think() injection
+  5. Ответ → Piper TTS (адаптивный noise/length_scale)
 
 Dependencies: faster-whisper, sounddevice, numpy, piper-tts (optional)
 """
@@ -97,6 +99,15 @@ class TarsVoice:
 
         # -- 3. Piper TTS (подготовка) --
         self._init_piper_tts()
+
+        # -- 4. IntonationSensor (DSP) --
+        self.intonation_sensor = None
+        try:
+            from sensory.intonation_sensor import IntonationSensor
+            self.intonation_sensor = IntonationSensor()
+            logger.info("Voice: IntonationSensor загружен (питч/эмоция/вопрос)")
+        except ImportError:
+            logger.debug("Voice: IntonationSensor недоступен")
 
     def _init_piper_tts(self):
         """Подготовка Piper TTS (загрузка модели, если есть)."""
@@ -269,8 +280,179 @@ class TarsVoice:
             logger.error(f"Voice Stream Error: {e}")
             return None
 
-    async def speak(self, text: str):
-        """Синтез речи через Piper TTS (ONNX) или системный fallback."""
+    async def transcribe_with_intonation(self, audio_path: str):
+        """
+        Транскрипция + анализ интонации параллельно.
+        
+        Returns:
+            (text, intonation_data) где intonation_data = {
+                "emotion": str, "is_question": bool,
+                "pitch_trend": str, "pitch_mean": float, ...
+            }
+        """
+        text = await self.transcribe(audio_path)
+        intonation_data = {}
+        
+        if self.intonation_sensor and text:
+            try:
+                import wave
+                with wave.open(audio_path, 'rb') as wf:
+                    sr = wf.getframerate()
+                    frames = wf.readframes(wf.getnframes())
+                    audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+                
+                intonation_data = self.intonation_sensor.analyze(audio, sr)
+                logger.debug(
+                    f"Intonation: {intonation_data.get('emotion', '?')} "
+                    f"q={intonation_data.get('is_question', False)}"
+                )
+            except Exception as e:
+                logger.debug(f"Intonation analysis error: {e}")
+        
+        return text, intonation_data
+
+    def listen_and_inject(self, supplement_queue, tokenizer=None, stop_event=None):
+        """
+        Потоковое прослушивание + инжекция дополнений в supplement_queue.
+        
+        Запускается в отдельном потоке ПАРАЛЛЕЛЬНО с think().
+        Когда VAD детектирует речь → Whisper → текст + интонация
+        → кладёт в очередь → think() инжектирует между волнами.
+        
+        Args:
+            supplement_queue: queue.Queue для дополнений
+            tokenizer: TarsTokenizer для токенизации
+            stop_event: threading.Event для остановки
+        """
+        import threading
+        
+        if stop_event is None:
+            stop_event = threading.Event()
+        
+        if self.stt_model is None:
+            logger.warning("listen_and_inject: STT не загружен")
+            return
+        
+        logger.info("🎤 listen_and_inject: слушаю микрофон для дополнений...")
+        
+        try:
+            import sounddevice as sd
+            import tempfile
+            import wave
+            
+            sr = 16000
+            chunk_duration = 0.5  # 500ms chunks
+            chunk_size = int(sr * chunk_duration)
+            speech_buffer = []
+            is_speaking = False
+            silence_chunks = 0
+            vad_state = None
+            
+            def audio_callback(indata, frames, time_info, status):
+                nonlocal speech_buffer, is_speaking, silence_chunks, vad_state
+                
+                if stop_event.is_set():
+                    raise sd.CallbackAbort
+                
+                chunk = indata[:, 0].copy()
+                
+                # VAD проверка
+                has_speech = False
+                if self.vad_model is not None:
+                    has_speech, vad_state = self._detect_speech_silero(
+                        chunk, vad_state, sr
+                    )
+                else:
+                    # Energy-based fallback
+                    energy = np.sqrt(np.mean(chunk ** 2))
+                    has_speech = energy > 0.01
+                
+                if has_speech:
+                    speech_buffer.append(chunk)
+                    is_speaking = True
+                    silence_chunks = 0
+                elif is_speaking:
+                    silence_chunks += 1
+                    if silence_chunks >= 3:  # 1.5s тишины
+                        # Речь закончилась — транскрибируем
+                        audio_data = np.concatenate(speech_buffer)
+                        speech_buffer = []
+                        is_speaking = False
+                        silence_chunks = 0
+                        
+                        # Сохраняем во временный WAV
+                        with tempfile.NamedTemporaryFile(
+                            suffix='.wav', delete=False
+                        ) as tmp:
+                            tmp_path = tmp.name
+                            with wave.open(tmp_path, 'wb') as wf:
+                                wf.setnchannels(1)
+                                wf.setsampwidth(2)
+                                wf.setframerate(sr)
+                                wf.writeframes(
+                                    (audio_data * 32768).astype(np.int16).tobytes()
+                                )
+                        
+                        # Транскрибируем
+                        try:
+                            segments, _ = self.stt_model.transcribe(
+                                tmp_path, language="ru",
+                                initial_prompt=self.whisper_prompt,
+                            )
+                            text = " ".join(
+                                s.text.strip() for s in segments
+                            ).strip()
+                            
+                            # Интонация
+                            intonation = {}
+                            if self.intonation_sensor:
+                                intonation = self.intonation_sensor.analyze(
+                                    audio_data, sr
+                                )
+                            
+                            if text:
+                                # Токенизация
+                                tokens = None
+                                if tokenizer:
+                                    try:
+                                        import torch
+                                        ids = tokenizer.encode(text)
+                                        tokens = torch.tensor(
+                                            [ids], dtype=torch.long
+                                        )
+                                    except Exception:
+                                        pass
+                                
+                                supplement_queue.put({
+                                    "text": text,
+                                    "tokens": tokens,
+                                    "intonation": intonation,
+                                })
+                                logger.info(
+                                    f"🎤 Supplement: '{text[:60]}' "
+                                    f"[{intonation.get('emotion', '?')}]"
+                                )
+                        except Exception as e:
+                            logger.debug(f"Supplement STT error: {e}")
+                        finally:
+                            try:
+                                os.remove(tmp_path)
+                            except Exception:
+                                pass
+            
+            with sd.InputStream(
+                samplerate=sr, channels=1, blocksize=chunk_size,
+                callback=audio_callback
+            ):
+                stop_event.wait()  # Ждём пока think() не закончит
+        
+        except ImportError:
+            logger.warning("listen_and_inject: sounddevice не установлен")
+        except Exception as e:
+            logger.error(f"listen_and_inject error: {e}")
+
+    async def speak(self, text: str, emotion: str = "neutral"):
+        """Синтез речи через Piper TTS (адаптивный) или системный fallback."""
         if not text:
             return
 
@@ -283,12 +465,26 @@ class TarsVoice:
         output_wav = "data/last_response.wav"
         os.makedirs("data", exist_ok=True)
 
+        # Адаптивные параметры Piper по эмоции
+        # noise_scale: вариативность (выше = эмоциональнее)
+        # length_scale: скорость (ниже = быстрее)
+        piper_kwargs = {}
+        if emotion == "excited":
+            piper_kwargs = {"noise_scale": 0.8, "length_scale": 0.9}
+        elif emotion == "calm":
+            piper_kwargs = {"noise_scale": 0.3, "length_scale": 1.15}
+        elif emotion == "whisper":
+            piper_kwargs = {"noise_scale": 0.2, "length_scale": 1.3}
+        elif emotion == "question":
+            piper_kwargs = {"noise_scale": 0.6, "length_scale": 1.0}
+        # neutral = default Piper params
+
         # 1. Piper TTS (Python-пакет piper-tts)
         if self.piper_voice is not None:
             try:
                 import wave
                 with wave.open(output_wav, 'wb') as wav_file:
-                    self.piper_voice.synthesize(text, wav_file)
+                    self.piper_voice.synthesize(text, wav_file, **piper_kwargs)
 
                 if os.path.exists(output_wav):
                     self._play_audio(output_wav)

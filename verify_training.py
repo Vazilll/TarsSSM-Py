@@ -49,9 +49,16 @@ train_in, test_in = inputs[:-n_test], inputs[-n_test:]
 train_tgt, test_tgt = targets[:-n_test], targets[-n_test:]
 print(f"Train: {len(train_in)}, Test: {len(test_in)}")
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.05)
 batch_size = 4 if FULL else 8
 epochs = 8
+
+# ═══ Early Stopping ═══
+best_eval_loss = float('inf')
+best_epoch = 0
+best_state = None
+patience = 3         # сколько эпох терпим без улучшения
+no_improve = 0
 
 # ═══ Tracking arrays ═══
 train_losses = []
@@ -96,7 +103,7 @@ for epoch in range(epochs):
         logits = model(batch_in)
         lm_loss = F.cross_entropy(
             logits.view(-1, 256), batch_tgt.view(-1),
-            label_smoothing=0.1,
+            label_smoothing=0.15,
         )
         loss = lm_loss + model.mole_aux_loss
         t_fwd_end = time.time()
@@ -172,16 +179,44 @@ for epoch in range(epochs):
     train_losses.append(train_avg)
     eval_losses.append(eval_loss)
     
-    # Track memory_vec norm (probe via a forward pass)
+    # Track memory_vec norm (spine проецирует h_curr → 384d между волнами)
+    mem_norm_val = 'n/a'
     with torch.no_grad():
         probe = torch.randint(0, 256, (1, SEQ), device=device)
         _ = model(probe)
+        # После forward() спинной мозг обновляет memory_vec внутри.
+        # Чтобы его прочитать, делаем ещё один проход и ловим его через хук.
+        # Но проще — вычислить напрямую из to_memory_space:
+        probe_x = model.embedding(probe)
+        h_probe = probe_x.mean(dim=1)  # [1, d_model]
+        mem_vec = model.to_memory_space(h_probe)  # [1, 384]
+        mem_norm_val = mem_vec.norm().item()
+    spine_mem_norms.append(mem_norm_val)
     
     recent_spine = np.mean(grad_norms_spine[-n_batches:]) if grad_norms_spine else 0
     recent_total = np.mean(grad_norms_total[-n_batches:]) if grad_norms_total else 0
     
+    mem_display = f"{mem_norm_val:8.4f}" if isinstance(mem_norm_val, float) else f"{'n/a':>8}"
     print(f"  {epoch+1:3d}   | {train_avg:8.4f} | {eval_loss:8.4f} | {ppl:7.1f} | "
-          f"{recent_total:8.4f} | {recent_spine:8.4f} | {'n/a':>8} | {elapsed:5.1f}s")
+          f"{recent_total:8.4f} | {recent_spine:8.4f} | {mem_display} | {elapsed:5.1f}s")
+    
+    # ═══ Early Stopping ═══
+    if eval_loss < best_eval_loss:
+        best_eval_loss = eval_loss
+        best_epoch = epoch + 1
+        best_state = {k: v.clone() for k, v in model.state_dict().items()}
+        no_improve = 0
+    else:
+        no_improve += 1
+        if no_improve >= patience:
+            print(f"\n  Early stopping at epoch {epoch+1} (no improvement for {patience} epochs)")
+            print(f"  Best eval loss: {best_eval_loss:.4f} at epoch {best_epoch}")
+            break
+
+# Restore best model
+if best_state is not None:
+    model.load_state_dict(best_state)
+    print(f"\n  Restored best model from epoch {best_epoch} (eval={best_eval_loss:.4f})")
 
 # ═══ ANALYSIS ═══
 print(f"\n{'='*65}")

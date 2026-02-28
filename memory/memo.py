@@ -129,6 +129,10 @@ class MemoCache:
         }
 
 
+# Alias для обратной совместимости
+Memo = MemoCache
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     

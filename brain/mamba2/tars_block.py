@@ -44,6 +44,7 @@ class TarsBlock(nn.Module):
         n_experts: int = 8,
         layer_idx: int = 0,
         quant_mode: str = "fp16",
+        dropout: float = 0.1,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -81,6 +82,11 @@ class TarsBlock(nn.Module):
             nn.Sigmoid(),
         )
         
+        # ═══ 7. Dropout (регуляризация против overfitting) ═══
+        # Применяется в 3 точках: после core, после MoLE, после memory injection.
+        # Стандартный 0.1 для SSM-моделей. При eval автоматически отключается.
+        self.drop = nn.Dropout(dropout)
+        
         # Stats
         self.last_stats = {}
         self.last_surprise = 0.0  # Для Titans feedback
@@ -115,7 +121,7 @@ class TarsBlock(nn.Module):
         core_out, wkv_state, x_prev, ssd_state, conv_state = self.core(
             self.norm(x), wkv_state, x_prev, ssd_state, conv_state
         )
-        x = residual + core_out
+        x = residual + self.drop(core_out)
         
         # ═══ Cache h_mean once (used by RAG, NoveltyGate, Memory) ═══
         h_mean = x.mean(dim=1)  # [B, d_model]
@@ -131,6 +137,7 @@ class TarsBlock(nn.Module):
         
         # ═══ 3. MoLE (returns aux_loss for load balancing) ═══
         x, mole_aux_loss = self.mole(x)
+        x = self.drop(x)
         
         # ═══ 4. NoveltyGate — adaptive residual ═══
         h_old = residual.mean(dim=1)                             # [B, d_model]
@@ -150,7 +157,7 @@ class TarsBlock(nn.Module):
             gate = self.mem_gate(gate_input).squeeze(-1)              # [B]
             mem_strength = (similarity * gate).unsqueeze(-1).unsqueeze(-1)
             mem_signal = self.mem_proj(memory_vec).unsqueeze(1)       # [B, 1, d_model]
-            x = x + mem_strength * mem_signal
+            x = x + self.drop(mem_strength * mem_signal)
             mem_relevance = similarity.mean().item()
             self.last_surprise = gate.mean().item()
         

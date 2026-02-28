@@ -1,20 +1,16 @@
-# TARS v3 — Core Dependencies
+# TARS v3 — Full Dependencies
 # Install: pip install -r requirements.txt
 
-# ═══ Обязательные (ядро) ═══
+# ═══ Ядро (обучение мозга) ═══
 torch
 numpy
 einops
 tqdm
+psutil
 
 # ═══ Токенайзеры ═══
 sentencepiece
 tokenizers
-
-# ═══ Голос (STT + TTS) ═══
-faster-whisper
-sounddevice
-# piper-tts  # Опционально, для голосового синтеза
 
 # ═══ RAG и память (LEANN) ═══
 sentence-transformers
@@ -22,7 +18,20 @@ sentence-transformers
 # ═══ Датасеты HuggingFace ═══
 datasets
 
-# ═══ Опционально ═══
-# onnxruntime        # Для Silero VAD ONNX
-# pyttsx3            # Системный голос (fallback)
-# duckduckgo-search  # Веб-поиск
+# ═══ Голос — STT (Whisper LoRA, фаза 8) ═══
+transformers
+peft
+jiwer
+faster-whisper
+
+# ═══ Голос — TTS (Piper, фаза 9) ═══
+sounddevice
+# piper-tts          # Устанавливается автоматически в train_piper.py
+
+# ═══ Голос — Квантизация ONNX (фаза 10) ═══
+onnxruntime
+
+# ═══ Hub API сервер ═══
+fastapi
+uvicorn
+websockets

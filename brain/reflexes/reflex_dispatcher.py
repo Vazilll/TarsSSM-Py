@@ -37,6 +37,7 @@ from brain.reflexes.sensors import (
     SystemSensor,
     EmotionSensor,
     ContextSensor,
+    VoiceSensor,
 )
 
 logger = logging.getLogger("Tars.ReflexDispatcher")
@@ -86,6 +87,14 @@ class ReflexContext:
     session_length: int = 0
     context_summary: str = ""
     
+    # ═══ Voice/Intonation (Sensor 7) ═══
+    voice_emotion: str = "neutral"
+    voice_is_question: bool = False
+    voice_pitch_trend: str = "flat"
+    voice_energy: float = 0.0
+    is_supplement: bool = False
+    has_voice_data: bool = False
+    
     def summary_line(self) -> str:
         """Краткая строка для CLI."""
         emoji_map = {
@@ -107,6 +116,10 @@ class ReflexContext:
             parts.append(f"⚠️urgent={self.urgency:.0%}")
         if self.is_followup:
             parts.append("↩️followup")
+        if self.is_supplement:
+            parts.append("🎤supplement")
+        if self.has_voice_data:
+            parts.append(f"🗣{self.voice_emotion}")
         
         return " | ".join(parts)
 
@@ -134,6 +147,7 @@ class ReflexDispatcher:
             "system": SystemSensor(),
             "emotion": EmotionSensor(),
             "context": ContextSensor(),
+            "voice": VoiceSensor(),
         }
         self.max_workers = max_workers
         self.total_dispatches = 0
@@ -144,12 +158,13 @@ class ReflexDispatcher:
             f"{max_workers} потоков"
         )
     
-    def dispatch(self, query: str) -> ReflexContext:
+    def dispatch(self, query: str, intonation_data: dict = None) -> ReflexContext:
         """
         Параллельный запуск всех сенсоров.
         
         Args:
             query: Текст запроса пользователя
+            intonation_data: Данные от IntonationSensor (опционально)
         
         Returns:
             ReflexContext с результатами всех сенсоров
@@ -160,11 +175,16 @@ class ReflexDispatcher:
         ctx = ReflexContext(query=query)
         results = {}
         
+        # kwargs для сенсоров (VoiceSensor получит intonation_data)
+        sensor_kwargs = {}
+        if intonation_data:
+            sensor_kwargs["intonation_data"] = intonation_data
+        
         # ═══ Параллельный запуск всех сенсоров ═══
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
             futures = {}
             for name, sensor in self.sensors.items():
-                future = pool.submit(self._run_sensor, sensor, query)
+                future = pool.submit(self._run_sensor, sensor, query, **sensor_kwargs)
                 futures[future] = name
             
             for future in as_completed(futures):
@@ -193,10 +213,10 @@ class ReflexDispatcher:
         
         return ctx
     
-    def _run_sensor(self, sensor, query: str):
+    def _run_sensor(self, sensor, query: str, **kwargs):
         """Запуск одного сенсора с замером времени."""
         t0 = time.perf_counter()
-        result = sensor.process(query)
+        result = sensor.process(query, **kwargs)
         elapsed = (time.perf_counter() - t0) * 1000
         return result, elapsed
     
@@ -257,6 +277,24 @@ class ReflexDispatcher:
         ctx.is_followup = r.get("is_followup", False)
         ctx.session_length = r.get("session_length", 0)
         ctx.context_summary = r.get("context_summary", "")
+        
+        # Voice
+        r = results.get("voice", {})
+        ctx.voice_emotion = r.get("voice_emotion", "neutral")
+        ctx.voice_is_question = r.get("is_question", False)
+        ctx.voice_pitch_trend = r.get("pitch_trend", "flat")
+        ctx.voice_energy = r.get("energy", 0.0)
+        ctx.is_supplement = r.get("is_supplement", False)
+        ctx.has_voice_data = r.get("has_audio", False)
+        
+        # Merge voice urgency boost into overall urgency
+        voice_boost = r.get("urgency_boost", 0.0)
+        if voice_boost > 0:
+            ctx.urgency = min(1.0, ctx.urgency + voice_boost)
+        
+        # Voice emotion overrides text emotion when audio is present
+        if ctx.has_voice_data and ctx.voice_emotion != "neutral":
+            ctx.dominant_emotion = ctx.voice_emotion
     
     def add_to_history(self, query: str, response: str = "", intent: str = ""):
         """Обновляет историю сессии в ContextSensor."""

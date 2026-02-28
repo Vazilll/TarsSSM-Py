@@ -1,10 +1,10 @@
 ═══════════════════════════════════════════════════════════════════════════════
-      TARS v3 — ПОЛНЫЙ АУДИТ: 38 РЕАЛИЗОВАННЫХ КОМПОНЕНТОВ
+      TARS v3 — ПОЛНЫЙ АУДИТ: 44 РЕАЛИЗОВАННЫХ КОМПОНЕНТА
 ═══════════════════════════════════════════════════════════════════════════════
 
 Авторы: Жуков М.Д., Кадымов Д.
-Дата аудита: 26 февраля 2026
-Статус: ВСЕ 38 ПУНКТОВ РЕАЛИЗОВАНЫ ✓
+Дата аудита: 28 февраля 2026
+Статус: ВСЕ 44 ПУНКТА РЕАЛИЗОВАНЫ ✓
 
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -305,3 +305,54 @@
     - ConfidenceHead (64→1) + IntentHead (64→6)
     - 6 интентов: greeting, farewell, status, time, quick_action, complex
     - P_conf > 0.85 → Tier 1 (мгновенный ответ)
+
+
+═══════════════════════════════════════════════════════════════════════════════
+             9. ГОЛОСОВАЯ СЕНСОРИКА (6 пунктов, NEW)
+═══════════════════════════════════════════════════════════════════════════════
+
+Файлы: brain/reflexes/sensors.py, sensory/voice.py, sensory/intonation_sensor.py,
+       brain/mamba2/model.py, hub/main.py, brain/reflexes/reflex_dispatcher.py
+
+  [✓] 39. VoiceSensor — 7-й сенсор ReflexDispatcher
+      Реализация: sensors.py строки 449-535
+      17 маркеров дополнений ("и ещё", "уточню", "подожди"...),
+      passthrough данных IntonationSensor, urgency boost от голоса.
+      Поля: voice_emotion, is_question, pitch_trend, is_supplement.
+
+  [✓] 40. Supplement Injection в think()
+      Реализация: model.py строки 653-765
+      supplement_queue (thread-safe Queue) проверяется МЕЖДУ волнами.
+      Если дополнение →:
+        1. Embedding → 2 блока [B_left ‖ B_right] параллельно
+        2. WaveConsolidation: суммирующая матрица
+        3. Spine: memory_vec = 50% старый + 50% supplement
+        4. Integral Auditor RESET (переоценка сходимости)
+        5. +3 extra волны (6 блоков) для сопоставления.
+
+  [✓] 41. IntonationSensor — DSP анализ интонации
+      Реализация: sensory/intonation_sensor.py
+      Чисто DSP (без ML): autocorrelation pitch tracking,
+      zero-crossing rate, RMS energy, pitch trend detection.
+      Возвращает: emotion (calm/excited/whisper/question/neutral),
+      is_question (повышающий тон), pitch_mean, speech_rate.
+
+  [✓] 42. Adaptive Piper TTS (эмоция → параметры)
+      Реализация: sensory/voice.py метод speak()
+      Emotion → noise_scale + length_scale:
+        excited: 0.8/0.9, calm: 0.3/1.15,
+        whisper: 0.2/1.3, question: 0.6/1.0.
+      Голос ТАРС адаптируется к контексту диалога.
+
+  [✓] 43. listen_and_inject() — потоковая инжекция
+      Реализация: sensory/voice.py метод listen_and_inject()
+      Запускается ПАРАЛЛЕЛЬНО с think() в отдельном потоке.
+      VAD → Whisper → IntonationSensor → supplement_queue.put().
+      think() инжектирует между волнами автоматически.
+
+  [✓] 44. Hub: голос через ReflexDispatcher
+      Реализация: hub/main.py
+      /voice_interaction: audio → transcribe_with_intonation()
+        → dispatch(text, intonation_data) → GIE/reflex → speak(emotion)
+      /ws/voice_stream: WebSocket для реал-тайм supplement injection.
+      Dispatcher telemetry в /ws/telemetry.

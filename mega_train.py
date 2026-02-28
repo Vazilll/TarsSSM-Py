@@ -5,22 +5,27 @@
 
 Один скрипт делает ВСЁ:
 
-  Фаза 0: Установка зависимостей (pip install)
-  Фаза 1: Скачивание данных (Wikipedia + HuggingFace + LEANN)
-  Фаза 2: Обучение рефлексов (MinGRU classifier, ~1 мин)
-  Фаза 3: Обучение MinGRU LM (System 1, ~30 мин GPU)
-  Фаза 4: Обучение Mamba-2 (12 слоёв × 768d, 4 фазы, ~2-4ч GPU)
-  Фаза 5: Квантизация 1.58-bit + дообучение (~30 мин)
-  Фаза 6: Финальная сборка в models/tars_v3/
-  Фаза 7: Валидация (тестовая генерация)
+  Фаза 0:  Установка зависимостей (pip install)
+  Фаза 1:  Скачивание данных (Wikipedia + HuggingFace + LEANN)
+  Фаза 2:  Обучение рефлексов (MinGRU classifier, ~1 мин)
+  Фаза 3:  Обучение MinGRU LM (System 1, ~30 мин GPU)
+  Фаза 4:  Обучение Mamba-2 (12 слоёв × 768d, 4 фазы, ~2-4ч GPU)
+  Фаза 5:  Квантизация 1.58-bit + дообучение (~30 мин)
+  Фаза 6:  Финальная сборка в models/tars_v3/
+  Фаза 7:  Валидация (тестовая генерация)
+  Фаза 8:  Whisper Tiny LoRA — дообучение STT для русского (~2ч GPU)
+  Фаза 9:  Piper TTS — дообучение голоса для русского (~5ч GPU)
+  Фаза 10: Квантизация голосовых ONNX-моделей (INT8, ~5 мин)
 
-Оптимизировано для: RTX 4090 (24GB VRAM) + 64GB RAM
+Оптимизировано для: Kaggle P100 (16GB) / Colab A100 / RTX 4090
 
 Использование:
-  python mega_train.py              # Полный пайплайн
+  python mega_train.py              # Полный пайплайн (~15ч)
   python mega_train.py --skip-download  # Без скачивания (данные есть)
   python mega_train.py --phase 4    # Только Mamba-2
+  python mega_train.py --phase 8    # Только Whisper fine-tune
   python mega_train.py --quick      # Быстрый тест (маленькая модель)
+  python mega_train.py --skip-voice # Без голосовых фаз (8-10)
 
 ═══════════════════════════════════════════════════════════════════════════
 """
@@ -60,7 +65,7 @@ logger = logging.getLogger("MegaTrain")
 #  УТИЛИТЫ
 # ═════════════════════════════════════════════════════════════════════════
 
-def banner(phase: int, title: str, total: int = 7):
+def banner(phase: int, title: str, total: int = 10):
     """Печатает баннер фазы."""
     logger.info("")
     logger.info("╔" + "═" * 62 + "╗")
@@ -286,11 +291,23 @@ def phase_0_install():
     
     # Остальные пакеты
     packages = [
+        # ═══ Core (обучение мозга) ═══
         "numpy", "einops", "tqdm",
         "sentencepiece", "tokenizers",
         "sentence-transformers",
         "datasets",
         "psutil",
+        # ═══ Voice (фазы 8-10) ═══
+        "transformers",          # Whisper model
+        "peft",                  # LoRA adapters
+        "jiwer",                 # WER метрика для Whisper
+        "onnxruntime",           # INT8 квантизация ONNX
+        "faster-whisper",        # STT runtime
+        "sounddevice",           # Захват микрофона
+        # ═══ Hub (API сервер) ═══
+        "fastapi",               # REST API
+        "uvicorn",               # ASGI сервер
+        "websockets",            # WebSocket support
     ]
     
     logger.info("Проверка и установка остальных пакетов...")
@@ -707,6 +724,69 @@ def phase_7_validate():
 
 
 # ═════════════════════════════════════════════════════════════════════════
+#  ФАЗА 8: WHISPER TINY FINE-TUNE (РУССКИЙ)
+# ═════════════════════════════════════════════════════════════════════════
+
+def phase_8_whisper(device: str, quick: bool = False):
+    """Дообучение Whisper Tiny для русского (LoRA)."""
+    banner(8, "Whisper Tiny LoRA (Russian STT)")
+
+    # Установка дополнительных зависимостей
+    logger.info("  📦 Установка peft, jiwer...")
+    run([PYTHON, "-m", "pip", "install", "peft", "jiwer", "-q"], check=False)
+
+    args_list = [
+        PYTHON, TRAINING / "train_whisper.py",
+        "--device", device,
+    ]
+    if quick:
+        args_list += ["--samples", "500", "--epochs", "1", "--batch", "8"]
+    else:
+        args_list += ["--samples", "5000", "--epochs", "3", "--batch", "16"]
+
+    return run(args_list)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  ФАЗА 9: PIPER TTS FINE-TUNE (РУССКИЙ)
+# ═════════════════════════════════════════════════════════════════════════
+
+def phase_9_piper(quick: bool = False):
+    """Дообучение Piper TTS для русского голоса."""
+    banner(9, "Piper TTS (Russian Voice)")
+
+    # Установка дополнительных зависимостей
+    logger.info("  📦 Установка piper-tts, piper-phonemize...")
+    run([PYTHON, "-m", "pip", "install", "piper-tts", "piper-phonemize", "-q"], check=False)
+
+    args_list = [
+        PYTHON, TRAINING / "train_piper.py",
+    ]
+    if quick:
+        args_list += ["--epochs", "100", "--max_samples", "200", "--batch", "8"]
+    else:
+        args_list += ["--epochs", "1000", "--max_samples", "3000", "--batch", "16"]
+
+    return run(args_list)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  ФАЗА 10: КВАНТИЗАЦИЯ ГОЛОСОВЫХ МОДЕЛЕЙ (INT8)
+# ═════════════════════════════════════════════════════════════════════════
+
+def phase_10_quantize_voice():
+    """INT8 квантизация Whisper ONNX + Piper ONNX."""
+    banner(10, "Квантизация голосовых моделей (INT8)")
+
+    # Whisper Vocabulary Boost
+    logger.info("  📝 Генерация Whisper hotwords...")
+    run([PYTHON, TRAINING / "whisper_boost.py"], check=False)
+
+    # ONNX квантизация
+    return run([PYTHON, TRAINING / "quantize_voice.py"])
+
+
+# ═════════════════════════════════════════════════════════════════════════
 #  MAIN
 # ═════════════════════════════════════════════════════════════════════════
 
@@ -716,11 +796,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Примеры:
-  python mega_train.py                        # Полный пайплайн (~4-6 часов)
+  python mega_train.py                        # Полный пайплайн (~15 часов)
   python mega_train.py --skip-download        # Данные уже скачаны
   python mega_train.py --phase 4              # Только Mamba-2
+  python mega_train.py --phase 8              # Только Whisper
+  python mega_train.py --phase 9              # Только Piper
   python mega_train.py --quick                # Быстрый тест (256d, 4 слоя)
   python mega_train.py --skip-quantize        # Без квантизации
+  python mega_train.py --skip-voice           # Без голосовых фаз (8-10)
         """
     )
     
@@ -728,7 +811,9 @@ def main():
                         help="Пропустить скачивание данных")
     parser.add_argument("--skip-quantize", action="store_true",
                         help="Пропустить квантизацию 1.58-bit")
-    parser.add_argument("--phase", type=int, choices=[0,1,2,3,4,5,6,7],
+    parser.add_argument("--skip-voice", action="store_true",
+                        help="Пропустить голосовые фазы (Whisper, Piper, квант.)")
+    parser.add_argument("--phase", type=int, choices=[0,1,2,3,4,5,6,7,8,9,10],
                         help="Запустить только конкретную фазу")
     parser.add_argument("--quick", action="store_true",
                         help="Быстрый тест (маленькая модель, 1 эпоха)")
@@ -780,6 +865,9 @@ def main():
         4: ("mamba2", lambda: phase_4_mamba2(device, quick=args.quick)),
         5: ("quantize", lambda: phase_5_quantize(device, quick=args.quick)),
         7: ("validate", lambda: phase_7_validate()),
+        8: ("whisper", lambda: phase_8_whisper(device, quick=args.quick)),
+        9: ("piper", lambda: phase_9_piper(quick=args.quick)),
+        10: ("voice_quant", lambda: phase_10_quantize_voice()),
     }
     
     # Если задана конкретная фаза
@@ -832,11 +920,27 @@ def main():
         logger.info("⏭ Пропуск квантизации (--skip-quantize)")
         results["quantize"] = True
     
-    # Фаза 6: Сборка
+    # Фаза 6: Сборка (промежуточная)
     phase_6_consolidate(results, time.time() - t0)
     
-    # Фаза 7: Валидация
+    # Фаза 7: Валидация мозга
     results["validate"] = phase_7_validate()
+    
+    # ═══ ГОЛОСОВОЙ ПАЙПЛАЙН (Фазы 8-10) ═══
+    if not args.skip_voice:
+        # Фаза 8: Whisper STT fine-tune
+        results["whisper"] = phase_8_whisper(device, quick=args.quick)
+        
+        # Фаза 9: Piper TTS fine-tune
+        results["piper"] = phase_9_piper(quick=args.quick)
+        
+        # Фаза 10: Квантизация голосовых ONNX
+        results["voice_quant"] = phase_10_quantize_voice()
+    else:
+        logger.info("⏭ Пропуск голосовых фаз (--skip-voice)")
+        results["whisper"] = True
+        results["piper"] = True
+        results["voice_quant"] = True
     
     # ═══ ИТОГИ ═══
     total_time = time.time() - t0
@@ -857,6 +961,7 @@ def main():
         logger.info("")
         logger.info("  🎯 ВСЕ ФАЗЫ ЗАВЕРШЕНЫ УСПЕШНО!")
         logger.info("  📁 Модели собраны: models/tars_v3/")
+        logger.info("  🎤 Голос: Whisper (RU) + Piper (RU) + INT8")
         logger.info("  🚀 Запуск: python launch_tars.py")
         logger.info("")
     else:
