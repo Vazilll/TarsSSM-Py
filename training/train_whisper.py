@@ -26,7 +26,9 @@ logger = logging.getLogger("Whisper.Train")
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Whisper Tiny LoRA Fine-tune (Russian)")
+    p = argparse.ArgumentParser(description="Whisper LoRA Fine-tune (Russian)")
+    p.add_argument("--model", type=str, default="tiny", choices=["tiny", "base", "small"],
+                    help="Размер базовой модели Whisper (tiny=39M, base=74M, small=244M)")
     p.add_argument("--samples", type=int, default=5000, help="Кол-во обучающих примеров")
     p.add_argument("--val_samples", type=int, default=500, help="Кол-во валидационных примеров")
     p.add_argument("--epochs", type=int, default=3, help="Кол-во эпох")
@@ -63,9 +65,10 @@ def train(args):
     logger.info(f"Device: {device}, FP16: {fp16}")
 
     # ═══ Модель ═══
-    logger.info("Загрузка Whisper Tiny...")
-    model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny")
-    processor = WhisperProcessor.from_pretrained("openai/whisper-tiny")
+    model_name = f"openai/whisper-{args.model}"
+    logger.info(f"Загрузка {model_name}...")
+    model = WhisperForConditionalGeneration.from_pretrained(model_name)
+    processor = WhisperProcessor.from_pretrained(model_name)
 
     # Принудительно русский язык
     model.config.forced_decoder_ids = processor.get_decoder_prompt_ids(
