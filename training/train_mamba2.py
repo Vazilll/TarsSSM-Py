@@ -74,6 +74,8 @@ def parse_args():
                    help="Warmup-Stable-Decay scheduler (SmolLM2, better for long training)")
     p.add_argument('--mod', action='store_true',
                    help="Mixture of Depths: skip layers for easy tokens (-30%% compute)")
+    p.add_argument('--no_wiki', action='store_true',
+                   help="Не скачивать Wikipedia (использовать встроенный корпус)")
     return p.parse_args()
 
 
@@ -262,7 +264,7 @@ def train(args):
         print("[CPU] GPU не используется")
     
     # Данные (корпус загружается 1 раз, токенизация — по curriculum)
-    corpus = load_corpus(data_path=args.data)
+    corpus = load_corpus(data_path=args.data, download_wiki=not args.no_wiki)
     print(f"[Data] Корпус загружен ({len(corpus):,} символов)")
     
     # ═══════════════════════════════════════════════════════════

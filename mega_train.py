@@ -573,6 +573,7 @@ def phase_4_mamba2(device: str, resume: bool = False, quick: bool = False):
             "--label_smoothing", "0.1",
             "--max_samples", "500",
             "--no_compile",  # T4 не поддерживает linalg.solve в FP16 через compile
+            "--no_wiki",     # Вики уже пропущена в фазе 1
         ]
     else:
         base = [
