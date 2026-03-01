@@ -26,12 +26,22 @@
   python mega_train.py --phase 8    # Только Whisper fine-tune
   python mega_train.py --quick      # Быстрый тест (маленькая модель)
   python mega_train.py --skip-voice # Без голосовых фаз (8-10)
+  python mega_train.py --drive      # Кеш данных на Google Drive
 
 ═══════════════════════════════════════════════════════════════════════════
 """
 
 import os
 import sys
+
+# Fix Windows cp1252 encoding for Russian output
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 import re
 import time
 import json
@@ -355,6 +365,136 @@ def phase_0_install():
 
 
 # ═════════════════════════════════════════════════════════════════════════
+#  GOOGLE DRIVE: Кеширование данных и моделей
+# ═════════════════════════════════════════════════════════════════════════
+
+DRIVE_BASE = Path("/content/drive/MyDrive/TarsData")
+
+def drive_mount():
+    """Монтирует Google Drive (только на Colab)."""
+    try:
+        from google.colab import drive
+        if not Path("/content/drive").exists():
+            drive.mount("/content/drive")
+            logger.info("  📁 Google Drive подключен")
+        else:
+            logger.info("  📁 Google Drive уже подключен")
+        DRIVE_BASE.mkdir(parents=True, exist_ok=True)
+        return True
+    except ImportError:
+        logger.info("  ℹ Не Colab — Google Drive недоступен")
+        return False
+
+def drive_restore():
+    """Восстанавливает данные с Google Drive (пропускает скачивание)."""
+    if not DRIVE_BASE.exists():
+        return
+    
+    restored = 0
+    
+    # Восстановить data/ (wiki_ru.txt, hf_*.txt)
+    drive_data = DRIVE_BASE / "data"
+    if drive_data.exists():
+        for f in drive_data.glob("*"):
+            dst = DATA / f.name
+            if not dst.exists() or dst.stat().st_size < f.stat().st_size:
+                shutil.copy2(str(f), str(dst))
+                restored += 1
+        if restored:
+            logger.info(f"  📥 Из Drive: {restored} файлов данных")
+    
+    # Восстановить models/embeddings/
+    drive_emb = DRIVE_BASE / "embeddings"
+    local_emb = MODELS / "embeddings"
+    if drive_emb.exists() and not (local_emb / "config.json").exists():
+        shutil.copytree(str(drive_emb), str(local_emb), dirs_exist_ok=True)
+        logger.info("  📥 Из Drive: embeddings модель")
+        restored += 1
+    
+    # Восстановить models/voice/
+    drive_voice = DRIVE_BASE / "voice"
+    local_voice = MODELS / "voice"
+    if drive_voice.exists():
+        local_voice.mkdir(parents=True, exist_ok=True)
+        for f in drive_voice.rglob("*"):
+            if f.is_file():
+                rel = f.relative_to(drive_voice)
+                dst = local_voice / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if not dst.exists():
+                    shutil.copy2(str(f), str(dst))
+                    restored += 1
+        if restored:
+            logger.info(f"  📥 Из Drive: голосовые модели")
+    
+    # Восстановить memory/leann.index
+    drive_leann = DRIVE_BASE / "leann.index"
+    local_leann = ROOT / "memory" / "leann.index"
+    if drive_leann.exists() and not local_leann.exists():
+        shutil.copy2(str(drive_leann), str(local_leann))
+        logger.info("  📥 Из Drive: LEANN индекс")
+        restored += 1
+    
+    if restored:
+        logger.info(f"  ✅ Восстановлено {restored} элементов из Drive (скачивание пропущено)")
+    else:
+        logger.info("  ℹ Drive кэш пуст — первый запуск, данные скачаются")
+
+def drive_save():
+    """Сохраняет данные и модели на Google Drive для следующего запуска."""
+    if not DRIVE_BASE.exists():
+        return
+    
+    saved = 0
+    
+    # Сохранить data/ (wiki + hf)
+    drive_data = DRIVE_BASE / "data"
+    drive_data.mkdir(parents=True, exist_ok=True)
+    for f in DATA.glob("*.txt"):
+        if f.stat().st_size > 10000:  # Только значимые файлы
+            dst = drive_data / f.name
+            if not dst.exists() or dst.stat().st_size < f.stat().st_size:
+                shutil.copy2(str(f), str(dst))
+                saved += 1
+    for f in DATA.glob("*.json"):
+        if f.stat().st_size > 100:
+            dst = drive_data / f.name
+            if not dst.exists():
+                shutil.copy2(str(f), str(dst))
+                saved += 1
+    
+    # Сохранить embeddings
+    local_emb = MODELS / "embeddings"
+    drive_emb = DRIVE_BASE / "embeddings"
+    if local_emb.exists() and not drive_emb.exists():
+        shutil.copytree(str(local_emb), str(drive_emb))
+        logger.info("  💾 → Drive: embeddings")
+        saved += 1
+    
+    # Сохранить voice
+    local_voice = MODELS / "voice"
+    drive_voice = DRIVE_BASE / "voice"
+    if local_voice.exists() and not drive_voice.exists():
+        shutil.copytree(str(local_voice), str(drive_voice))
+        logger.info("  💾 → Drive: voice модели")
+        saved += 1
+    
+    # Сохранить LEANN
+    local_leann = ROOT / "memory" / "leann.index"
+    drive_leann = DRIVE_BASE / "leann.index"
+    if local_leann.exists():
+        shutil.copy2(str(local_leann), str(drive_leann))
+        saved += 1
+    
+    # НЕ сохраняем обученные модели (tars_v3) — обучение всегда с нуля
+    
+    if saved:
+        logger.info(f"  ✅ Сохранено {saved} элементов на Drive")
+        logger.info(f"  📂 Путь: {DRIVE_BASE}")
+        logger.info(f"  ℹ Обученные модели НЕ кешируются — обучение всегда с нуля")
+
+
+# ═════════════════════════════════════════════════════════════════════════
 #  ФАЗА 1: СКАЧИВАНИЕ ДАННЫХ
 # ═════════════════════════════════════════════════════════════════════════
 
@@ -363,31 +503,19 @@ def phase_1_download(quick: bool = False):
     banner(1, "Скачивание данных")
     
     success = True
-    # 1.1 Wikipedia
-    wiki_path = DATA / "wiki_ru.txt"
+    # 1.1 Все датасеты через HuggingFace (включая Wikipedia)
     if quick:
-        logger.info("  📚 Wikipedia: пропуск (quick mode, используем встроенный корпус)")
-    elif wiki_path.exists() and wiki_path.stat().st_size > 1_000_000:
-        wiki_mb = wiki_path.stat().st_size / 1024 / 1024
-        logger.info(f"  📚 Wikipedia: уже есть ({wiki_mb:.1f} MB)")
-    else:
-        logger.info("  📚 Скачивание Wikipedia (100000 статей)...")
-        if not run([PYTHON, TRAINING / "download_wiki.py", "--count", "100000"], check=False):
-            logger.warning("  ⚠ Wikipedia не скачана — продолжаем")
-            success = False
-    
-    # 1.2 HuggingFace датасеты
-    if quick:
-        logger.info("  🤗 HuggingFace: пропуск (quick mode)")
+        logger.info("  📚 Данные: пропуск (quick mode, используем встроенный корпус)")
     else:
         hf_files = list(DATA.glob("hf_*.txt"))
-        if len(hf_files) >= 3:
+        if len(hf_files) >= 8:  # 15 датасетов в preset all, но некоторые могут не загрузиться
             total_mb = sum(f.stat().st_size for f in hf_files) / 1024 / 1024
-            logger.info(f"  🤗 HuggingFace: уже есть ({len(hf_files)} файлов, {total_mb:.0f} MB)")
+            logger.info(f"  📚 Данные: уже есть ({len(hf_files)} датасетов, {total_mb:.0f} MB)")
         else:
-            logger.info("  🤗 Скачивание HuggingFace датасетов (код + чат + агенты)...")
+            logger.info("  📚 Скачивание всех датасетов (Wikipedia + HF, ~15 источников)...")
+            logger.info("  ℹ Wikipedia качается через HuggingFace дамп (быстрее чем API)")
             if not run([PYTHON, TRAINING / "download_hf_dataset.py", "--preset", "all"], check=False):
-                logger.warning("  ⚠ HuggingFace не скачан — продолжаем")
+                logger.warning("  ⚠ Часть датасетов не скачана — продолжаем")
                 success = False
     
     # 1.3 LEANN embedding model
@@ -542,7 +670,7 @@ def phase_3_mingru(device: str, quick: bool = False):
 #  ФАЗА 4: MAMBA-2 BRAIN (TIER 2 / System 2) — ОСНОВНОЕ ОБУЧЕНИЕ
 # ═════════════════════════════════════════════════════════════════════════
 
-def phase_4_mamba2(device: str, resume: bool = False, quick: bool = False):
+def phase_4_mamba2(device: str, resume: bool = False, quick: bool = False, max_mode: bool = False):
     """
     Обучение Mamba-2 brain — полная архитектура.
     
@@ -552,7 +680,10 @@ def phase_4_mamba2(device: str, resume: bool = False, quick: bool = False):
       Phase 3: Fine-tune MoLE + MatrixPool (1 эпоха)
       Phase 4: Fine-tune WKV Fusion + RAG (1 эпоха)
     """
-    banner(4, "Mamba-2 Brain (12×768d, Full Architecture)")
+    if max_mode:
+        banner(4, "Mamba-2 Brain (20×1024d, 768M params, MAX)")
+    else:
+        banner(4, "Mamba-2 Brain (8×512d, 103M params, MEDIUM)")
     
     # ═══ Transfer embedding MinGRU → Mamba-2 ═══
     emb_path = None
@@ -574,15 +705,15 @@ def phase_4_mamba2(device: str, resume: bool = False, quick: bool = False):
         except Exception as e:
             logger.warning(f"  ⚠ Transfer failed: {e}")
     
-    # ═══ Базовые аргументы для RTX 4090 ═══
+    # ═══ Базовые аргументы ═══
     if quick:
         logger.info("  ⚡ Quick mode: d_model=256, n_layers=4, 1 эпоха на фазу")
         base = [
             "--d_model", "256",
             "--n_layers", "4",
             "--vocab_size", "256",
-            "--batch", "32",             # T4: 14.6 GB VRAM, 256d модель = ~2 GB → batch=32 OK
-            "--accum_steps", "1",        # Не накапливаем — прямой step
+            "--batch", "32",
+            "--accum_steps", "1",
             "--device", device,
             "--curriculum",
             "--label_smoothing", "0.1",
@@ -590,22 +721,60 @@ def phase_4_mamba2(device: str, resume: bool = False, quick: bool = False):
             "--no_compile",
             "--no_wiki",
         ]
-    else:
-        # ═══ T4-compatible full training (512d, 8 layers, ~50M params) ═══
-        # T4: 14.6 GB VRAM, fp16 → ~4 GB model → batch=16 OK
+    elif max_mode:
+        # ═══ MAX MODE: 1024d×20L = 768M params (RTX 4090 / A100) ═══
+        logger.info("  🔥 Max mode: d_model=1024, n_layers=20, ~768M params")
         base = [
-            "--d_model", "512",         # Medium model (50M params)
-            "--n_layers", "8",          # 8 rich blocks
-            "--vocab_size", "256",      # cp1251 bytes
-            "--batch", "16",            # 16 × 512 seq → fits 14.6GB VRAM
-            "--accum_steps", "2",       # Effective batch = 32
+            "--d_model", "1024",
+            "--n_layers", "20",
+            "--vocab_size", "256",
+            "--batch", "4",
+            "--accum_steps", "8",
             "--device", device,
-            "--curriculum",             # Curriculum learning (128→256→512)
+            "--curriculum",
+            "--label_smoothing", "0.1",
+            "--bf16",
+            "--grad_ckpt",
+        ]
+    else:
+        # ═══ MEDIUM MODE: 512d×8L = 103M params ═══
+        # Авто-оптимизация по GPU: batch и AMP подстраиваются под VRAM
+        gpu_name_m, vram_m = gpu_info()
+        bf16_capable = False
+        if vram_m >= 35:
+            # A100 (40GB) / H100 — максимум
+            med_batch, med_accum = "32", "1"
+            bf16_capable = True
+            logger.info("  🔥 A100/H100 detected → batch=32, bf16, max speed")
+        elif vram_m >= 20:
+            # L4 (24GB) / RTX 3090/4090
+            med_batch, med_accum = "24", "1"
+            bf16_capable = True
+            logger.info("  ⚡ L4/RTX detected → batch=24, bf16")
+        elif vram_m >= 14:
+            # T4 (15GB) — стандарт
+            med_batch, med_accum = "16", "2"
+            logger.info("  ✅ T4 detected → batch=16, fp16")
+        else:
+            # Маленький GPU или CPU
+            med_batch, med_accum = "8", "4"
+            logger.info("  ⚠ Small GPU → batch=8, accum=4")
+        
+        base = [
+            "--d_model", "512",
+            "--n_layers", "8",
+            "--vocab_size", "256",
+            "--batch", med_batch,
+            "--accum_steps", med_accum,
+            "--device", device,
+            "--curriculum",
             "--label_smoothing", "0.1",
         ]
-    # ═══ AMP: fp16 + GradScaler (T4 не поддерживает bf16 нативно) ═══
+        if bf16_capable:
+            base += ["--bf16"]
+    # ═══ Gradient checkpointing (экономия VRAM) ═══
     if device != "cpu" and not quick:
-        base += ["--grad_ckpt"]  # Gradient checkpointing для экономии VRAM
+        base += ["--grad_ckpt"]
     
     if emb_path:
         base += ["--pretrained_emb", emb_path]
@@ -1051,6 +1220,12 @@ def main():
                         help="Запустить только конкретную фазу")
     parser.add_argument("--quick", action="store_true",
                         help="Быстрый тест (маленькая модель, 1 эпоха)")
+    parser.add_argument("--drive", action="store_true",
+                        help="Кешировать данные/модели на Google Drive")
+    parser.add_argument("--max", action="store_true",
+                        help="Max mode: 1024d×20L (~768M params), reasoning-focused data")
+    parser.add_argument("--medium", action="store_true",
+                        help="Medium mode: 512d×8L (~103M params) — default")
     
     args = parser.parse_args()
     
@@ -1083,8 +1258,12 @@ def main():
     
     if args.quick:
         logger.info("  ⚡ QUICK MODE: уменьшенная модель (256d, 4 слоя, 1 эпоха)")
+    elif getattr(args, 'max', False):
+        logger.info("  🔥 MAX MODE: 1024d, 20 слоёв, ~768M параметров")
+        logger.info("  📊 Эпохи Mamba-2: 10+5+3+3 = 21 эпоха")
+        logger.info("  ⏱  Ожидаемое время: 8-24 часа на RTX 4090 / A100")
     else:
-        logger.info("  🔥 FULL MODE: 512d, 8 слоёв, ~50M параметров")
+        logger.info("  🔥 MEDIUM MODE: 512d, 8 слоёв, ~103M параметров")
         logger.info("  📊 Эпохи Mamba-2: 10+5+3+3 = 21 эпоха")
         logger.info("  ⏱  Ожидаемое время: 2-4 часа на T4 GPU")
     
@@ -1100,7 +1279,7 @@ def main():
         1: ("download", lambda: phase_1_download(quick=args.quick)),
         2: ("reflex", lambda: phase_2_reflex(quick=args.quick)),
         3: ("mingru", lambda: phase_3_mingru(device, quick=args.quick)),
-        4: ("mamba2", lambda: phase_4_mamba2(device, quick=args.quick)),
+        4: ("mamba2", lambda: phase_4_mamba2(device, quick=args.quick, max_mode=getattr(args, 'max', False))),
         5: ("quantize", lambda: phase_5_quantize(device, quick=args.quick)),
         7: ("validate", lambda: phase_7_validate()),
         8: ("whisper", lambda: phase_8_whisper(device, quick=args.quick)),
@@ -1134,6 +1313,14 @@ def main():
     device = "cuda" if gpu_name else "cpu"
     if gpu_name:
         logger.info(f"  🖥️  GPU обнаружен: {gpu_name} ({vram:.1f} GB VRAM)")
+    
+    # ═══ Google Drive кеш ═══
+    if args.drive:
+        logger.info("")
+        logger.info("  ☁️  Google Drive кеширование...")
+        if drive_mount():
+            drive_restore()
+        logger.info("")
     
     # Фаза 1: Данные
     if not args.skip_download:
@@ -1265,6 +1452,12 @@ def main():
         logger.info("")
         logger.info(f"  ⚠ Фазы с ошибками: {', '.join(failed)}")
         logger.info("  Проверьте mega_train.log для деталей")
+        logger.info("")
+    
+    # ═══ Сохранение на Google Drive ═══
+    if args.drive:
+        logger.info("  ☁️  Сохранение на Google Drive...")
+        drive_save()
         logger.info("")
 
 

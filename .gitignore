@@ -33,6 +33,15 @@ data/thinking_logs/
 .DS_Store
 Thumbs.db
 
+# Old duplicates (removed)
+tars_v3_models/
+
+# Runtime DB
+data/mem0_db/
+
+# Training log
+mega_train.log
+
 # C++ Build
 brain/*.obj
 brain/*.lib

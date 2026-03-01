@@ -43,13 +43,6 @@ PRESETS = {
             "format": "instruct",
         },
         {
-            "name": "bigcode/the-stack-smol",
-            "desc": "Примеры кода из GitHub (asm, c, cpp, dart, rust)",
-            "count": 10000,
-            "format": "code",
-            "subsets": ["default"],
-        },
-        {
             "name": "sahil2801/CodeAlpaca-20k",
             "desc": "20K задач instruction-tuning для программирования",
             "count": 20000,
@@ -66,16 +59,16 @@ PRESETS = {
             "format": "chat",
         },
         {
-            "name": "ai-forever/ru_sharegpt",
-            "desc": "Диалоги людей с ChatGPT (русские)",
-            "count": 20000,
-            "format": "sharegpt",
-        },
-        {
             "name": "Den4ikAI/russian_instructions_2",
             "desc": "Русские инструкции для ИИ",
             "count": 30000,
             "format": "instruct",
+        },
+        {
+            "name": "IlyaGusev/pikabu",
+            "desc": "Русские посты Pikabu — живой разговорный язык",
+            "count": 30000,
+            "format": "text",
         },
     ],
     
@@ -120,6 +113,157 @@ PRESETS = {
             "format": "chat",
         },
     ],
+    
+    # ─── Наука и рассуждения (CoT, reasoning) ───
+    "science": [
+        {
+            "name": "OpenAssistant/oasst1",
+            "desc": "Мультиязычные диалоги с ассистентом (вкл. русский)",
+            "count": 30000,
+            "format": "chat",
+        },
+        {
+            "name": "IlyaGusev/saiga_scored",
+            "desc": "Оцененные русские диалоги (отфильтрованы по качеству)",
+            "count": 25000,
+            "format": "chat",
+        },
+        {
+            "name": "ai-forever/school_notebooks_QA",
+            "desc": "Русские школьные вопросы-ответы (образовательный контент)",
+            "count": 20000,
+            "format": "instruct",
+        },
+    ],
+    
+    # ═══════════════════════════════════════════════════════
+    #  MASSIVE DATASETS (для 1B модели, 50-80 GB)
+    # ═══════════════════════════════════════════════════════
+    
+    # ─── Огромные веб-корпуса (основная масса данных) ───
+    "massive": [
+        {
+            "name": "cc100",
+            "desc": "CC-100 Russian — 46 GB качественного веб-текста",
+            "count": 5_000_000,
+            "format": "text",
+            "subsets": ["ru"],
+            "streaming": True,
+            "shard_size_mb": 1024,
+        },
+        {
+            "name": "uonlp/CulturaX",
+            "desc": "CulturaX Russian — cleaned mC4 + OSCAR (огромный корпус)",
+            "count": 3_000_000,
+            "format": "text",
+            "subsets": ["ru"],
+            "streaming": True,
+            "shard_size_mb": 1024,
+        },
+        {
+            "name": "oscar-corpus/OSCAR-2301",
+            "desc": "OSCAR Russian — веб-тексты из CommonCrawl",
+            "count": 2_000_000,
+            "format": "text",
+            "subsets": ["ru"],
+            "streaming": True,
+            "shard_size_mb": 1024,
+        },
+    ],
+    
+    # ─── Высококачественные данные (база знаний) ───
+    "quality": [
+        {
+            "name": "wikimedia/wikipedia",
+            "desc": "Русская Wikipedia ПОЛНАЯ (~3 GB, ~1B токенов)",
+            "count": 2_000_000,
+            "format": "text",
+            "subsets": ["20231101.ru"],
+        },
+        {
+            "name": "IlyaGusev/gazeta",
+            "desc": "Газета.ру — все новости (~500 MB)",
+            "count": 500_000,
+            "format": "text",
+        },
+        {
+            "name": "d0rj/librusec",
+            "desc": "Русская литература ПОЛНАЯ — богатый стиль",
+            "count": 500_000,
+            "format": "text",
+        },
+        {
+            "name": "IlyaGusev/ru_turbo_alpaca",
+            "desc": "GPT-4 русские инструкции (высшее качество)",
+            "count": 100_000,
+            "format": "instruct",
+        },
+        {
+            "name": "IlyaGusev/ru_turbo_alpaca_evol_instruct",
+            "desc": "Эволюционные цепочки (сложный reasoning)",
+            "count": 100_000,
+            "format": "instruct",
+        },
+        {
+            "name": "Vikhrmodels/GrandMaster-PRO-MAX",
+            "desc": "Сложный русский reasoning + многошаговые задачи",
+            "count": 100_000,
+            "format": "chat",
+        },
+    ],
+    
+    # ─── Reasoning, STEM, математика ───
+    "reasoning": [
+        {
+            "name": "OpenAssistant/oasst2",
+            "desc": "OpenAssistant v2 — улучшенные диалоги",
+            "count": 50_000,
+            "format": "chat",
+        },
+        {
+            "name": "TIGER-Lab/MathInstruct",
+            "desc": "Математические задачи с решениями (CoT)",
+            "count": 100_000,
+            "format": "instruct",
+        },
+        {
+            "name": "Open-Orca/OpenOrca",
+            "desc": "Разнообразные инструкции (GPT-4 качество)",
+            "count": 500_000,
+            "format": "chat",
+        },
+        {
+            "name": "teknium/OpenHermes-2.5",
+            "desc": "1M+ качественных инструкций (GPT-4, Code, Math)",
+            "count": 500_000,
+            "format": "sharegpt",
+        },
+        {
+            "name": "BAAI/Infinity-Instruct",
+            "desc": "Огромный инструкционный датасет (мультиязычный)",
+            "count": 300_000,
+            "format": "sharegpt",
+        },
+    ],
+    
+    # ─── DPO / Preference данные (alignment) ───
+    "dpo": [
+        {
+            "name": "Anthropic/hh-rlhf",
+            "desc": "Human preference data (chosen/rejected)",
+            "count": 100_000,
+            "format": "chat",
+        },
+        {
+            "name": "Intel/orca_dpo_pairs",
+            "desc": "DPO пары (chosen vs rejected ответы)",
+            "count": 50_000,
+            "format": "instruct",
+        },
+    ],
+    
+    # ─── MAX: всё вместе (50-80 GB для 1B модели) ───
+    "max": [],  # computed dynamically = massive + quality + reasoning + dpo + all existing
 }
 
 
@@ -204,7 +348,7 @@ def format_row(row: dict, fmt: str) -> str:
 
 
 def download_one_dataset(ds_config: dict, output_dir: str) -> str:
-    """Скачивает один датасет и возвращает текст."""
+    """Скачивает один датасет и возвращает текст (или путь к шардам)."""
     try:
         from datasets import load_dataset
     except ImportError:
@@ -215,6 +359,11 @@ def download_one_dataset(ds_config: dict, output_dir: str) -> str:
     count = ds_config.get("count", 10000)
     fmt = ds_config.get("format", "instruct")
     safe_name = name.replace("/", "_")
+    is_streaming = ds_config.get("streaming", False)
+    
+    if is_streaming:
+        return download_streaming(ds_config, output_dir)
+    
     output_file = os.path.join(output_dir, f"hf_{safe_name}.txt")
     
     # Проверяем кеш
@@ -259,16 +408,136 @@ def download_one_dataset(ds_config: dict, output_dir: str) -> str:
         return ""
 
 
+def download_streaming(ds_config: dict, output_dir: str) -> str:
+    """Скачивает большой датасет в режиме streaming (пишет на диск, не в RAM).
+    
+    Для датасетов 10+ GB: CC-100, CulturaX, OSCAR.
+    Пишет в шарды по shard_size_mb для streaming DataLoader.
+    """
+    from datasets import load_dataset
+    import time as _time
+    
+    name = ds_config["name"]
+    count = ds_config.get("count", 5_000_000)
+    fmt = ds_config.get("format", "text")
+    subsets = ds_config.get("subsets", [])
+    safe_name = name.replace("/", "_")
+    shard_mb = ds_config.get("shard_size_mb", 1024)
+    
+    shard_dir = os.path.join(output_dir, f"shards_{safe_name}")
+    marker = os.path.join(shard_dir, "_COMPLETE")
+    
+    # Проверяем кеш
+    if os.path.exists(marker):
+        # Считаем размер
+        total = sum(
+            os.path.getsize(os.path.join(shard_dir, f))
+            for f in os.listdir(shard_dir) if f.endswith('.txt')
+        )
+        total_gb = total / (1024**3)
+        n_shards = len([f for f in os.listdir(shard_dir) if f.endswith('.txt')])
+        print(f"  ✓ {name}: уже скачан ({n_shards} шардов, {total_gb:.1f} GB)")
+        return f"SHARDS:{shard_dir}"
+    
+    os.makedirs(shard_dir, exist_ok=True)
+    
+    print(f"  ↓↓ {name}: STREAMING режим ({count:,} примеров)...")
+    print(f"     Шарды: {shard_dir}")
+    
+    try:
+        if subsets:
+            ds = load_dataset(name, subsets[0], split="train", streaming=True)
+        else:
+            ds = load_dataset(name, split="train", streaming=True)
+        
+        shard_idx = 0
+        shard_texts = []
+        shard_bytes = 0
+        total_items = 0
+        total_bytes = 0
+        t0 = _time.time()
+        
+        for i, row in enumerate(ds):
+            if i >= count:
+                break
+            
+            text = format_row(row, fmt)
+            if not text or len(text) < 30:
+                continue
+            
+            text_bytes = len(text.encode('utf-8'))
+            shard_texts.append(text)
+            shard_bytes += text_bytes
+            total_items += 1
+            total_bytes += text_bytes
+            
+            # Записать шард если набрали shard_mb
+            if shard_bytes >= shard_mb * 1024 * 1024:
+                shard_file = os.path.join(shard_dir, f"shard_{shard_idx:04d}.txt")
+                with open(shard_file, 'w', encoding='utf-8') as f:
+                    f.write("\n\n".join(shard_texts))
+                
+                shard_idx += 1
+                elapsed = _time.time() - t0
+                speed = total_items / elapsed if elapsed > 0 else 0
+                gb = total_bytes / (1024**3)
+                print(f"     Шард {shard_idx}: {len(shard_texts):,} примеров, "
+                      f"{shard_bytes/1024/1024:.0f} MB | "
+                      f"Всего: {total_items:,} ({gb:.2f} GB) | "
+                      f"{speed:.0f} ex/s")
+                
+                shard_texts = []
+                shard_bytes = 0
+            
+            # Прогресс каждые 100K
+            if total_items % 100_000 == 0 and total_items > 0:
+                elapsed = _time.time() - t0
+                gb = total_bytes / (1024**3)
+                pct = 100 * i / count
+                print(f"     ... {total_items:,} ({pct:.0f}%, {gb:.2f} GB, "
+                      f"{elapsed:.0f}s)")
+        
+        # Последний шард
+        if shard_texts:
+            shard_file = os.path.join(shard_dir, f"shard_{shard_idx:04d}.txt")
+            with open(shard_file, 'w', encoding='utf-8') as f:
+                f.write("\n\n".join(shard_texts))
+            shard_idx += 1
+        
+        # Маркер завершения
+        with open(marker, 'w') as f:
+            f.write(f"{total_items} items, {total_bytes} bytes, {shard_idx} shards\n")
+        
+        total_gb = total_bytes / (1024**3)
+        elapsed = _time.time() - t0
+        print(f"  ✓ {name}: {total_items:,} → {shard_idx} шардов, "
+              f"{total_gb:.2f} GB за {elapsed:.0f}s")
+        
+        return f"SHARDS:{shard_dir}"
+        
+    except Exception as e:
+        print(f"  ⚠ {name}: streaming ошибка — {e}")
+        import traceback
+        traceback.print_exc()
+        return ""
+
+
 def download_preset(preset: str, output_dir: str = None, count_override: int = None) -> list:
     """Скачивает все датасеты из пресета."""
     if output_dir is None:
         output_dir = str(ROOT / "data")
     os.makedirs(output_dir, exist_ok=True)
     
-    if preset == "all":
+    # 'max' = ВСЕ датасеты (massive + quality + reasoning + dpo + existing)
+    if preset in ("all", "max"):
         datasets = []
-        for p in PRESETS.values():
-            datasets.extend(p)
+        include_massive = (preset == "max")
+        for pname, pdata in PRESETS.items():
+            if pname == "max":
+                continue
+            if pname == "massive" and not include_massive:
+                continue  # 'all' пропускает streaming-датасеты
+            datasets.extend(pdata)
         # Дедупликация по имени
         seen = set()
         unique = []

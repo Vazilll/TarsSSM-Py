@@ -19,6 +19,15 @@
 
 import os
 import sys
+
+# Fix Windows cp1252 encoding for Russian output
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 import time
 import json
 import argparse
@@ -76,6 +85,8 @@ def parse_args():
                    help="Mixture of Depths: skip layers for easy tokens (-30%% compute)")
     p.add_argument('--no_wiki', action='store_true',
                    help="Не скачивать Wikipedia (использовать встроенный корпус)")
+    p.add_argument('--data_dir', type=str, default=None,
+                   help="Папка с шардами данных (data/shards_*/shard_*.txt)")
     return p.parse_args()
 
 
@@ -145,6 +156,27 @@ def load_corpus(data_path=None, download_wiki=True):
             except Exception:
                 pass
     
+    # 4b. Sharded datasets (data/shards_*/shard_*.txt) — для 50+ GB
+    if hf_dir.exists():
+        shard_dirs = sorted(hf_dir.glob("shards_*"))
+        for shard_dir in shard_dirs:
+            if not shard_dir.is_dir():
+                continue
+            shard_files = sorted(shard_dir.glob("shard_*.txt"))
+            shard_total = 0
+            for sf in shard_files:
+                try:
+                    with open(sf, 'r', encoding='utf-8') as f:
+                        shard_text = f.read()
+                    if len(shard_text) > 1000:
+                        parts.append(shard_text)
+                        shard_total += len(shard_text)
+                except Exception:
+                    pass
+            if shard_total > 0:
+                shard_gb = shard_total / (1024**3)
+                print(f"[Data] Shards {shard_dir.name}: {len(shard_files)} шардов, {shard_gb:.2f} GB")
+    
     # 5. TARS memories
     memories_path = ROOT / "data" / "tars_memories.json"
     if memories_path.exists():
@@ -169,6 +201,29 @@ def load_corpus(data_path=None, download_wiki=True):
             identity_repeated = ("\n\n" + identity_text) * 5
             corpus = identity_repeated + "\n\n" + corpus
             print(f"[Data] ТАРС Identity: {len(identity_text):,} символов (×5 для усиления)")
+    
+    # 7. TARS Personality (стиль общения — юмор, сарказм, прямолинейность)
+    personality_path = ROOT / "data" / "tars_personality.txt"
+    if personality_path.exists():
+        with open(personality_path, 'r', encoding='utf-8') as f:
+            personality_text = f.read()
+        if len(personality_text) > 100:
+            # Повторяем 10x — личность должна быть СИЛЬНО выражена
+            personality_repeated = ("\n\n" + personality_text) * 10
+            corpus = personality_repeated + "\n\n" + corpus
+            print(f"[Data] ТАРС Personality: {len(personality_text):,} символов (×10 для усиления)")
+    
+    # 8. TARS Mega Personality (6000+ реплик — основной корпус личности)
+    mega_path = ROOT / "data" / "tars_personality_mega.txt"
+    if mega_path.exists():
+        with open(mega_path, 'r', encoding='utf-8') as f:
+            mega_text = f.read()
+        if len(mega_text) > 1000:
+            # Повторяем 3x — 385KB × 3 = ~1.1MB доминирующего сигнала
+            mega_repeated = ("\n\n" + mega_text) * 3
+            corpus = mega_repeated + "\n\n" + corpus
+            mega_lines = mega_text.count('\n')
+            print(f"[Data] ТАРС Mega Personality: {mega_lines:,} строк ({len(mega_text)//1024} KB, ×3)")
     
     
     # Повторяем маленький корпус
@@ -367,6 +422,10 @@ def train(args):
                 print(f"    {bk}: {bv:,}")
     
     # ═══ Фазы обучения ═══
+    # PersonalityAdapter ЗАМОРОЖЕН в Phase 1-4 (не портит стиль знаниями)
+    for p in model.personality.parameters():
+        p.requires_grad = False
+    
     if args.phase == 1:
         # Phase 1: Pre-train ALL (TarsCoreBlock + Ω-SSM + MoLE)
         print("[Phase 1] Full pre-training: ALL components")
@@ -671,6 +730,112 @@ def train(args):
             print(f"  ✓ Best saved: {save_path} ({quant_mode})")
         else:
             print(f"  ↺ Epoch checkpoint: {epoch_path.name}")
+    
+    # ═══════════════════════════════════════════════════════════
+    # Phase 5: PERSONALITY FINE-TUNING
+    # After all phases — fine-tune ONLY on personality data.
+    # Recency bias: last gradients stick the most.
+    # ═══════════════════════════════════════════════════════════
+    personality_epochs = 3
+    print(f"\n{'═'*60}")
+    print(f"  Phase 5: Personality Fine-tuning ({personality_epochs} epochs)")
+    print(f"{'═'*60}")
+    
+    # Load only personality data
+    p_parts = []
+    for pfile in ["tars_identity.txt", "tars_personality.txt", "tars_personality_mega.txt"]:
+        ppath = ROOT / "data" / pfile
+        if ppath.exists():
+            with open(ppath, 'r', encoding='utf-8') as f:
+                ptxt = f.read()
+            if len(ptxt) > 100:
+                p_parts.append(ptxt)
+                print(f"  [P5] {pfile}: {len(ptxt)//1024} KB")
+    
+    if p_parts:
+        p_corpus = "\n\n".join(p_parts)
+        
+        # ═══ Freeze ALL except PersonalityAdapter ═══
+        for p in model.parameters():
+            p.requires_grad = False
+        for p in model.personality.parameters():
+            p.requires_grad = True
+        
+        p_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        p_total = sum(p.numel() for p in model.parameters())
+        print(f"  [P5] PersonalityAdapter: {p_trainable:,} / {p_total:,} params trainable")
+        
+        # Higher LR for adapter — it's small and needs to learn fast
+        p_lr = args.lr * 0.1
+        p_optimizer = torch.optim.AdamW(
+            [p for p in model.personality.parameters() if p.requires_grad],
+            lr=p_lr, weight_decay=0.005
+        )
+        print(f"  [P5] LR: {p_lr:.2e} | Corpus: {len(p_corpus)//1024} KB")
+        
+        p_inputs, p_targets = prepare_byte_data(p_corpus, args.seq_len, actual_vocab)
+        n_test_p = max(2, len(p_inputs) // 10)
+        p_train_in, p_test_in = p_inputs[:-n_test_p], p_inputs[-n_test_p:]
+        p_train_tgt, p_test_tgt = p_targets[:-n_test_p], p_targets[-n_test_p:]
+        print(f"  [P5] Samples: {len(p_train_in)}")
+        
+        for p_epoch in range(personality_epochs):
+            t0 = time.time()
+            model.train()
+            p_loss_sum = 0
+            p_n = 0
+            
+            perm = torch.randperm(len(p_train_in))
+            for pi in range(0, len(p_train_in), args.batch):
+                idx = perm[pi:pi+args.batch]
+                b_in = p_train_in[idx].to(device)
+                b_tgt = p_train_tgt[idx].to(device)
+                
+                if use_amp:
+                    with torch.amp.autocast('cuda', dtype=amp_dtype):
+                        logits = forward_model(b_in)
+                        loss = F.cross_entropy(logits.view(-1, actual_vocab), b_tgt.view(-1))
+                    if scaler is not None:
+                        scaler.scale(loss).backward()
+                        scaler.unscale_(p_optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        scaler.step(p_optimizer)
+                        scaler.update()
+                    else:
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        p_optimizer.step()
+                else:
+                    logits = forward_model(b_in)
+                    loss = F.cross_entropy(logits.view(-1, actual_vocab), b_tgt.view(-1))
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    p_optimizer.step()
+                
+                p_optimizer.zero_grad()
+                p_loss_sum += loss.item()
+                p_n += 1
+            
+            # Eval on personality data
+            model.eval()
+            with torch.no_grad():
+                p_eval = []
+                for pj in range(0, len(p_test_in), args.batch):
+                    tb = p_test_in[pj:pj+args.batch].to(device)
+                    tt = p_test_tgt[pj:pj+args.batch].to(device)
+                    logits = forward_model(tb)
+                    p_eval.append(F.cross_entropy(logits.view(-1, actual_vocab), tt.view(-1)).item())
+            
+            p_el = np.mean(p_eval) if p_eval else 0
+            elapsed = time.time() - t0
+            print(f"  P5 Epoch {p_epoch+1}/{personality_epochs} | "
+                  f"Train: {p_loss_sum/max(p_n,1):.4f} | Eval: {p_el:.4f} | {elapsed:.1f}s")
+        
+        # Save final personality-tuned model
+        checkpoint['model_state_dict'] = model.state_dict()
+        checkpoint['phase'] = 5
+        torch.save(checkpoint, str(save_path))
+        print(f"  [P5] Personality-tuned model saved: {save_path}")
     
     print(f"\n{'═'*60}")
     print(f"  Done! Best eval loss: {best_loss:.4f}")

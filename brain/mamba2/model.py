@@ -41,6 +41,7 @@ from brain.mamba2.dendrites import DendriticBlock
 from brain.mamba2.hyperbolic import HyperbolicSimilarity, project_to_poincare
 from brain.mamba2.active_inference import BeliefState
 from brain.mamba2.thinking_chain import ThinkingChain
+from brain.mamba2.personality_adapter import PersonalityAdapter
 from brain.mamba2.bitnet import (
     UniversalLinear, convert_model_to_158bit,
     convert_model_to_fp16, model_stats, replace_linear_with_universal
@@ -479,6 +480,21 @@ class TarsMamba2LM(nn.Module):
             d_model, d_memory=384, n_max_waves=n_layers // 2, vocab_size=vocab_size
         )
         
+        # ═══ PersonalityAdapter (Convergence-Gated Style Transform) ═══
+        # Отдельный модуль стиля ТАРС. Не смешивается с весами Mamba.
+        # Итеративный рефайнмент: 1-3 прохода до сходимости.
+        #   Pass 1: базовый стиль (характер)
+        #   Pass 2: рефайнмент (нюансы, юмор)
+        #   Pass 3: полировка (уникальность)
+        # При обучении Phase 1-4: ЗАМОРОЖЕН (не портит знания).
+        # При обучении Phase 5: ЕДИНСТВЕННЫЙ обучаемый (только личность).
+        self.personality = PersonalityAdapter(
+            d_model=d_model,
+            style_dim=128,
+            max_passes=3,
+            convergence_threshold=0.01,
+        )
+        
         # ═══ Cached SSM states for fast generation ═══
         self._gen_cache = None  # Initialized by reset_cache()
         self._prefix_cache = None  # For prefix caching (system prompt)
@@ -786,8 +802,9 @@ class TarsMamba2LM(nn.Module):
         # Store for external access (training loop)
         self.mole_aux_loss = mole_aux_total
         
-        # Output
+        # Output: Mamba → Norm → PersonalityAdapter → LM Head
         x = self.norm_f(x)
+        x = self.personality(x)  # Style transform: «что сказать» → «как ТАРС скажет»
         logits = self.lm_head(x)
         
         if labels is not None:
