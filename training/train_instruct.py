@@ -156,7 +156,7 @@ def load_instruction_dataset(path: Optional[str] = None) -> List[str]:
 def train_instruct(model, tokenize_fn, texts: List[str], 
                    epochs: int = 3, lr: float = 5e-5, batch_size: int = 4):
     """
-    Instruction fine-tuning loop.
+    Instruction fine-tuning loop with AMP acceleration.
     
     Args:
         model: TarsMamba2LM
@@ -167,68 +167,97 @@ def train_instruct(model, tokenize_fn, texts: List[str],
         batch_size: размер батча
     """
     import random
+    import time
     
     device = next(model.parameters()).device
+    use_amp = device.type == "cuda"
+    
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs * len(texts))
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+    
+    # Pre-tokenize (cp1251 → маленькие последовательности, быстро)
+    logger.info(f"InstructTuning: Токенизация {len(texts)} примеров...")
+    answer_marker = list("### Ответ:".encode('cp1251', errors='replace'))
+    marker_len = len(answer_marker)
+    
+    tokenized = []
+    max_len = 512  # ограничиваем длину для скорости
+    for text in texts:
+        tokens = tokenize_fn(text)
+        if tokens.shape[1] < 4:
+            continue
+        if tokens.shape[1] > max_len:
+            tokens = tokens[:, :max_len]
+        tokenized.append(tokens.squeeze(0))  # [L]
+    
+    logger.info(f"InstructTuning: {len(tokenized)} примеров после фильтрации")
+    
+    total_batches = (len(tokenized) + batch_size - 1) // batch_size
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs * total_batches
+    )
     
     model.train()
     
     for epoch in range(epochs):
-        random.shuffle(texts)
+        random.shuffle(tokenized)
         total_loss = 0.0
         n_batches = 0
+        t0 = time.time()
         
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i:i + batch_size]
-            batch_loss = 0.0
+        for i in range(0, len(tokenized), batch_size):
+            batch_tokens = tokenized[i:i + batch_size]
+            batch_loss = torch.tensor(0.0, device=device)
+            valid = 0
             
-            for text in batch_texts:
-                tokens = tokenize_fn(text)
-                if tokens.shape[1] < 4:
-                    continue
-                tokens = tokens.to(device)
-                
+            optimizer.zero_grad(set_to_none=True)
+            
+            for tokens_1d in batch_tokens:
+                tokens = tokens_1d.unsqueeze(0).to(device)  # [1, L]
                 input_ids = tokens[:, :-1]
                 labels = tokens[:, 1:]
                 
-                logits = model(input_ids)
+                with torch.amp.autocast('cuda', enabled=use_amp):
+                    logits = model(input_ids)
+                    
+                    # Маска: loss только на ответной части
+                    masked_labels = labels.clone()
+                    token_list = tokens_1d.tolist()
+                    answer_start = 0
+                    for j in range(len(token_list) - marker_len):
+                        if token_list[j:j + marker_len] == answer_marker:
+                            answer_start = j + marker_len
+                            break
+                    if answer_start > 0:
+                        masked_labels[0, :min(answer_start, masked_labels.shape[1])] = -100
+                    
+                    loss = criterion(
+                        logits.reshape(-1, logits.size(-1)),
+                        masked_labels.reshape(-1)
+                    )
                 
-                # Loss только на ответной части
-                # Ищем "### Ответ:" и считаем loss только после него
-                answer_marker = list("### Ответ:".encode('cp1251', errors='replace'))
-                marker_len = len(answer_marker)
-                token_list = tokens[0].tolist()
-                answer_start = 0
-                for j in range(len(token_list) - marker_len):
-                    if token_list[j:j + marker_len] == answer_marker:
-                        answer_start = j + marker_len
-                        break
-                
-                # Маска: -100 для instruction части, настоящие labels для ответа
-                masked_labels = labels.clone()
-                if answer_start > 0:
-                    masked_labels[0, :min(answer_start, masked_labels.shape[1])] = -100
-                
-                loss = criterion(
-                    logits.reshape(-1, logits.size(-1)),
-                    masked_labels.reshape(-1)
-                )
-                batch_loss += loss
+                scaler.scale(loss / len(batch_tokens)).backward()
+                batch_loss += loss.detach()
+                valid += 1
             
-            if batch_loss > 0:
-                optimizer.zero_grad()
-                (batch_loss / len(batch_texts)).backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
+            if valid > 0:
+                scaler.step(optimizer)
+                scaler.update()
                 scheduler.step()
                 
-                total_loss += batch_loss.item() / len(batch_texts)
+                total_loss += batch_loss.item() / valid
                 n_batches += 1
+            
+            # Прогресс каждые 50 батчей
+            if n_batches % 50 == 0 and n_batches > 0:
+                elapsed = time.time() - t0
+                speed = n_batches * batch_size / elapsed
+                logger.info(f"  [{n_batches}/{total_batches}] loss={total_loss/n_batches:.4f} | {speed:.0f} samples/s")
         
         avg_loss = total_loss / max(1, n_batches)
-        logger.info(f"InstructTuning: Epoch {epoch+1}/{epochs}, loss={avg_loss:.4f}")
+        elapsed = time.time() - t0
+        logger.info(f"InstructTuning: Epoch {epoch+1}/{epochs}, loss={avg_loss:.4f}, time={elapsed:.1f}s")
     
     logger.info("InstructTuning: ✅ Instruction tuning завершено")
     return model

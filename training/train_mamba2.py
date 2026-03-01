@@ -499,13 +499,7 @@ def train(args):
         from brain.mamba2.mixture_of_depths import add_mod_to_model
         model = add_mod_to_model(model, capacity_factor=0.5)
     
-    # ═══ torch.compile for 30% speedup ═══
-    if not args.no_compile and hasattr(torch, 'compile'):
-        try:
-            model = torch.compile(model, mode='reduce-overhead')
-            print("  ⚡ torch.compile: enabled (reduce-overhead mode)")
-        except Exception as e:
-            print(f"  ⚠ torch.compile failed: {e} — continuing without")
+    # torch.compile handled below (line ~531)
     
     # ═══ AMP (BitMamba-2: bfloat16 по умолчанию на TPU/GPU) ═══
     use_amp = device.type == 'cuda'
@@ -538,7 +532,7 @@ def train(args):
             print(f"  ⚠ torch.compile failed: {e}")
     forward_model = compiled_model if compiled_model is not None else model
     
-    # ═══ Curriculum Learning ═══
+    # ═══ Curriculum Learning (skip for 1-epoch) ═══
     curriculum_schedule = None
     if args.curriculum and args.epochs >= 3:
         # Постепенно увеличиваем seq_len: 64 → 128 → 256 → target

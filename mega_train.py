@@ -318,20 +318,28 @@ def phase_0_install():
         "websockets",            # WebSocket support
     ]
     
+    # Batch-проверка: один subprocess вместо 17 отдельных
     logger.info("Проверка и установка остальных пакетов...")
-    
+    check_script = "; ".join(
+        f"import {pkg.replace('-', '_')}" for pkg in packages
+    )
+    missing = []
     for pkg in packages:
-        check_cmd = [PYTHON, "-c", f"import {pkg.replace('-', '_')}"]
         try:
-            result_ok = subprocess.run(check_cmd, capture_output=True, timeout=10).returncode == 0
+            result_ok = subprocess.run(
+                [PYTHON, "-c", f"import {pkg.replace('-', '_')}"],
+                capture_output=True, timeout=5
+            ).returncode == 0
         except Exception:
             result_ok = False
-        
         if result_ok:
             logger.info(f"  ✅ {pkg} — уже установлен")
         else:
-            logger.info(f"  📦 Установка {pkg}...")
-            run(pip_cmd + ["install", pkg, "--quiet"] + extra_flags, check=False)
+            missing.append(pkg)
+    
+    if missing:
+        logger.info(f"  📦 Установка {len(missing)} пакетов: {', '.join(missing)}")
+        run(pip_cmd + ["install"] + missing + ["--quiet"] + extra_flags, check=False)
     
     # Проверка CUDA
     gpu_name, vram = gpu_info()
@@ -384,7 +392,7 @@ def phase_1_download(quick: bool = False):
     
     # 1.3 LEANN embedding model
     emb_path = MODELS / "embeddings"
-    if emb_path.exists():
+    if emb_path.exists() and (emb_path / "config.json").exists():
         logger.info(f"  🧠 LEANN embeddings: уже есть ({emb_path})")
     else:
         logger.info("  🧠 Скачивание модели эмбеддингов (all-MiniLM-L6-v2)...")
@@ -397,75 +405,82 @@ def phase_1_download(quick: bool = False):
             logger.warning(f"  ⚠ Embeddings: {e}")
     
     # 1.4 Инициализация LEANN памяти
-    logger.info("  🧠 Загрузка данных в LEANN...")
-    try:
-        sys.path.insert(0, str(TRAINING))
-        from ingest_to_leann import ingest_all
-        ingest_all()
-        logger.info("  ✅ LEANN заполнена")
-    except Exception as e:
-        logger.info(f"  ℹ LEANN: {e} (не критично)")
+    leann_index = ROOT / "memory" / "leann.index"
+    if leann_index.exists() and quick:
+        logger.info("  🧠 LEANN: индекс уже есть, пропуск (quick mode)")
+    else:
+        logger.info("  🧠 Загрузка данных в LEANN...")
+        try:
+            sys.path.insert(0, str(TRAINING))
+            from ingest_to_leann import ingest_all
+            ingest_all()
+            logger.info("  ✅ LEANN заполнена")
+        except Exception as e:
+            logger.info(f"  ℹ LEANN: {e} (не критично)")
     
     # 1.5 Голосовые модели (Whisper CTranslate2 + Piper ONNX + Silero VAD)
-    voice_dir = MODELS / "voice"
-    voice_dir.mkdir(parents=True, exist_ok=True)
-    
-    # 1.5.1 faster-whisper CTranslate2 (для runtime STT)
-    whisper_ct2 = voice_dir / "whisper_tiny"
-    if (whisper_ct2 / "model.bin").exists():
-        logger.info(f"  🎙 Whisper CTranslate2: уже есть ({whisper_ct2})")
+    if quick:
+        logger.info("  🎙 Голосовые модели: пропуск (quick mode)")
     else:
-        logger.info("  🎙 Скачивание Whisper Tiny (CTranslate2) для STT...")
-        try:
-            from faster_whisper import WhisperModel
-            _m = WhisperModel("tiny", device="cpu", compute_type="int8",
-                              download_root=str(voice_dir))
-            # faster-whisper кеширует модель, копируем в нужное место
-            import huggingface_hub
-            cached = huggingface_hub.snapshot_download("guillaumekln/faster-whisper-tiny")
-            if not (whisper_ct2 / "model.bin").exists():
-                shutil.copytree(cached, str(whisper_ct2), dirs_exist_ok=True)
-            del _m
-            logger.info(f"  ✅ Whisper Tiny CTranslate2 сохранён: {whisper_ct2}")
-        except Exception as e:
-            logger.warning(f"  ⚠ Whisper CTranslate2: {e}")
+        voice_dir = MODELS / "voice"
+        voice_dir.mkdir(parents=True, exist_ok=True)
     
-    # 1.5.2 Piper TTS ONNX (русский голос для синтеза речи)
-    piper_models = [
-        ("ru_RU-irina-medium.onnx",
-         "https://huggingface.co/rhasspy/piper-voices/resolve/main/ru/ru_RU/irina/medium/ru_RU-irina-medium.onnx"),
-        ("ru_RU-irina-medium.onnx.json",
-         "https://huggingface.co/rhasspy/piper-voices/resolve/main/ru/ru_RU/irina/medium/ru_RU-irina-medium.onnx.json"),
-    ]
-    for fname, url in piper_models:
-        dst = voice_dir / fname
-        if dst.exists():
-            size_mb = dst.stat().st_size / 1024 / 1024
-            logger.info(f"  🗣 Piper {fname}: уже есть ({size_mb:.1f} MB)")
+        # 1.5.1 faster-whisper CTranslate2 (для runtime STT)
+        whisper_ct2 = voice_dir / "whisper_tiny"
+        if (whisper_ct2 / "model.bin").exists():
+            logger.info(f"  🎙 Whisper CTranslate2: уже есть ({whisper_ct2})")
         else:
-            logger.info(f"  🗣 Скачивание Piper {fname}...")
+            logger.info("  🎙 Скачивание Whisper Tiny (CTranslate2) для STT...")
             try:
-                import urllib.request
-                urllib.request.urlretrieve(url, str(dst))
-                size_mb = dst.stat().st_size / 1024 / 1024
-                logger.info(f"  ✅ {fname}: {size_mb:.1f} MB")
+                from faster_whisper import WhisperModel
+                _m = WhisperModel("tiny", device="cpu", compute_type="int8",
+                                  download_root=str(voice_dir))
+                # faster-whisper кеширует модель, копируем в нужное место
+                import huggingface_hub
+                cached = huggingface_hub.snapshot_download("guillaumekln/faster-whisper-tiny")
+                if not (whisper_ct2 / "model.bin").exists():
+                    shutil.copytree(cached, str(whisper_ct2), dirs_exist_ok=True)
+                del _m
+                logger.info(f"  ✅ Whisper Tiny CTranslate2 сохранён: {whisper_ct2}")
             except Exception as e:
-                logger.warning(f"  ⚠ Piper {fname}: {e}")
+                logger.warning(f"  ⚠ Whisper CTranslate2: {e}")
     
-    # 1.5.3 Silero VAD ONNX (детекция голоса)
-    vad_path = voice_dir / "silero_vad.onnx"
-    if vad_path.exists():
-        logger.info(f"  👂 Silero VAD: уже есть")
-    else:
-        logger.info("  👂 Скачивание Silero VAD...")
-        try:
-            vad_url = "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx"
-            import urllib.request
-            urllib.request.urlretrieve(vad_url, str(vad_path))
-            size_mb = vad_path.stat().st_size / 1024 / 1024
-            logger.info(f"  ✅ Silero VAD: {size_mb:.1f} MB")
-        except Exception as e:
-            logger.warning(f"  ⚠ Silero VAD: {e}")
+        # 1.5.2 Piper TTS ONNX (русский голос для синтеза речи)
+        piper_models = [
+            ("ru_RU-irina-medium.onnx",
+             "https://huggingface.co/rhasspy/piper-voices/resolve/main/ru/ru_RU/irina/medium/ru_RU-irina-medium.onnx"),
+            ("ru_RU-irina-medium.onnx.json",
+             "https://huggingface.co/rhasspy/piper-voices/resolve/main/ru/ru_RU/irina/medium/ru_RU-irina-medium.onnx.json"),
+        ]
+        for fname, url in piper_models:
+            dst = voice_dir / fname
+            if dst.exists():
+                size_mb = dst.stat().st_size / 1024 / 1024
+                logger.info(f"  🗣 Piper {fname}: уже есть ({size_mb:.1f} MB)")
+            else:
+                logger.info(f"  🗣 Скачивание Piper {fname}...")
+                try:
+                    import urllib.request
+                    urllib.request.urlretrieve(url, str(dst))
+                    size_mb = dst.stat().st_size / 1024 / 1024
+                    logger.info(f"  ✅ {fname}: {size_mb:.1f} MB")
+                except Exception as e:
+                    logger.warning(f"  ⚠ Piper {fname}: {e}")
+    
+        # 1.5.3 Silero VAD ONNX (детекция голоса)
+        vad_path = voice_dir / "silero_vad.onnx"
+        if vad_path.exists():
+            logger.info(f"  👂 Silero VAD: уже есть")
+        else:
+            logger.info("  👂 Скачивание Silero VAD...")
+            try:
+                vad_url = "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx"
+                import urllib.request
+                urllib.request.urlretrieve(vad_url, str(vad_path))
+                size_mb = vad_path.stat().st_size / 1024 / 1024
+                logger.info(f"  ✅ Silero VAD: {size_mb:.1f} MB")
+            except Exception as e:
+                logger.warning(f"  ⚠ Silero VAD: {e}")
     
     # Сводка данных
     total_data = 0
