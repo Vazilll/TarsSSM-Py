@@ -722,15 +722,22 @@ def download_one_dataset(ds_config: dict, output_dir: str) -> str:
     print(f"  ↓ {name}: {ds_config.get('desc', '')}...")
     
     try:
-        # Загрузка
+        # Загрузка (берём только count строк — быстрее!)
+        split_str = f"train[:{count}]"
         subsets = ds_config.get("subsets", [])
-        if subsets:
-            ds = load_dataset(name, subsets[0], split="train", streaming=False)
-        else:
-            ds = load_dataset(name, split="train", streaming=False)
-        
-        if len(ds) > count:
-            ds = ds.select(range(count))
+        try:
+            if subsets:
+                ds = load_dataset(name, subsets[0], split=split_str, streaming=False)
+            else:
+                ds = load_dataset(name, split=split_str, streaming=False)
+        except Exception:
+            # Некоторые датасеты не поддерживают slicing — грузим всё
+            if subsets:
+                ds = load_dataset(name, subsets[0], split="train", streaming=False)
+            else:
+                ds = load_dataset(name, split="train", streaming=False)
+            if len(ds) > count:
+                ds = ds.select(range(count))
         
         # Форматирование
         texts = []
