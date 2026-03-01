@@ -147,37 +147,7 @@ PRESETS = {
             "format": "sharegpt",
             "subsets": ["v0"],
         },
-        # AtomEcho/RPSD удалён — не существует на Hub
-        {
-            "name": "camel-ai/math",
-            "desc": "CAMEL-AI: 5K multi-step math reasoning",
-            "count": 3000,
-            "format": "sharegpt",
-        },
-        {
-            "name": "camel-ai/code",
-            "desc": "CAMEL-AI: 50K multi-step code reasoning",
-            "count": 3000,
-            "format": "sharegpt",
-        },
-        {
-            "name": "camel-ai/physics",
-            "desc": "CAMEL-AI: физика — задачи с объяснениями",
-            "count": 2000,
-            "format": "sharegpt",
-        },
-        {
-            "name": "camel-ai/biology",
-            "desc": "CAMEL-AI: биология — диалоги",
-            "count": 2000,
-            "format": "sharegpt",
-        },
-        {
-            "name": "camel-ai/chemistry",
-            "desc": "CAMEL-AI: химия — задачи",
-            "count": 2000,
-            "format": "sharegpt",
-        },
+        # camel-ai/* удалены — слишком медленная индексация (7+ часов)
     ],
     
     # ─── Сложные эволюционные инструкции ───
