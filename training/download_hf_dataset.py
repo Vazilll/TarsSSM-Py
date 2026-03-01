@@ -145,6 +145,7 @@ PRESETS = {
             "desc": "R1 distill: reasoning traces для math + code",
             "count": 10000,
             "format": "sharegpt",
+            "subsets": ["v0"],
         },
         # AtomEcho/RPSD удалён — не существует на Hub
         {
