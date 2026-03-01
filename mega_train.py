@@ -542,33 +542,37 @@ def phase_1_download(quick: bool = False):
                 logger.warning("  ⚠ Часть датасетов не скачана — продолжаем")
                 success = False
     
-    # 1.3 LEANN embedding model
-    emb_path = MODELS / "embeddings"
-    if emb_path.exists() and (emb_path / "config.json").exists():
-        logger.info(f"  🧠 LEANN embeddings: уже есть ({emb_path})")
+    # 1.3 LEANN embedding model (пропуск на Colab — OOM)
+    IS_COLAB = "COLAB_GPU" in os.environ or Path("/content").exists()
+    if IS_COLAB:
+        logger.info("  🧠 LEANN + Embeddings: пропуск (Colab, экономия RAM)")
     else:
-        logger.info("  🧠 Скачивание модели эмбеддингов (all-MiniLM-L6-v2)...")
-        try:
-            from sentence_transformers import SentenceTransformer
-            model = SentenceTransformer('all-MiniLM-L6-v2')
-            model.save(str(emb_path))
-            logger.info(f"  ✅ Сохранена в {emb_path}")
-        except Exception as e:
-            logger.warning(f"  ⚠ Embeddings: {e}")
-    
-    # 1.4 Инициализация LEANN памяти
-    leann_index = ROOT / "memory" / "leann.index"
-    if leann_index.exists() and quick:
-        logger.info("  🧠 LEANN: индекс уже есть, пропуск (quick mode)")
-    else:
-        logger.info("  🧠 Загрузка данных в LEANN...")
-        try:
-            sys.path.insert(0, str(TRAINING))
-            from ingest_to_leann import ingest_all
-            ingest_all()
-            logger.info("  ✅ LEANN заполнена")
-        except Exception as e:
-            logger.info(f"  ℹ LEANN: {e} (не критично)")
+        emb_path = MODELS / "embeddings"
+        if emb_path.exists() and (emb_path / "config.json").exists():
+            logger.info(f"  🧠 LEANN embeddings: уже есть ({emb_path})")
+        else:
+            logger.info("  🧠 Скачивание модели эмбеддингов (all-MiniLM-L6-v2)...")
+            try:
+                from sentence_transformers import SentenceTransformer
+                model = SentenceTransformer('all-MiniLM-L6-v2')
+                model.save(str(emb_path))
+                logger.info(f"  ✅ Сохранена в {emb_path}")
+            except Exception as e:
+                logger.warning(f"  ⚠ Embeddings: {e}")
+        
+        # 1.4 Инициализация LEANN памяти
+        leann_index = ROOT / "memory" / "leann.index"
+        if leann_index.exists() and quick:
+            logger.info("  🧠 LEANN: индекс уже есть, пропуск (quick mode)")
+        else:
+            logger.info("  🧠 Загрузка данных в LEANN...")
+            try:
+                sys.path.insert(0, str(TRAINING))
+                from ingest_to_leann import ingest_all
+                ingest_all()
+                logger.info("  ✅ LEANN заполнена")
+            except Exception as e:
+                logger.info(f"  ℹ LEANN: {e} (не критично)")
     
     # 1.5 Голосовые модели (Whisper CTranslate2 + Piper ONNX + Silero VAD)
     if quick:

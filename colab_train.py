@@ -188,7 +188,9 @@ t0 = time.time()
 # Parse extra args
 extra_args = []
 for arg in sys.argv[1:]:
-    if arg in ("--skip-download", "--resume", "--skip-quantize"):
+    if arg == "--resume":
+        extra_args.append("--skip-download")  # resume = пропуск скачивания
+    elif arg in ("--skip-download", "--skip-quantize"):
         extra_args.append(arg)
 
 # mega_train.py сам определит GPU
