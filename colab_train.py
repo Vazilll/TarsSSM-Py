@@ -4,24 +4,20 @@
 ═══════════════════════════════════════════════════════════════════════
 
 Обучение на Google Colab с авто-оптимизацией под GPU.
+ВСЕ ДАННЫЕ сохраняются на Google Drive — не теряются при Disconnect.
 
-  Модель:       512d × 8 слоёв (~103M params)
-  Данные:       Wikipedia + HuggingFace + Personality
-  Квантизация:  1.58-bit BitNet
-  
   A100 (40GB) — batch=32, bf16, ~30-45 мин    🔥 Рекомендуется
   L4   (24GB) — batch=24, bf16, ~45-60 мин    ⚡ Лучший баланс
   T4   (15GB) — batch=16, fp16, ~1-2 часа     ✅ Бесплатный
 
 ИНСТРУКЦИЯ:
-  1. Runtime → Change runtime type → L4 (рекомендуется)
-  2. Загрузите проект (ZIP / Git / Drive)
+  1. Runtime → Change runtime type → L4
+  2. Запустить ячейки блокнота по порядку
   3. !python colab_train.py
 
 ОПЦИИ:
   !python colab_train.py --resume           # Продолжить с чекпоинта
   !python colab_train.py --skip-download    # Данные уже есть
-
 ═══════════════════════════════════════════════════════════════════════
 """
 
@@ -46,90 +42,75 @@ sys.path.insert(0, str(ROOT))
 
 IS_COLAB = "COLAB_GPU" in os.environ or os.path.exists("/content")
 PYTHON = sys.executable
-DATA = ROOT / "data"
-MODELS = ROOT / "models"
 
 # ═══════════════════════════════════════════
-# 1. Google Drive
+# 1. Google Drive — ВСЁ хранится здесь
 # ═══════════════════════════════════════════
 
+DRIVE_BASE = None
 DRIVE_DATA = None
 DRIVE_MODELS = None
 
 if IS_COLAB:
-    # Drive должен быть примонтирован в notebook (TARS_Colab.ipynb)
     if Path("/content/drive/MyDrive").exists():
-        DRIVE_DATA = Path("/content/drive/MyDrive/TarsData")
-        DRIVE_MODELS = Path("/content/drive/MyDrive/TarsModels")
+        DRIVE_BASE = Path("/content/drive/MyDrive")
+        DRIVE_DATA = DRIVE_BASE / "TarsData"
+        DRIVE_MODELS = DRIVE_BASE / "TarsModels"
         DRIVE_DATA.mkdir(parents=True, exist_ok=True)
         DRIVE_MODELS.mkdir(parents=True, exist_ok=True)
+        
+        # === Symlink: data/ → Drive/TarsData ===
+        # Датасеты скачиваются СРАЗУ на Drive!
+        local_data = ROOT / "data"
+        if local_data.is_symlink():
+            pass  # уже симлинк
+        else:
+            if local_data.exists():
+                # Перенести существующие файлы на Drive
+                for f in local_data.glob("*.txt"):
+                    dest = DRIVE_DATA / f.name
+                    if not dest.exists():
+                        shutil.move(str(f), str(dest))
+                for f in local_data.glob("*.json"):
+                    dest = DRIVE_DATA / f.name
+                    if not dest.exists():
+                        shutil.move(str(f), str(dest))
+                shutil.rmtree(str(local_data))
+            local_data.symlink_to(DRIVE_DATA)
+        
+        # === Symlink: models/ → Drive/TarsModels ===
+        local_models = ROOT / "models"
+        if local_models.is_symlink():
+            pass
+        else:
+            if local_models.exists():
+                for f in local_models.rglob("*"):
+                    if f.is_file():
+                        rel = f.relative_to(local_models)
+                        dest = DRIVE_MODELS / rel
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        if not dest.exists():
+                            shutil.move(str(f), str(dest))
+                shutil.rmtree(str(local_models))
+            local_models.symlink_to(DRIVE_MODELS)
+        
         print(f"  ☁️  Google Drive подключён")
-        print(f"     Данные:  {DRIVE_DATA}")
-        print(f"     Модели:  {DRIVE_MODELS}")
+        print(f"     data/   → {DRIVE_DATA}")
+        print(f"     models/ → {DRIVE_MODELS}")
+        
+        # Показать что уже есть на Drive
+        existing_data = list(DRIVE_DATA.glob("hf_*.txt"))
+        if existing_data:
+            total_mb = sum(f.stat().st_size for f in existing_data) / (1024*1024)
+            print(f"     📂 На Drive уже {len(existing_data)} датасетов ({total_mb:.0f} MB)")
     else:
         print("  ⚠️  Drive не смонтирован!")
-        print("     Смонтируйте в notebook: from google.colab import drive; drive.mount('/content/drive')")
-        print("     Продолжаем без Drive (данные НЕ будут сохранены)")
-
-
-def restore_cached_data():
-    """Восстановить данные с Drive (если есть)."""
-    if not DRIVE_DATA or not DRIVE_DATA.exists():
-        return 0
-    
-    restored = 0
-    DATA.mkdir(parents=True, exist_ok=True)
-    
-    for f in DRIVE_DATA.glob("*"):
-        dest = DATA / f.name
-        if not dest.exists():
-            if f.is_file():
-                shutil.copy2(str(f), str(dest))
-                restored += 1
-    
-    if restored > 0:
-        print(f"  📂 Восстановлено {restored} файлов с Drive")
-    return restored
-
-
-def save_data_to_drive():
-    """Сохранить скачанные данные на Drive."""
-    if not DRIVE_DATA:
-        return
-    
-    saved = 0
-    for f in DATA.glob("*.txt"):
-        dest = DRIVE_DATA / f.name
-        if not dest.exists() or f.stat().st_size != dest.stat().st_size:
-            shutil.copy2(str(f), str(dest))
-            saved += 1
-    
-    for f in DATA.glob("*.json"):
-        dest = DRIVE_DATA / f.name
-        if not dest.exists():
-            shutil.copy2(str(f), str(dest))
-            saved += 1
-    
-    if saved > 0:
-        print(f"  💾 Сохранено {saved} файлов на Drive (не будут скачиваться повторно)")
-
-
-def save_models_to_drive():
-    """Сохранить модели на Drive."""
-    if not DRIVE_MODELS:
-        return
-    
-    tars_v3 = MODELS / "tars_v3"
-    if tars_v3.exists():
-        for f in tars_v3.glob("*.pt"):
-            dest = DRIVE_MODELS / f.name
-            shutil.copy2(str(f), str(dest))
-            mb = f.stat().st_size / 1024 / 1024
-            print(f"  💾 {f.name}: {mb:.1f} MB → Drive")
+        print("     drive.mount('/content/drive')")
+        print("     Без Drive данные ПОТЕРЯЮТСЯ при Disconnect!")
 
 
 # ═══════════════════════════════════════════
-# 2. GPU Detection + Auto-Optimization
+# 2. GPU Detection
 # ═══════════════════════════════════════════
 
 print()
@@ -169,14 +150,17 @@ try:
         print("  🔧 Runtime → Change runtime type → L4")
         sys.exit(1)
 except ImportError:
-    print("  📦 PyTorch не установлен (будет установлен)")
-
+    print("  📦 PyTorch не установлен")
 
 # ═══════════════════════════════════════════
-# 3. Restore cached data
+# 3. LEANN — пропуск если нет индекса
 # ═══════════════════════════════════════════
 
-restore_cached_data()
+leann_index = ROOT / "memory" / "leann.index"
+if not leann_index.exists():
+    leann_index.parent.mkdir(parents=True, exist_ok=True)
+    leann_index.touch()
+    print("  🧠 LEANN: создан пустой индекс (пропуск)")
 
 # ═══════════════════════════════════════════
 # 4. Training
@@ -195,8 +179,6 @@ print(f"  Конфигурация (авто-{gpu_tier.upper()}):")
 print(f"    Модель:        512d × 8 слоёв (~103M params)")
 print(f"    Batch:         {cfg['batch']} × {cfg['accum']} = {cfg['batch']*cfg['accum']} effective")
 print(f"    AMP:           {cfg['amp']}")
-print(f"    Mamba-2:       10+5+3+3 = 21 эпоха × 4 фазы + Phase 5")
-print(f"    Квантизация:   1.58-bit BitNet")
 print(f"    Время:         ~{cfg['time']}")
 print()
 print("─" * 65)
@@ -209,17 +191,13 @@ for arg in sys.argv[1:]:
     if arg in ("--skip-download", "--resume", "--skip-quantize"):
         extra_args.append(arg)
 
-# mega_train.py сам определит GPU и выберет batch/bf16
+# mega_train.py сам определит GPU
 cmd = [PYTHON, "mega_train.py", "--skip-voice", "--drive"] + extra_args
 result = subprocess.run(cmd, cwd=str(ROOT))
 
 # ═══════════════════════════════════════════
-# 5. Save + Report
+# 5. Report
 # ═══════════════════════════════════════════
-
-save_data_to_drive()
-if result.returncode == 0:
-    save_models_to_drive()
 
 elapsed = time.time() - t0
 hours = elapsed / 3600
@@ -230,23 +208,20 @@ print("═" * 65)
 if result.returncode == 0:
     print(f"  ✅ ОБУЧЕНИЕ ЗАВЕРШЕНО за {minutes:.0f} мин ({hours:.1f} ч)!")
     print()
-    print(f"  Модель: 512d × 8L (~103M params)")
-    print()
     
-    tars_v3 = ROOT / "models" / "tars_v3"
-    if tars_v3.exists():
+    if DRIVE_MODELS:
         total_mb = 0
-        for f in tars_v3.glob("*.pt"):
+        for f in DRIVE_MODELS.rglob("*.pt"):
             mb = f.stat().st_size / 1024 / 1024
             total_mb += mb
-            print(f"    {f.name}: {mb:.1f} MB")
-        print(f"    {'─' * 30}")
-        print(f"    Итого: {total_mb:.0f} MB")
+            print(f"    💾 {f.name}: {mb:.1f} MB (на Drive)")
+        if total_mb > 0:
+            print(f"    {'─' * 30}")
+            print(f"    Итого: {total_mb:.0f} MB")
     
     print()
-    if DRIVE_MODELS:
-        print(f"  💾 Модели на Drive: {DRIVE_MODELS}")
-        print(f"  💾 Данные на Drive: {DRIVE_DATA}")
+    print(f"  Данные на Drive:  MyDrive/TarsData/")
+    print(f"  Модели на Drive:  MyDrive/TarsModels/")
     print()
     print("  🚀 Запуск: python launch_tars.py")
 else:
