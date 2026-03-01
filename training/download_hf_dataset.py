@@ -150,7 +150,7 @@ PRESETS = {
         # AtomEcho/RPSD удалён — не существует на Hub
         {
             "name": "camel-ai/math",
-            "desc": "CAMEL-AI: 50K multi-step math reasoning",
+            "desc": "CAMEL-AI: 5K multi-step math reasoning",
             "count": 3000,
             "format": "sharegpt",
         },
