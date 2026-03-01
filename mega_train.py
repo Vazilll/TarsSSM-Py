@@ -591,19 +591,21 @@ def phase_4_mamba2(device: str, resume: bool = False, quick: bool = False):
             "--no_wiki",
         ]
     else:
+        # ═══ T4-compatible full training (512d, 8 layers, ~50M params) ═══
+        # T4: 14.6 GB VRAM, fp16 → ~4 GB model → batch=16 OK
         base = [
-            "--d_model", "2048",        # TARS 1B
-            "--n_layers", "24",         # 24 rich blocks
-            "--vocab_size", "256",      # cp1251 байты
-            "--batch", "4",             # 4 × seq → fits 16GB VRAM (bf16+ckpt)
-            "--accum_steps", "16",      # Effective batch = 64
+            "--d_model", "512",         # Medium model (50M params)
+            "--n_layers", "8",          # 8 rich blocks
+            "--vocab_size", "256",      # cp1251 bytes
+            "--batch", "16",            # 16 × 512 seq → fits 14.6GB VRAM
+            "--accum_steps", "2",       # Effective batch = 32
             "--device", device,
-            "--curriculum",             # Curriculum learning (64→128→256)
+            "--curriculum",             # Curriculum learning (128→256→512)
             "--label_smoothing", "0.1",
         ]
-    # ═══ BitMamba-2 optimizations: bf16 + grad checkpoint ═══
+    # ═══ AMP: fp16 + GradScaler (T4 не поддерживает bf16 нативно) ═══
     if device != "cpu" and not quick:
-        base += ["--bf16", "--grad_ckpt"]
+        base += ["--grad_ckpt"]  # Gradient checkpointing для экономии VRAM
     
     if emb_path:
         base += ["--pretrained_emb", emb_path]
@@ -614,7 +616,7 @@ def phase_4_mamba2(device: str, resume: bool = False, quick: bool = False):
     logger.info("── Phase 1/4: Full pretrain (SSD + WKV + Ω-SSM + MoLE + WaveMerge) ──")
     quick_epochs = "1"
     results["p1"] = run([PYTHON, TRAINING / "train_mamba2.py"] + base + [
-        "--epochs", quick_epochs if quick else "5",  # Tars.txt §7.3
+        "--epochs", quick_epochs if quick else "10",   # 10 эпох для сходимости
         "--lr", "3e-4",
         "--phase", "1",
         "--seq_len", "256" if quick else "256",
@@ -623,7 +625,7 @@ def phase_4_mamba2(device: str, resume: bool = False, quick: bool = False):
     # ── Phase 2: Fine-tune WKV + Fusion (SSD frozen) ──
     logger.info("── Phase 2/4: Fine-tune WKV + Fusion (SSD frozen) ──")
     results["p2"] = run([PYTHON, TRAINING / "train_mamba2.py"] + base + [
-        "--epochs", quick_epochs if quick else "3",  # Tars.txt §7.3
+        "--epochs", quick_epochs if quick else "5",    # 5 эпох
         "--lr", "1e-4",
         "--phase", "2",
         "--seq_len", "256" if quick else "512",
@@ -633,7 +635,7 @@ def phase_4_mamba2(device: str, resume: bool = False, quick: bool = False):
     # ── Phase 3: Fine-tune MoLE + MatrixPool + WaveMerge ──
     logger.info("── Phase 3/4: Fine-tune MoLE + MatrixPool + WaveMerge ──")
     results["p3"] = run([PYTHON, TRAINING / "train_mamba2.py"] + base + [
-        "--epochs", quick_epochs if quick else "2",  # Tars.txt §7.3
+        "--epochs", quick_epochs if quick else "3",    # 3 эпохи
         "--lr", "3e-5",
         "--phase", "3",
         "--seq_len", "256" if quick else "512",
@@ -643,7 +645,7 @@ def phase_4_mamba2(device: str, resume: bool = False, quick: bool = False):
     # ── Phase 4: Fine-tune WKV RAG State + Memory Integration ──
     logger.info("── Phase 4/4: Fine-tune WKV + RAG + Memory Injection ──")
     results["p4"] = run([PYTHON, TRAINING / "train_mamba2.py"] + base + [
-        "--epochs", quick_epochs if quick else "2",  # Tars.txt §7.3
+        "--epochs", quick_epochs if quick else "3",    # 3 эпохи
         "--lr", "1.5e-5",
         "--phase", "4",
         "--seq_len", "256" if quick else "512",
@@ -1081,6 +1083,10 @@ def main():
     
     if args.quick:
         logger.info("  ⚡ QUICK MODE: уменьшенная модель (256d, 4 слоя, 1 эпоха)")
+    else:
+        logger.info("  🔥 FULL MODE: 512d, 8 слоёв, ~50M параметров")
+        logger.info("  📊 Эпохи Mamba-2: 10+5+3+3 = 21 эпоха")
+        logger.info("  ⏱  Ожидаемое время: 2-4 часа на T4 GPU")
     
     if device == "cuda" and vram < 8:
         logger.warning("⚠ VRAM < 8GB — рекомендуется уменьшить batch size")
