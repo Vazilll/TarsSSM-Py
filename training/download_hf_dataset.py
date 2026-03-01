@@ -34,105 +34,455 @@ ROOT = Path(__file__).parent.parent
 # ═══════════════════════════════════════════════════════════════
 
 PRESETS = {
-    # ─── Код: Rust, C++, ASM, C, Dart, Python ───
+    # ─── Код: C++, Rust, Python, JS, коммиты, фидбек ───
     "code": [
         {
             "name": "ise-uiuc/Magicoder-Evol-Instruct-110K",
-            "desc": "110K задач по коду на разных языках (C++, Rust, Python, JS)",
-            "count": 20000,
+            "desc": "110K задач по коду (C++, Rust, Python, JS)",
+            "count": 110000,
             "format": "instruct",
         },
         {
             "name": "sahil2801/CodeAlpaca-20k",
-            "desc": "20K задач instruction-tuning для программирования",
+            "desc": "20K instruction-tuning для программирования",
             "count": 20000,
+            "format": "instruct",
+        },
+        {
+            "name": "codeparrot/self-instruct-starcoder",
+            "desc": "StarCoder self-instruct — генерация кода",
+            "count": 50000,
+            "format": "instruct",
+        },
+        {
+            "name": "d0rj/conala-mined-ru",
+            "desc": "Код + комментарии на русском",
+            "count": 50000,
+            "format": "instruct",
+        },
+        {
+            "name": "bigcode/commitpackft",
+            "desc": "Коммиты как инструкции (высокое качество)",
+            "count": 100000,
+            "format": "instruct",
+        },
+        {
+            "name": "m-a-p/Code-Feedback",
+            "desc": "70K разговоров о коде с фидбеком",
+            "count": 70000,
+            "format": "sharegpt",
+        },
+        {
+            "name": "m-a-p/CodeFeedback-Filtered-Instruction",
+            "desc": "157K отфильтрованных инструкций по коду",
+            "count": 157000,
+            "format": "instruct",
+        },
+        {
+            "name": "theblackcat102/evol-codealpaca-v1",
+            "desc": "110K эволюционных задач по коду",
+            "count": 110000,
             "format": "instruct",
         },
     ],
     
-    # ─── Харизма, шутки, русские диалоги ───
+    # ─── Математика и логика ───
+    "math": [
+        {
+            "name": "d0rj/MathInstruct-ru",
+            "desc": "Математические задачи с решениями (русский)",
+            "count": 100000,
+            "format": "instruct",
+        },
+        {
+            "name": "d0rj/muInstruct-ru",
+            "desc": "Авто-сгенерированные мат. задачи (русский)",
+            "count": 100000,
+            "format": "instruct",
+        },
+        {
+            "name": "d0rj/ROMB-1.0",
+            "desc": "Олимпиадные задачи и экзамены (русский)",
+            "count": 50000,
+            "format": "instruct",
+        },
+        {
+            "name": "TIGER-Lab/MathInstruct",
+            "desc": "Математические задачи с CoT решениями",
+            "count": 200000,
+            "format": "instruct",
+        },
+        {
+            "name": "meta-math/MetaMathQA",
+            "desc": "MetaMath: переформулированные GSM8K+MATH",
+            "count": 200000,
+            "format": "instruct",
+        },
+        {
+            "name": "openai/gsm8k",
+            "desc": "8.5K задач с пошаговыми решениями",
+            "count": 8500,
+            "format": "instruct",
+        },
+        {
+            "name": "d0rj/R1-Distill-SFT_v1-ru",
+            "desc": "DeepSeek R1 reasoning traces — русский перевод",
+            "count": 100000,
+            "format": "instruct",
+        },
+    ],
+    
+    # ─── МЫШЛЕНИЕ: Chain-of-Thought, Reasoning Traces ───
+    "thinking": [
+        {
+            "name": "open-thoughts/OpenThoughts-114k",
+            "desc": "114K задач с длинными цепочками рассуждений",
+            "count": 114000,
+            "format": "sharegpt",
+        },
+        {
+            "name": "ServiceNow-AI/R1-Distill-SFT",
+            "desc": "R1 distill: reasoning traces для math + code",
+            "count": 200000,
+            "format": "sharegpt",
+        },
+        {
+            "name": "AtomEcho/RPSD",
+            "desc": "150K логических загадок и пазлов с CoT",
+            "count": 150000,
+            "format": "instruct",
+        },
+        {
+            "name": "camel-ai/math",
+            "desc": "CAMEL-AI: 50K multi-step math reasoning",
+            "count": 50000,
+            "format": "sharegpt",
+        },
+        {
+            "name": "camel-ai/code",
+            "desc": "CAMEL-AI: 50K multi-step code reasoning",
+            "count": 50000,
+            "format": "sharegpt",
+        },
+        {
+            "name": "camel-ai/physics",
+            "desc": "CAMEL-AI: физика — задачи с объяснениями",
+            "count": 20000,
+            "format": "sharegpt",
+        },
+        {
+            "name": "camel-ai/biology",
+            "desc": "CAMEL-AI: биология — диалоги",
+            "count": 20000,
+            "format": "sharegpt",
+        },
+        {
+            "name": "camel-ai/chemistry",
+            "desc": "CAMEL-AI: химия — задачи",
+            "count": 20000,
+            "format": "sharegpt",
+        },
+    ],
+    
+    # ─── Сложные эволюционные инструкции ───
+    "evolinstruct": [
+        {
+            "name": "WizardLMTeam/WizardLM_evol_instruct_V2_196k",
+            "desc": "WizardLM: 196K эволюционных инструкций",
+            "count": 196000,
+            "format": "instruct",
+        },
+        {
+            "name": "WizardLMTeam/WizardLM_evol_instruct_70k",
+            "desc": "WizardLM: 70K базовых эволюционных инструкций",
+            "count": 70000,
+            "format": "instruct",
+        },
+        {
+            "name": "cognitivecomputations/dolphin",
+            "desc": "Dolphin: 1M+ uncensored инструкций",
+            "count": 300000,
+            "format": "sharegpt",
+        },
+        {
+            "name": "lmsys/lmsys-chat-1m",
+            "desc": "1M реальных диалогов с LLM (Chatbot Arena)",
+            "count": 200000,
+            "format": "chat",
+        },
+    ],
+    
+    # ─── Харизма, юмор, диалоги, личность, ролеплей ───
     "chat": [
         {
             "name": "Vikhrmodels/ru_turbo_saiga",
-            "desc": "50K+ русских инструкций и ответов (Saiga)",
+            "desc": "50K+ русских инструкций (Saiga)",
             "count": 50000,
             "format": "chat",
         },
         {
             "name": "Den4ikAI/russian_instructions_2",
             "desc": "Русские инструкции для ИИ",
-            "count": 30000,
+            "count": 50000,
             "format": "instruct",
         },
         {
             "name": "IlyaGusev/pikabu",
-            "desc": "Русские посты Pikabu — живой разговорный язык",
-            "count": 30000,
+            "desc": "Pikabu — юмор, сарказм, живой язык",
+            "count": 200000,
             "format": "text",
         },
-    ],
-    
-    # ─── Агенты и управление интерфейсом ───
-    "agent": [
         {
-            "name": "glaiveai/glaive-function-calling-v2",
-            "desc": "Обучение вызову функций и API (function calling)",
-            "count": 10000,
-            "format": "chat",
+            "name": "IlyaGusev/ru_turbo_alpaca",
+            "desc": "GPT-4 русские инструкции (высшее качество)",
+            "count": 50000,
+            "format": "instruct",
         },
-    ],
-    
-    # ─── Instruction tuning (основа) ───
-    "instruct": [
         {
-            "name": "Vikhrmodels/ru_turbo_saiga",
-            "desc": "50K+ русских инструкций (основной датасет)",
+            "name": "IlyaGusev/saiga_scored",
+            "desc": "Оцененные русские диалоги (по качеству)",
             "count": 50000,
             "format": "chat",
         },
         {
-            "name": "Den4ikAI/russian_instructions_2",
-            "desc": "Русские инструкции для ИИ",
-            "count": 20000,
+            "name": "inkoziev/Conversations",
+            "desc": "9M русских диалогов (форумы, книги, шутки)",
+            "count": 500000,
+            "format": "text",
+        },
+        {
+            "name": "IlyaGusev/gpt_roleplay_realm",
+            "desc": "GPT-4 ролеплей — русские персонажи",
+            "count": 50000,
+            "format": "chat",
+        },
+        {
+            "name": "d0rj/dialogsum-ru",
+            "desc": "Русские диалоги + суммаризация",
+            "count": 50000,
+            "format": "text",
+        },
+        {
+            "name": "IlyaGusev/ru_sharegpt_cleaned",
+            "desc": "Очищенные русские ShareGPT диалоги",
+            "count": 50000,
+            "format": "sharegpt",
+        },
+    ],
+    
+    # ─── Самосознание, рефлексия, personality ───
+    "selfaware": [
+        {
+            "name": "nazlicanto/persona-based-chat",
+            "desc": "Диалоги с устойчивой персоной/характером",
+            "count": 50000,
+            "format": "chat",
+        },
+        {
+            "name": "Anthropic/hh-rlhf",
+            "desc": "Helpful/Harmless: самосознание ИИ",
+            "count": 100000,
+            "format": "chat",
+        },
+        {
+            "name": "HuggingFaceH4/ultrachat_200k",
+            "desc": "200K глубоких multi-turn диалогов",
+            "count": 200000,
+            "format": "sharegpt",
+        },
+        {
+            "name": "stingning/ultrachat",
+            "desc": "1.5M диалогов — вопросы о мире, себе, идеях",
+            "count": 300000,
+            "format": "chat",
+        },
+    ],
+    
+    # ─── SQL и работа с базами данных ───
+    "sql": [
+        {
+            "name": "gretelai/synthetic_text_to_sql",
+            "desc": "100K+ синтетических text-to-SQL примеров",
+            "count": 100000,
+            "format": "instruct",
+        },
+        {
+            "name": "Clinton/Text-to-sql-v1",
+            "desc": "Text-to-SQL: вопрос → SQL запрос",
+            "count": 50000,
+            "format": "instruct",
+        },
+        {
+            "name": "b-mc2/sql-create-context",
+            "desc": "SQL с контекстом создания таблиц",
+            "count": 80000,
             "format": "instruct",
         },
     ],
     
-    # ─── Русский reasoning и качественные корпуса ───
+    # ─── Креативное письмо, истории, стиль ───
+    "creative": [
+        {
+            "name": "Dampfinchen/Creative_Writing_Multiturn",
+            "desc": "Multi-turn креативное письмо",
+            "count": 50000,
+            "format": "sharegpt",
+        },
+        {
+            "name": "d0rj/librusec",
+            "desc": "Русская литература — богатый стиль и язык",
+            "count": 300000,
+            "format": "text",
+        },
+        {
+            "name": "IlyaGusev/gazeta",
+            "desc": "Газета.ру — журналистский стиль",
+            "count": 200000,
+            "format": "text",
+        },
+    ],
+    
+    # ─── Суммаризация и понимание текста ───
+    "summarize": [
+        {
+            "name": "d0rj/curation-corpus-ru",
+            "desc": "Русский корпус суммаризации новостей",
+            "count": 50000,
+            "format": "instruct",
+        },
+        {
+            "name": "IlyaGusev/gazeta",
+            "desc": "Газета.ру — статьи + заголовки как суммари",
+            "count": 100000,
+            "format": "text",
+        },
+    ],
+    
+    # ─── Мировые знания, факты, QA ───
+    "trivia": [
+        {
+            "name": "mandarjoshi/trivia_qa",
+            "desc": "95K вопросов с evidence-based ответами",
+            "count": 95000,
+            "format": "instruct",
+        },
+        {
+            "name": "ai-forever/school_notebooks_QA",
+            "desc": "Русские школьные вопросы-ответы",
+            "count": 100000,
+            "format": "instruct",
+        },
+        {
+            "name": "NousResearch/nous-hermes-llama2-13b",
+            "desc": "Nous: качественные QA (GPT-4 уровень)",
+            "count": 100000,
+            "format": "instruct",
+        },
+        {
+            "name": "allenai/ai2_arc",
+            "desc": "ARC: научные вопросы (школьный экзамен)",
+            "count": 8000,
+            "format": "instruct",
+        },
+    ],
+    
+    # ─── Агенты, function calling, интерфейс ───
+    "agent": [
+        {
+            "name": "glaiveai/glaive-function-calling-v2",
+            "desc": "Вызов функций и API",
+            "count": 50000,
+            "format": "chat",
+        },
+        {
+            "name": "NousResearch/hermes-function-calling-v1",
+            "desc": "Hermes: продвинутый function calling (JSON)",
+            "count": 50000,
+            "format": "sharegpt",
+        },
+        {
+            "name": "Salesforce/xlam-function-calling-60k",
+            "desc": "xLAM: 60K примеров вызова API",
+            "count": 60000,
+            "format": "chat",
+        },
+    ],
+    
+    # ─── Instruction tuning (русский, основа) ───
+    "instruct": [
+        {
+            "name": "d0rj/OpenOrca-ru",
+            "desc": "4.2M русских инструкций (перевод OpenOrca)",
+            "count": 500000,
+            "format": "instruct",
+        },
+        {
+            "name": "d0rj/OpenHermes-2.5-ru",
+            "desc": "1M русских инструкций GPT-4 качества",
+            "count": 300000,
+            "format": "sharegpt",
+        },
+        {
+            "name": "d0rj/ru-instruct",
+            "desc": "754K русских инструкций (сборник)",
+            "count": 200000,
+            "format": "instruct",
+        },
+    ],
+    
+    # ─── Русский reasoning ───
     "russian": [
         {
-            "name": "IlyaGusev/ru_turbo_alpaca",
-            "desc": "Высококачественные русские инструкции (GPT-4 генерация)",
-            "count": 30000,
+            "name": "IlyaGusev/ru_turbo_alpaca_evol_instruct",
+            "desc": "Эволюционные цепочки (сложный reasoning)",
+            "count": 100000,
             "format": "instruct",
         },
         {
             "name": "Vikhrmodels/GrandMaster-PRO-MAX",
             "desc": "Сложный русский reasoning + многошаговые задачи",
-            "count": 30000,
-            "format": "chat",
-        },
-    ],
-    
-    # ─── Наука и рассуждения (CoT, reasoning) ───
-    "science": [
-        {
-            "name": "OpenAssistant/oasst1",
-            "desc": "Мультиязычные диалоги с ассистентом (вкл. русский)",
-            "count": 30000,
-            "format": "chat",
-        },
-        {
-            "name": "IlyaGusev/saiga_scored",
-            "desc": "Оцененные русские диалоги (отфильтрованы по качеству)",
-            "count": 25000,
+            "count": 100000,
             "format": "chat",
         },
         {
             "name": "ai-forever/school_notebooks_QA",
-            "desc": "Русские школьные вопросы-ответы (образовательный контент)",
-            "count": 20000,
+            "desc": "Школьные вопросы-ответы (образование)",
+            "count": 50000,
             "format": "instruct",
+        },
+    ],
+    
+    # ─── Наука и рассуждения ───
+    "science": [
+        {
+            "name": "OpenAssistant/oasst1",
+            "desc": "Мультиязычные диалоги (вкл. русский)",
+            "count": 80000,
+            "format": "chat",
+        },
+        {
+            "name": "OpenAssistant/oasst2",
+            "desc": "OpenAssistant v2 — улучшенные диалоги",
+            "count": 80000,
+            "format": "chat",
+        },
+        {
+            "name": "Open-Orca/OpenOrca",
+            "desc": "Разнообразные инструкции (GPT-4)",
+            "count": 500000,
+            "format": "chat",
+        },
+        {
+            "name": "teknium/OpenHermes-2.5",
+            "desc": "1M+ инструкций (GPT-4, Code, Math)",
+            "count": 500000,
+            "format": "sharegpt",
+        },
+        {
+            "name": "BAAI/Infinity-Instruct",
+            "desc": "Огромный инструкционный датасет",
+            "count": 300000,
+            "format": "sharegpt",
         },
     ],
     
@@ -140,11 +490,10 @@ PRESETS = {
     #  MASSIVE DATASETS (для 1B модели, 50-80 GB)
     # ═══════════════════════════════════════════════════════
     
-    # ─── Огромные веб-корпуса (основная масса данных) ───
     "massive": [
         {
             "name": "cc100",
-            "desc": "CC-100 Russian — 46 GB качественного веб-текста",
+            "desc": "CC-100 Russian — 46 GB веб-текста",
             "count": 5_000_000,
             "format": "text",
             "subsets": ["ru"],
@@ -153,7 +502,7 @@ PRESETS = {
         },
         {
             "name": "uonlp/CulturaX",
-            "desc": "CulturaX Russian — cleaned mC4 + OSCAR (огромный корпус)",
+            "desc": "CulturaX Russian — cleaned mC4 + OSCAR",
             "count": 3_000_000,
             "format": "text",
             "subsets": ["ru"],
@@ -162,7 +511,7 @@ PRESETS = {
         },
         {
             "name": "oscar-corpus/OSCAR-2301",
-            "desc": "OSCAR Russian — веб-тексты из CommonCrawl",
+            "desc": "OSCAR Russian — CommonCrawl",
             "count": 2_000_000,
             "format": "text",
             "subsets": ["ru"],
@@ -171,99 +520,101 @@ PRESETS = {
         },
     ],
     
-    # ─── Высококачественные данные (база знаний) ───
     "quality": [
         {
             "name": "wikimedia/wikipedia",
-            "desc": "Русская Wikipedia ПОЛНАЯ (~3 GB, ~1B токенов)",
+            "desc": "Русская Wikipedia (~3 GB)",
             "count": 2_000_000,
             "format": "text",
             "subsets": ["20231101.ru"],
         },
         {
             "name": "IlyaGusev/gazeta",
-            "desc": "Газета.ру — все новости (~500 MB)",
+            "desc": "Газета.ру — новости (~500 MB)",
             "count": 500_000,
             "format": "text",
         },
         {
             "name": "d0rj/librusec",
-            "desc": "Русская литература ПОЛНАЯ — богатый стиль",
+            "desc": "Русская литература — богатый стиль",
             "count": 500_000,
             "format": "text",
         },
         {
             "name": "IlyaGusev/ru_turbo_alpaca",
-            "desc": "GPT-4 русские инструкции (высшее качество)",
+            "desc": "GPT-4 русские инструкции",
             "count": 100_000,
             "format": "instruct",
         },
         {
             "name": "IlyaGusev/ru_turbo_alpaca_evol_instruct",
-            "desc": "Эволюционные цепочки (сложный reasoning)",
+            "desc": "Эволюционные цепочки reasoning",
             "count": 100_000,
             "format": "instruct",
         },
         {
             "name": "Vikhrmodels/GrandMaster-PRO-MAX",
-            "desc": "Сложный русский reasoning + многошаговые задачи",
+            "desc": "Сложный русский reasoning",
             "count": 100_000,
             "format": "chat",
         },
     ],
     
-    # ─── Reasoning, STEM, математика ───
     "reasoning": [
         {
             "name": "OpenAssistant/oasst2",
-            "desc": "OpenAssistant v2 — улучшенные диалоги",
+            "desc": "OpenAssistant v2",
             "count": 50_000,
             "format": "chat",
         },
         {
             "name": "TIGER-Lab/MathInstruct",
-            "desc": "Математические задачи с решениями (CoT)",
-            "count": 100_000,
+            "desc": "Математические задачи (CoT)",
+            "count": 200_000,
             "format": "instruct",
         },
         {
             "name": "Open-Orca/OpenOrca",
-            "desc": "Разнообразные инструкции (GPT-4 качество)",
+            "desc": "Инструкции GPT-4 качества",
             "count": 500_000,
             "format": "chat",
         },
         {
             "name": "teknium/OpenHermes-2.5",
-            "desc": "1M+ качественных инструкций (GPT-4, Code, Math)",
+            "desc": "1M+ инструкций (GPT-4, Code, Math)",
             "count": 500_000,
             "format": "sharegpt",
         },
         {
             "name": "BAAI/Infinity-Instruct",
-            "desc": "Огромный инструкционный датасет (мультиязычный)",
+            "desc": "Огромный мультиязычный датасет",
             "count": 300_000,
             "format": "sharegpt",
         },
     ],
     
-    # ─── DPO / Preference данные (alignment) ───
     "dpo": [
         {
             "name": "Anthropic/hh-rlhf",
-            "desc": "Human preference data (chosen/rejected)",
-            "count": 100_000,
+            "desc": "Human preference (chosen/rejected)",
+            "count": 150_000,
             "format": "chat",
         },
         {
             "name": "Intel/orca_dpo_pairs",
-            "desc": "DPO пары (chosen vs rejected ответы)",
+            "desc": "DPO пары (chosen vs rejected)",
             "count": 50_000,
             "format": "instruct",
         },
+        {
+            "name": "d0rj/full-hh-rlhf-ru",
+            "desc": "Human preference на русском",
+            "count": 150_000,
+            "format": "chat",
+        },
     ],
     
-    # ─── MAX: всё вместе (50-80 GB для 1B модели) ───
-    "max": [],  # computed dynamically = massive + quality + reasoning + dpo + all existing
+    "max": [],  # = massive + quality + reasoning + dpo + all
 }
 
 
