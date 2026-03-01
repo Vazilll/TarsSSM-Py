@@ -57,9 +57,8 @@ DRIVE_DATA = None
 DRIVE_MODELS = None
 
 if IS_COLAB:
-    try:
-        from google.colab import drive
-        drive.mount("/content/drive", force_remount=False)
+    # Drive должен быть примонтирован в notebook (TARS_Colab.ipynb)
+    if Path("/content/drive/MyDrive").exists():
         DRIVE_DATA = Path("/content/drive/MyDrive/TarsData")
         DRIVE_MODELS = Path("/content/drive/MyDrive/TarsModels")
         DRIVE_DATA.mkdir(parents=True, exist_ok=True)
@@ -67,8 +66,10 @@ if IS_COLAB:
         print(f"  ☁️  Google Drive подключён")
         print(f"     Данные:  {DRIVE_DATA}")
         print(f"     Модели:  {DRIVE_MODELS}")
-    except Exception as e:
-        print(f"  ⚠️  Drive не подключён: {e}")
+    else:
+        print("  ⚠️  Drive не смонтирован!")
+        print("     Смонтируйте в notebook: from google.colab import drive; drive.mount('/content/drive')")
+        print("     Продолжаем без Drive (данные НЕ будут сохранены)")
 
 
 def restore_cached_data():

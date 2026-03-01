@@ -371,18 +371,42 @@ def phase_0_install():
 DRIVE_BASE = Path("/content/drive/MyDrive/TarsData")
 
 def drive_mount():
-    """Монтирует Google Drive (только на Colab)."""
-    try:
-        from google.colab import drive
-        if not Path("/content/drive").exists():
-            drive.mount("/content/drive")
-            logger.info("  📁 Google Drive подключен")
-        else:
-            logger.info("  📁 Google Drive уже подключен")
+    """Монтирует Google Drive (только на Colab).
+    
+    Если Drive уже смонтирован (colab_train.py делает это в notebook),
+    просто проверяем папку. Не пытаемся монтировать из скрипта.
+    """
+    # Если Drive уже подключен (colab_train.py монтирует в notebook)
+    if Path("/content/drive/MyDrive").exists():
+        logger.info("  📁 Google Drive уже подключен")
         DRIVE_BASE.mkdir(parents=True, exist_ok=True)
         return True
-    except ImportError:
-        logger.info("  ℹ Не Colab — Google Drive недоступен")
+    
+    # Попытка монтирования (работает только внутри notebook)
+    try:
+        from google.colab import drive
+        # Проверяем, что мы в notebook kernel
+        ip = get_ipython() if 'get_ipython' in dir(__builtins__) else None
+        if ip is None:
+            try:
+                from IPython import get_ipython as _get_ip
+                ip = _get_ip()
+            except Exception:
+                pass
+        
+        if ip is not None and hasattr(ip, 'kernel'):
+            drive.mount("/content/drive", force_remount=False)
+            logger.info("  📁 Google Drive подключен")
+            DRIVE_BASE.mkdir(parents=True, exist_ok=True)
+            return True
+        else:
+            logger.warning("  ⚠ Drive mount доступен только в notebook.")
+            logger.warning("    Подключите Drive в TARS_Colab.ipynb или colab_train.py")
+            logger.info("  ℹ Продолжаем без Drive (данные сохранятся локально)")
+            return False
+    except (ImportError, Exception) as e:
+        logger.info(f"  ℹ Google Drive недоступен: {e}")
+        logger.info("  ℹ Продолжаем без Drive (данные сохранятся локально)")
         return False
 
 def drive_restore():
