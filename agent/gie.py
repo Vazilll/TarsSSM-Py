@@ -26,65 +26,13 @@ except ImportError:
     BeliefState = None
     ExpectedFreeEnergy = None
 try:
-    from agent.routine_detector import RoutineDetector
-except ImportError:
-    RoutineDetector = None
-try:
     from agent.learning_helper import LearningHelper
 except ImportError:
     LearningHelper = None
 try:
-    from agent.reminders import ReminderService
-except ImportError:
-    ReminderService = None
-try:
-    from agent.system_monitor import SystemMonitor
-except ImportError:
-    SystemMonitor = None
-try:
-    from agent.meeting_scribe import MeetingScribe
-except ImportError:
-    MeetingScribe = None
-try:
-    from agent.notifier import TarsNotifier
-except ImportError:
-    TarsNotifier = None
-try:
-    from agent.pomodoro import PomodoroTimer
-except ImportError:
-    PomodoroTimer = None
-try:
-    from agent.schedule import StudentSchedule
-except ImportError:
-    StudentSchedule = None
-try:
-    from agent.lecture_summarizer import LectureSummarizer
-except ImportError:
-    LectureSummarizer = None
-try:
     from agent.knowledge_graph import KnowledgeGraph
 except ImportError:
     KnowledgeGraph = None
-try:
-    from agent.clipboard_manager import ClipboardManager
-except ImportError:
-    ClipboardManager = None
-try:
-    from agent.expense_tracker import ExpenseTracker
-except ImportError:
-    ExpenseTracker = None
-try:
-    from agent.quiz_generator import QuizGenerator
-except ImportError:
-    QuizGenerator = None
-try:
-    from agent.habit_tracker import HabitTracker
-except ImportError:
-    HabitTracker = None
-try:
-    from agent.daily_dashboard import DailyDashboard
-except ImportError:
-    DailyDashboard = None
 try:
     from agent.file_helper import FileHelper
 except ImportError:
@@ -119,43 +67,10 @@ class GieAgent:
         self.belief_state = BeliefState(d_state=128) if BeliefState else None
         
         # ═══ Proactive Systems ═══
-        self.routine_detector = RoutineDetector() if RoutineDetector else None
         self.learning_helper = LearningHelper() if LearningHelper else None
-        self.reminders = ReminderService() if ReminderService else None
-        self.system_monitor = SystemMonitor() if SystemMonitor else None
-        self.meeting_scribe = MeetingScribe() if MeetingScribe else None
-        
-        # ═══ Central Notifier (ТАРС пишет первым) ═══
-        self.notifier = TarsNotifier(
-            reminders=self.reminders,
-            monitor=self.system_monitor,
-            routine_detector=self.routine_detector,
-            learning_helper=self.learning_helper,
-            meeting_scribe=self.meeting_scribe,
-        ) if TarsNotifier else None
-        
-        # ═══ Student Features ═══
-        self.pomodoro = PomodoroTimer() if PomodoroTimer else None
-        self.schedule = StudentSchedule() if StudentSchedule else None
-        self.summarizer = LectureSummarizer() if LectureSummarizer else None
         self.knowledge_graph = KnowledgeGraph() if KnowledgeGraph else None
-        self.clipboard = ClipboardManager() if ClipboardManager else None
-        self.expenses = ExpenseTracker() if ExpenseTracker else None
-        
-        # ═══ Phase 10: Learning + Consumer ═══
-        self.quiz = QuizGenerator(
-            learning_helper=self.learning_helper,
-            knowledge_graph=self.knowledge_graph,
-        ) if QuizGenerator else None
-        self.habits = HabitTracker() if HabitTracker else None
         self.file_helper = FileHelper() if FileHelper else None
-        self.dashboard = DailyDashboard(
-            schedule=self.schedule, reminders=self.reminders,
-            pomodoro=self.pomodoro, learning_helper=self.learning_helper,
-            habit_tracker=self.habits, expenses=self.expenses,
-            knowledge_graph=self.knowledge_graph,
-            system_monitor=self.system_monitor,
-        ) if DailyDashboard else None
+        self.notifier = None  # Removed: standalone mini-apps deleted
         
         # Состояние сессии
         self.state = {
@@ -168,6 +83,10 @@ class GieAgent:
             # Каждый элемент: {"user": str, "tars": str, "time": str, "tier": str}
             "conversation": [],
         }
+    
+    def __getattr__(self, name):
+        """Return None for removed subsystem attributes (pomodoro, schedule, etc.)."""
+        return None
 
     async def execute_goal(self, goal: str, fast_callback=None):
         """Главный цикл обработки цели."""
@@ -175,18 +94,7 @@ class GieAgent:
         self.state["session_goals"].append(goal)
         self.logger.info(f"GIE: Цель #{self.state['total_processed']} → {goal[:60]}...")
 
-        # ═══ Proactive: собираем уведомления из всех подсистем ═══
         proactive_hints = ""
-        if self.notifier:
-            # Утреннее приветствие (раз в день)
-            greeting = self.notifier.get_morning_greeting()
-            if greeting:
-                proactive_hints += f"\n{greeting}"
-            
-            # Все pending уведомления
-            notifications = self.notifier.collect_notifications()
-            if notifications:
-                proactive_hints += f"\n{self.notifier.format_notifications(notifications)}"
 
         reflex_result = None
         if self.reflex is not None:
@@ -280,7 +188,6 @@ class GieAgent:
              full_context += "\nSystem-Hint: Solution found in grounding. Summarize and exit."
 
         # ═══ Uncertainty-Driven Auto-RAG ═══
-        # Если Titans surprise высокий → тема новая для модели → ищем в интернете
         if self.titans and recall_vec is not None:
             try:
                 recall_surprise = await self.titans.update(
@@ -289,13 +196,9 @@ class GieAgent:
                 if recall_surprise.get("surprised", False):
                     self.logger.info("GIE: 🔍 Высокий surprise → автоматический RAG search")
                     try:
-                        from agent.knowledge_injector import KnowledgeInjector
-                        injector = KnowledgeInjector(
-                            leann=self.storage._hub.leann if hasattr(self.storage, '_hub') else None,
-                            titans=self.titans
-                        )
-                        rag_result = injector.handle_tool("search_web", goal)
-                        if rag_result and "[Ошибка" not in rag_result:
+                        from tools import web_search_sync
+                        rag_result = web_search_sync(goal, max_results=3)
+                        if rag_result:
                             full_context += f"\n\nНайдено в интернете:\n{rag_result[:500]}"
                             self.logger.info(f"GIE: RAG добавил {len(rag_result)} символов контекста")
                     except Exception as e:
@@ -409,22 +312,7 @@ class GieAgent:
                     except Exception:
                         pass
                 
-                # ═══ Learning Helper: автоматические flashcards ═══
-                if self.learning_helper and self.learning_helper.should_create_card(goal):
-                    try:
-                        self.learning_helper.auto_create_card(goal, thought_text)
-                        self.logger.info("GIE: 📝 Авто-карточка создана для повторения")
-                    except Exception:
-                        pass
-                
-                # ═══ Routine Detector: логирование для паттерн-анализа ═══
-                if self.routine_detector:
-                    try:
-                        self.routine_detector.log_conversation(goal, thought_text, tier="brain")
-                    except Exception:
-                        pass
-                
-                # ═══ Knowledge Graph: авто-наполнение графа знаний ═══
+                # ═══ Knowledge Graph: авто-наполнение ═══
                 if self.knowledge_graph:
                     try:
                         self.knowledge_graph.add_from_dialog(goal, thought_text)

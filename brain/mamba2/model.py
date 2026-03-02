@@ -32,6 +32,7 @@ from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from brain.mamba2.tars_block import TarsBlock, MemoryInjector
 from brain.mamba2.integral_auditor import IntegralAuditor, MetaAuditor
+from brain.mamba2.critic import CriticHead, WaveCritic, TaskSpec
 from brain.mamba2.matrix_pool import MatrixPool
 from brain.mamba2.novelty import NoveltyGate, HankelDetector
 from brain.mamba2.logger import ThinkingLogger
@@ -450,6 +451,12 @@ class TarsMamba2LM(nn.Module):
         # ═══ Shared Memory Injector (wave-parallel: 1 lookup → 2 blocks) ═══
         self.shared_mem_injector = MemoryInjector(d_model, mem_dim=384, quant_mode=quant_mode)
         
+        # ═══ Cerebellum: CriticHead (inter-wave verification) ═══
+        # Проверяет соответствие текущего hidden state задаче (ТЗ).
+        # Вставляется МЕЖДУ WaveConsolidation и ThinkingChain (RAG).
+        self.critic_head = CriticHead(d_model, n_criteria=8)
+        self.wave_critic = WaveCritic(self.critic_head, d_model)
+        
         # ═══ Output head ═══
         self.norm_f = nn.LayerNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
@@ -848,6 +855,7 @@ class TarsMamba2LM(nn.Module):
         max_expansion_rounds: int = 12,
         reflex_ctx: Any = None,
         supplement_queue = None,
+        task_spec: Any = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Адаптивный forward с Integral Auditor и Speculative Matrix Routing.
@@ -869,6 +877,12 @@ class TarsMamba2LM(nn.Module):
         self.matrix_pool.reset()
         self.hankel.reset()
         self.thinking_chain.reset()  # Новый запрос — новая цепочка рассуждений
+        
+        # ═══ Cerebellum: установить ТЗ ═══
+        if task_spec is not None:
+            self.wave_critic.set_task_spec(task_spec)
+        else:
+            self.wave_critic.set_task_spec(TaskSpec(query=query_text))
         
         # Meta-Auditor: тип задачи и порог
         task_type, p_threshold = self.meta_auditor.classify_task(query_text)
@@ -1048,6 +1062,41 @@ class TarsMamba2LM(nn.Module):
                     f"Converged at wave {wave_count} (depth={blocks_executed}, reason={skip_reason})"
                 )
                 break
+            
+            # ═══ Cerebellum: CriticHead проверяет ТЗ между волнами ═══
+            critic_result = None
+            if wave_idx < max_waves - 1:
+                try:
+                    h_query_mean = self.embedding(input_ids).mean(dim=1).detach()
+                    critic_result = self.wave_critic.evaluate_wave(
+                        h_curr, h_query_mean, wave_idx, memory_vec
+                    )
+                    
+                    self.thinking_logger.log_step(blocks_executed, {
+                        "critic_score": critic_result["score"],
+                        "critic_needs_data": critic_result["needs_data"],
+                    })
+                    
+                    # Inject feedback into memory_vec
+                    if critic_result["feedback_vec"] is not None and memory_vec is not None:
+                        fb = critic_result["feedback_vec"]
+                        # Project feedback to memory space if sizes differ
+                        if fb.shape[-1] != memory_vec.shape[-1]:
+                            if hasattr(self, 'to_memory_space'):
+                                fb = self.to_memory_space(fb)
+                        if fb.shape == memory_vec.shape:
+                            memory_vec = memory_vec + 0.3 * fb  # additive correction
+                    
+                    # If critic says "all good" and IA also converging → early stop
+                    if critic_result["should_stop"] and ia_result["p"] > 0.5:
+                        converged_early = True
+                        self.logger.debug(
+                            f"Critic approved at wave {wave_count} "
+                            f"(score={critic_result['score']:.0%})"
+                        )
+                        break
+                except Exception as e:
+                    self.logger.debug(f"Critic eval error: {e}")
             
             # ── Спинной мозг обновляет память между волнами ──
             spine_updated = False

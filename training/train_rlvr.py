@@ -146,12 +146,12 @@ def parse_args():
 
 
 def generate_answer(model, prompt_ids, max_len, device):
-    """Generate answer tokens from the model."""
-    model.eval()
+    """Generate answer tokens from the model (with gradients for REINFORCE)."""
     model.reset_cache()
     
     generated = prompt_ids.clone()
     
+    # Prefill prompt (no grad needed — prompt is fixed, not sampled)
     with torch.no_grad():
         logits = model.step(prompt_ids)
     
@@ -164,13 +164,13 @@ def generate_answer(model, prompt_ids, max_len, device):
         token = torch.multinomial(probs, 1)  # [B, 1]
         
         log_prob = F.log_softmax(last_logits, dim=-1)
-        selected_log_prob = log_prob.gather(-1, token)  # [B, 1]
+        selected_log_prob = log_prob.gather(-1, token.detach())  # [B, 1]
         all_log_probs.append(selected_log_prob)
         
         generated = torch.cat([generated, token], dim=1)
         
-        with torch.no_grad():
-            logits = model.step(token)
+        # Next step WITH gradients (needed for REINFORCE policy gradient)
+        logits = model.step(token.detach())
         
         # Stop if newline or period
         if token.item() in [10, 46, 0]:  # \n, '.', \0
@@ -182,6 +182,7 @@ def generate_answer(model, prompt_ids, max_len, device):
         total_log_prob = torch.zeros(1, device=device)
     
     return generated, total_log_prob
+
 
 
 def train(args):

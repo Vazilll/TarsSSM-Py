@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+import math
 from .mingru import MinGRU
 from .utils import exists, default, count_parameters
 
@@ -12,13 +13,15 @@ except ImportError:
     from torch.nn import Linear as _Linear
 
 class FeedForward(nn.Module):
-    def __init__(self, dim, mult=4):
+    def __init__(self, dim, mult=4, dropout=0.0):
         super().__init__()
         self.dim_inner = int(dim * mult)
         self.net = nn.Sequential(
             _Linear(dim, self.dim_inner),
-            nn.GELU(),  
-            _Linear(self.dim_inner, dim)
+            nn.GELU(),
+            nn.Dropout(dropout),
+            _Linear(self.dim_inner, dim),
+            nn.Dropout(dropout),
         )
 
     def forward(self, x):
@@ -47,70 +50,71 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         return F.normalize(x, dim=-1) * self.scale * (self.gamma + 1)
 
-class MinGRU_Layers(nn.Module):
-    def __init__(self, dim, num_tokens, shared_emb=None):
+class MinGRUBlock(nn.Module):
+    """Single MinGRU block: Conv1d → RMSNorm → MinGRU → FF (all residual).
+    
+    Works on hidden representations directly — no per-layer embedding/logits.
+    """
+    def __init__(self, dim, num_layers=1, dropout=0.1):
         super().__init__()
-        # Используем общий эмбеддинг если передан, иначе создаём свой
-        if shared_emb is not None:
-            self.emb = shared_emb
-        else:
-            self.emb = nn.Embedding(num_tokens, dim)
-        self.casual_depth = CausalDepthWiseConv1d(dim=dim, kernel_size=3)
-        self.rms_norm = RMSNorm(dim)
+        self.conv = CausalDepthWiseConv1d(dim=dim, kernel_size=3)
+        self.conv_norm = RMSNorm(dim)
+        self.gru_norm = RMSNorm(dim)
         self.gru = MinGRU(dim)
-        self.ff = FeedForward(dim)
+        self.gru_dropout = nn.Dropout(dropout)
+        self.ff = FeedForward(dim, dropout=dropout)
+        self.ff_norm = RMSNorm(dim)
         
-        self.norm = RMSNorm(dim)
-        self.to_logits = _Linear(dim, num_tokens, bias=False)
+        # Residual scaling: 1/√num_layers (GPT-2 style, stabilizes deep nets)
+        self.res_scale = 1.0 / math.sqrt(num_layers)
 
-    def forward(self, inputs, labels=None, is_first_layer=True, prev_hiddens=None):
-        if is_first_layer:
-            x = self.emb(inputs)
-        else:
-            x = self.emb(inputs.argmax(dim=-1))
+    def forward(self, x, prev_hidden=None):
+        """
+        Args:
+            x: [B, L, dim] hidden representation
+            prev_hidden: optional cached hidden state for incremental decoding
+        Returns:
+            (output, next_hidden)
+        """
+        # Causal depthwise conv for local context (skip in incremental mode)
+        if prev_hidden is None:
+            x = self.conv(self.conv_norm(x)) * self.res_scale + x
         
-        if exists(prev_hiddens):
-            x = x[:, -1:]
+        # MinGRU recurrence
+        gru_out, next_hidden = self.gru(
+            self.gru_norm(x), prev_hidden, return_next_prev_hidden=True
+        )
+        x = self.gru_dropout(gru_out) * self.res_scale + x
+        
+        # Feedforward
+        x = self.ff(self.ff_norm(x)) * self.res_scale + x
+        
+        return x, next_hidden
 
-        next_prev_hiddens = []
-        prev_hiddens = iter(default(prev_hiddens, []))
-
-        x = self.rms_norm(x)
-        prev_hidden = next(prev_hiddens, None)
-
-        min_gru_out, next_hidden = self.gru(x, prev_hidden, return_next_prev_hidden=True)
-
-        x = min_gru_out + x
-        next_prev_hiddens.append(next_hidden)
-        x = self.ff(x) + x
-        logits = self.to_logits(self.norm(x))
-
-        if labels is not None:
-            loss = F.cross_entropy(logits.transpose(1, 2), labels)
-        else:
-            loss = None
-
-        return loss, logits, next_prev_hiddens
 
 class MinGRU_LM(nn.Module):
-    def __init__(self, dim, num_tokens, num_layers, context_dim=1024):
+    def __init__(self, dim, num_tokens, num_layers, context_dim=1024, dropout=0.1):
         super().__init__()
         self.dim = dim
+        self.num_layers = num_layers
         
-        # ═══ Единый эмбеддинг для всех слоёв (экономия памяти в num_layers раз) ═══
-        self.shared_embedding = nn.Embedding(num_tokens, dim)
+        # ═══ Единый эмбеддинг (shared with LM head via weight tying) ═══
+        self.embedding = nn.Embedding(num_tokens, dim)
+        self.emb_dropout = nn.Dropout(dropout)
         
-        self.layers = nn.ModuleList([
-            MinGRU_Layers(dim, num_tokens, shared_emb=self.shared_embedding)
+        # ═══ MinGRU blocks (operate on hidden dim, no per-layer logits) ═══
+        self.blocks = nn.ModuleList([
+            MinGRUBlock(dim, num_layers=num_layers, dropout=dropout)
             for _ in range(num_layers)
         ])
         
-        # Тайным весом привязываем lm_head к эмбеддингу (weight tying)
-        # Каждый слой уже имеет to_logits, но мы привязываем первый к shared_embedding
-        self.layers[0].to_logits.weight = self.shared_embedding.weight
+        # ═══ Output head ═══
+        self.out_norm = RMSNorm(dim)
+        self.lm_head = _Linear(dim, num_tokens, bias=False)
+        # Weight tying: lm_head shares weights with embedding
+        self.lm_head.weight = self.embedding.weight
         
         # ═══ QuantBridge: int8 LEANN → float32 context ═══
-        # Адаптивный мост между int8 памятью (384-dim) и MinGRU (dim)
         try:
             from .quant_bridge import QuantBridge
             self.quant_bridge = QuantBridge(
@@ -122,47 +126,75 @@ class MinGRU_LM(nn.Module):
         
         # Проекция контекста → MinGRU hidden dim
         self.context_proj = _Linear(context_dim, dim)
+        
+        # ═══ Proper initialization ═══
+        self._init_weights()
 
-    def forward(self, inputs, labels=None, context_vec=None):
+    def _init_weights(self):
+        """Initialize weights for stable training."""
+        for name, p in self.named_parameters():
+            if p.dim() < 2:
+                continue  # skip biases and scalars
+            if 'embedding' in name:
+                nn.init.normal_(p, mean=0.0, std=0.02)
+            elif 'lm_head' in name:
+                # Output projection scaled by depth (GPT-2 style)
+                nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * self.num_layers))
+            elif 'conv' in name:
+                continue  # Conv1d has its own default init
+            elif p.dim() >= 2:
+                nn.init.xavier_uniform_(p)
+
+    def forward(self, inputs, labels=None, context_vec=None, prev_hiddens=None,
+                return_hiddens=False):
         """
         Args:
             inputs: [B, L] token indices
             labels: [B, L] target indices (для обучения)
             context_vec: один из вариантов:
-                - [B, 1024] float tensor (из Ω-SSM)
+                - [B, context_dim] float tensor (из Ω-SSM)
                 - tuple (int8_vecs, scales) из LEANN (автоматически через QuantBridge)
                 - None (без контекста)
+            prev_hiddens: list of hidden states for incremental decoding (None = full sequence)
+            return_hiddens: if True, always return (logits, next_hiddens)
+        Returns:
+            if labels: (loss, logits)
+            if prev_hiddens or return_hiddens: (logits, next_hiddens)
+            else: logits
         """
-        total_loss = 0
-        hidden_states = [None] * len(self.layers)
+        incremental = prev_hiddens is not None or return_hiddens
         
-        # Если контекст — raw LEANN int8, пропустить через QuantBridge
+        # ═══ Embedding ═══
+        x = self.emb_dropout(self.embedding(inputs))  # [B, L, dim]
+        
+        # ═══ Context injection (first position bias) ═══
         if context_vec is not None:
             if isinstance(context_vec, tuple) and self._has_bridge:
                 int8_vecs, scales = context_vec
                 context_vec = self.quant_bridge(int8_vecs, scales)
-            
             ctx = self.context_proj(context_vec)  # [B, dim]
-            hidden_states[0] = [ctx.unsqueeze(1)]  # [B, 1, dim]
+            # Add context as bias to first token position
+            x[:, 0, :] = x[:, 0, :] + ctx
         
-        current_input = inputs
-
-        for i, layer in enumerate(self.layers):
-            loss, logits, next_hiddens = layer(
-                inputs=current_input,
-                labels=labels,
-                is_first_layer=(i == 0),
-                prev_hiddens=hidden_states[i]
-            )
-            
-            if loss is not None:
-                total_loss += loss
-                
-            current_input = logits
-            hidden_states[i] = next_hiddens
-
+        # ═══ MinGRU blocks ═══
+        next_hiddens = []
+        if prev_hiddens is None:
+            prev_hiddens = [None] * self.num_layers
+        
+        for i, block in enumerate(self.blocks):
+            x, next_hidden = block(x, prev_hiddens[i])
+            next_hiddens.append(next_hidden)
+        
+        # ═══ Output projection (only from final layer) ═══
+        logits = self.lm_head(self.out_norm(x))  # [B, L, num_tokens]
+        
         if labels is not None:
-            return total_loss / len(self.layers), logits
+            loss = F.cross_entropy(logits.transpose(1, 2), labels)
+            return loss, logits
+        
+        if incremental:
+            return logits, next_hiddens
+        
         return logits
 
     def from_leann_memory(self, inputs, int8_vecs, scales, labels=None):
@@ -175,4 +207,3 @@ class MinGRU_LM(nn.Module):
             scales: numpy float32[B] или torch float32[B]
         """
         return self.forward(inputs, labels=labels, context_vec=(int8_vecs, scales))
-

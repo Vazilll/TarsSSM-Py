@@ -94,7 +94,7 @@ def run(cmd: list, cwd=None, retries=3, check=True) -> bool:
             result = subprocess.run(
                 [str(c) for c in cmd],
                 cwd=str(cwd or ROOT),
-                timeout=7200,  # 2 часа макс
+                timeout=43200,  # 12 часов макс
             )
             if result.returncode == 0:
                 return True
@@ -113,7 +113,7 @@ def run(cmd: list, cwd=None, retries=3, check=True) -> bool:
                 logger.error("  ❌ PermissionError после всех попыток")
                 return False
         except subprocess.TimeoutExpired:
-            logger.error("  ❌ Таймаут (2 часа)")
+            logger.error("  ❌ Таймаут (12 часов)")
             return False
     return False
 
@@ -409,23 +409,44 @@ def drive_mount():
         logger.info("  ℹ Продолжаем без Drive (данные сохранятся локально)")
         return False
 
+def _is_on_drive(path: Path) -> bool:
+    """Check if path is a symlink to Google Drive (or is already on Drive)."""
+    try:
+        resolved = path.resolve()
+        return "/content/drive/" in str(resolved)
+    except Exception:
+        return False
+
+
 def drive_restore():
     """Восстанавливает данные с Google Drive (пропускает скачивание)."""
     if not DRIVE_BASE.exists():
         return
     
+    # Если data/ уже симлинк на Drive — данные уже на месте
+    if _is_on_drive(DATA):
+        logger.info("  ℹ data/ → Drive (symlink) — restore не нужен")
+        return
+    if _is_on_drive(MODELS):
+        logger.info("  ℹ models/ → Drive (symlink) — restore не нужен")
+        return
+    
     restored = 0
     
-    # Восстановить data/ (wiki_ru.txt, hf_*.txt)
-    drive_data = DRIVE_BASE / "data"
-    if drive_data.exists():
-        for f in drive_data.glob("*"):
+    # Восстановить data/ — файлы могут быть в корне DRIVE_BASE или DRIVE_BASE/data/
+    for src_dir in [DRIVE_BASE, DRIVE_BASE / "data"]:
+        if not src_dir.exists():
+            continue
+        for f in src_dir.glob("*"):
+            if not f.is_file():
+                continue
             dst = DATA / f.name
             if not dst.exists() or dst.stat().st_size < f.stat().st_size:
+                DATA.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(str(f), str(dst))
                 restored += 1
-        if restored:
-            logger.info(f"  📥 Из Drive: {restored} файлов данных")
+    if restored:
+        logger.info(f"  📥 Из Drive: {restored} файлов данных")
     
     # Восстановить models/embeddings/
     drive_emb = DRIVE_BASE / "embeddings"
@@ -471,20 +492,30 @@ def drive_save():
     if not DRIVE_BASE.exists():
         return
     
+    # Если data/ и models/ уже симлинки на Drive — данные уже на месте
+    if _is_on_drive(DATA) and _is_on_drive(MODELS):
+        logger.info("  ℹ data/ и models/ → Drive (symlinks) — save не нужен")
+        # Но LEANN может быть локально
+        for leann_file in ["leann.npz", "leann.texts.json"]:
+            local_f = ROOT / "memory" / leann_file
+            drive_f = DRIVE_BASE / leann_file
+            if local_f.exists() and not _is_on_drive(local_f):
+                shutil.copy2(str(local_f), str(drive_f))
+                logger.info(f"  💾 → Drive: {leann_file}")
+        return
+    
     saved = 0
     
-    # Сохранить data/ (wiki + hf)
-    drive_data = DRIVE_BASE / "data"
-    drive_data.mkdir(parents=True, exist_ok=True)
+    # Сохранить data/ (wiki + hf) — в корень DRIVE_BASE (не в поддиректорию)
     for f in DATA.glob("*.txt"):
         if f.stat().st_size > 10000:  # Только значимые файлы
-            dst = drive_data / f.name
+            dst = DRIVE_BASE / f.name
             if not dst.exists() or dst.stat().st_size < f.stat().st_size:
                 shutil.copy2(str(f), str(dst))
                 saved += 1
     for f in DATA.glob("*.json"):
         if f.stat().st_size > 100:
-            dst = drive_data / f.name
+            dst = DRIVE_BASE / f.name
             if not dst.exists():
                 shutil.copy2(str(f), str(dst))
                 saved += 1
@@ -514,12 +545,14 @@ def drive_save():
             saved += 1
     
     # Сохранить обученные модели на Drive (бэкап)
+    drive_models = Path("/content/drive/MyDrive/TarsModels")
     tars_v3 = MODELS / "tars_v3"
-    drive_tars_v3 = DRIVE_BASE / "models"
     if tars_v3.exists():
-        drive_tars_v3.mkdir(parents=True, exist_ok=True)
+        drive_models.mkdir(parents=True, exist_ok=True)
+        tars_v3_drive = drive_models / "tars_v3"
+        tars_v3_drive.mkdir(parents=True, exist_ok=True)
         for f in tars_v3.glob("*.pt"):
-            dst = drive_tars_v3 / f.name
+            dst = tars_v3_drive / f.name
             if not dst.exists() or dst.stat().st_size < f.stat().st_size:
                 shutil.copy2(str(f), str(dst))
                 saved += 1
@@ -698,7 +731,7 @@ def phase_3_mingru(device: str, quick: bool = False):
         logger.info("  ⚡ Quick mode: dim=256, layers=4, 3 эпохи")
         return run([PYTHON, TRAINING / "train_mingru.py",
             "--epochs", "3",
-            "--lr", "3e-3",
+            "--lr", "1e-3",
             "--dim", "256",
             "--layers", "4",
             "--batch", "16",
@@ -707,7 +740,7 @@ def phase_3_mingru(device: str, quick: bool = False):
     
     return run([PYTHON, TRAINING / "train_mingru.py",
         "--epochs", "25",           # 25 эпох (быстро на GPU)
-        "--lr", "3e-3",
+        "--lr", "1e-3",
         "--dim", "512",             # Полноценная размерность
         "--layers", "6",            # 6 слоёв MinGRU
         "--batch", "32",            # Начальный (авто-увеличится на GPU)

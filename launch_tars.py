@@ -155,12 +155,12 @@ def verify():
     except Exception as e:
         results["MoLE"] = f"⚠️  {e}"
 
-    # 8. Knowledge Injector (RAG)
+    # 8. RAG (Web Search)
     try:
-        from agent.knowledge_injector import KnowledgeInjector
-        results["RAG Injector"] = "✅ web/file/recall"
+        from tools.web_search import search_duckduckgo
+        results["RAG Search"] = "✅ DuckDuckGo"
     except Exception as e:
-        results["RAG Injector"] = f"❌ {e}"
+        results["RAG Search"] = f"❌ {e}"
 
     # Print results
     print("\n" + "=" * 55)

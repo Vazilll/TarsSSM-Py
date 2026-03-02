@@ -25,6 +25,7 @@ import os
 import asyncio
 import math
 from typing import Optional, List
+from pathlib import Path
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -351,15 +352,21 @@ class TarsRRN(nn.Module):
 
 class RrnCore:
     """
-    Высокоуровневый интерфейс RRN для системы TARS.
+    Спинной мозг ТАРС — маршрутизатор нервной системы.
     
-    Работает в трёх режимах:
-      - fast_reply():            Рефлекс (1–2 шага рекурсии)
-      - precompute_grounding():  Поиск связей для основного мозга (4–8 шагов)
-      - sleep_consolidation():   Ночная консолидация памяти
+    3 режима работы:
+      Mode 1 — Рефлекс:  fast_reply()  (<50ms, MinGRU alone)
+      Mode 2 — Действие:  dispatch()    (<200ms, Synapses parallel)
+      Mode 3 — Глубокий:  precompute_grounding() (500ms+, Synapses → summarize → Brain)
     
-    Под капотом использует нейронную TarsRRN + опциональный LLM.
+    Также:
+      sleep_consolidation() — ночная консолидация памяти
     """
+    # Порог для рефлекса (Mode 1)
+    REFLEX_THRESHOLD = 0.85
+    # Порог для действия (Mode 2) vs глубокое мышление (Mode 3)
+    ACTION_THRESHOLD = 0.50
+    
     def __init__(self, model_path="models/llm/rrn_small.gguf", dim=256):
         self.model_path = model_path
         self.logger = logging.getLogger("Tars.RRN")
@@ -368,92 +375,223 @@ class RrnCore:
         
         # Нейронное ядро RRN
         self.neural_core = TarsRRN(dim=dim, mem_slots=4, num_heads=4, max_steps=8)
-        self.input_proj = nn.Linear(1024, dim)  # Проекция из SSM-пространства
-        self.output_proj = nn.Linear(dim, 1024)  # Обратная проекция
+        self.input_proj = nn.Linear(1024, dim)   # Проекция из SSM-пространства
+        self.output_proj = nn.Linear(dim, 1024)  # Обратная проекция (обученная, не repeat!)
         
         param_count = sum(p.numel() for p in self.neural_core.parameters())
-        self.logger.info(f"RRN: Нейронное ядро инициализировано ({param_count:,} параметров)")
+        self.logger.info(f"Spine: Нейронное ядро ({param_count:,} params)")
         
-        # Интеграция MinGRU для быстрых текстовых рефлексов
+        # MinGRU для рефлексов
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         try:
             from brain.min_gru.mingru_lm import MinGRU_LM
-            # Инициализируем сеть: vocab 256 (UTF-8 bytes), 256 dim, 4 слоя
             self.mingru_lm = MinGRU_LM(dim=256, num_tokens=256, num_layers=4)
+            
+            # Загрузить обученные веса если есть
+            weights_path = Path(__file__).parent.parent / "models" / "mingru" / "mingru_best.pt"
+            if weights_path.exists():
+                ckpt = torch.load(str(weights_path), map_location='cpu', weights_only=False)
+                self.mingru_lm.load_state_dict(ckpt['model_state_dict'], strict=False)
+                self.logger.info(f"Spine: MinGRU weights loaded (epoch {ckpt.get('epoch', '?')})")
+            
             self.mingru_lm.to(self.device)
+            self.mingru_lm.eval()
             self.has_mingru = True
-            self.logger.info("RRN: Встроенный генератор рефлексов MinGRU (vocab=256) активирован.")
+            self.logger.info("Spine: MinGRU reflex engine active")
         except Exception as e:
             self.has_mingru = False
-            self.logger.warning(f"RRN MinGRU Backend failed to load: {e}")
-
-    async def fast_reply(self, prompt: str) -> Optional[str]:
-        """
-        Рекурсивный рефлекс (System 1).
+            self.logger.warning(f"Spine: MinGRU not available: {e}")
         
-        1. Нейронное ядро делает 2 быстрых прохода (TRM)
-        2. Если LLM есть — он формирует текстовый ответ с учётом нейронного контекста
-        3. Если LLM нет — проверяем паттерны рефлексов
+        # LEANN (lazy-load)
+        self._leann = None
+        self._leann_loaded = False
+        
+        # Synapse Pool (lazy-load)
+        self._synapse_pool = None
+    
+    @property
+    def leann(self):
+        """Lazy-load LEANN memory."""
+        if not self._leann_loaded:
+            self._leann_loaded = True
+            try:
+                from memory.leann import LeannIndex
+                self._leann = LeannIndex()
+                self._leann.load()
+                self.logger.info(f"Spine: LEANN loaded ({len(self._leann.texts)} docs)")
+            except Exception as e:
+                self.logger.warning(f"Spine: LEANN not available: {e}")
+        return self._leann
+    
+    @property
+    def synapse_pool(self):
+        """Lazy-load SynapsePool."""
+        if self._synapse_pool is None:
+            from tools.micro_agents import SynapsePool
+            self._synapse_pool = SynapsePool(leann=self.leann)
+            self.logger.info("Spine: SynapsePool initialized (5 synapses)")
+        return self._synapse_pool
+    
+    def _detect_mode(self, query: str, confidence: float) -> int:
         """
-        # Фаза 1: Нейронный рефлекс (2 шага рекурсии)
+        Определить режим работы:
+          1 = Рефлекс (confidence > 85%)
+          2 = Действие (есть action-triggers, confidence > 50%)
+          3 = Глубокое мышление (всё остальное)
+        """
+        if confidence > self.REFLEX_THRESHOLD:
+            return 1
+        
+        # Проверяем action-triggers для Mode 2
+        q_lower = query.lower()
+        action_triggers = [
+            "найди", "открой", "запусти", "выполни", "удали", "создай",
+            "find", "open", "run", "execute", "delete", "create",
+            "pip", "python", "git",
+        ]
+        if confidence > self.ACTION_THRESHOLD and any(t in q_lower for t in action_triggers):
+            return 2
+        
+        return 3
+    
+    async def process(self, query: str) -> dict:
+        """
+        Главная точка входа Spine.
+        Определяет mode и обрабатывает соответственно.
+        
+        Returns:
+            {
+                "mode": 1|2|3,
+                "confidence": float,
+                "response": str or None,       # Mode 1: ответ, Mode 2-3: None
+                "context": str or None,         # Mode 3: context для Brain
+                "synapse_results": list or None, # Mode 2-3: результаты синапсов
+                "rrn_vector": Tensor or None,    # Mode 3: context_vector [1, 1024]
+            }
+        """
+        # 1. RRN classification
         with torch.no_grad():
-            x = self._text_to_vec(prompt)
+            x = self._text_to_vec(query)
             x_proj = self.input_proj(x)
             z, conf, steps = self.neural_core(x_proj, n_steps=2)
-            neural_confidence = conf.item()
+            confidence = conf.item()
         
-        # Фаза 2: Генерация текста через обученную MinGRU_LM
+        mode = self._detect_mode(query, confidence)
+        self.logger.info(f"Spine: mode={mode}, conf={confidence:.2f}, steps={steps}")
+        
+        # ═══ Mode 1: Рефлекс ═══
+        if mode == 1:
+            reply = await self._reflex_reply(query, z, confidence)
+            if reply:
+                return {
+                    "mode": 1, "confidence": confidence,
+                    "response": reply, "context": None,
+                    "synapse_results": None, "rrn_vector": None,
+                }
+            # Fallback to mode 3 if reflex failed
+            mode = 3
+        
+        # ═══ Mode 2: Действие (синапсы) ═══
+        if mode == 2:
+            results = await self.synapse_pool.fire_for_query(query)
+            summary = self.synapse_pool.summarize_results(results)
+            return {
+                "mode": 2, "confidence": confidence,
+                "response": summary if summary else None,
+                "context": summary,
+                "synapse_results": results, "rrn_vector": None,
+            }
+        
+        # ═══ Mode 3: Глубокое мышление (Synapses → summarize → Brain) ═══
+        # 3a. Синапсы собирают данные параллельно
+        results = await self.synapse_pool.fire_for_query(query)
+        synapse_context = self.synapse_pool.summarize_results(results)
+        
+        # 3b. RRN глубокий проход (4-8 шагов) для grounding
+        with torch.no_grad():
+            z_deep, conf_deep, deep_steps = self.neural_core(x_proj, n_steps=None)
+        
+        # 3c. Проецируем RRN вектор → 1024d через обученную проекцию
+        rrn_context_vec = self.output_proj(z_deep)  # [1, 1024]
+        
+        # 3d. Формируем текстовый контекст для Brain
+        full_context = (
+            f"[Synapse Data]\n{synapse_context}\n"
+            f"[RRN] steps={deep_steps}, confidence={conf_deep.item():.2f}\n"
+            f"[Working Memory] {self.working_memory[-3:]}"
+        )
+        
+        self.working_memory.append(f"Deep: {query[:40]} → mode=3, steps={deep_steps}")
+        
+        return {
+            "mode": 3, "confidence": conf_deep.item(),
+            "response": None,
+            "context": full_context,
+            "synapse_results": results,
+            "rrn_vector": rrn_context_vec,
+        }
+    
+    async def _reflex_reply(self, prompt: str, z, confidence: float) -> Optional[str]:
+        """Mode 1: быстрый ответ через MinGRU."""
+        if not self.has_mingru:
+            return None
+        
         try:
             from brain.min_gru.generate import generate_text
             
-            # Генерация ответа через MinGRU с контекстом из RRN
             loop = asyncio.get_event_loop()
             mg_prompt = f"Вопрос: {prompt}\nОтвет:"
             
-            # Проецируем RRN-вектор z (256-dim) → 1024-dim для context injection
-            context_vec = None
-            if z is not None:
-                z_flat = z.flatten()
-                # Расширяем до 1024 через повторение (256 → 1024)
-                context_vec = z_flat.repeat(1024 // z_flat.shape[0] + 1)[:1024]
+            # Контекст из RRN через обученную проекцию (не repeat!)
+            context_vec = self.output_proj(z)  # [1, 1024]
             
-            raw_reply = await loop.run_in_executor(None, 
-                lambda: generate_text(self.mingru_lm, start_text=mg_prompt, 
-                                      max_length=80, temperature=0.7, 
+            raw_reply = await loop.run_in_executor(None,
+                lambda: generate_text(self.mingru_lm, start_text=mg_prompt,
+                                      max_length=80, temperature=0.7,
                                       device=self.device, context_vec=context_vec)
             )
             
-            # Извлекаем ответ из Q&A формата
+            # Извлекаем ответ
             if "Ответ:" in raw_reply:
                 reply = raw_reply.split("Ответ:")[-1].strip()
             else:
                 reply = raw_reply[len(mg_prompt):].strip()
             
-            # Фильтр мусора (если MinGRU не обучена)
-            is_garbage = False
+            # Фильтр мусора
             if len(reply) < 3:
-                is_garbage = True
-            else:
-                cyrillic_count = sum(1 for c in reply if '\u0400' <= c <= '\u04FF')
-                if len(reply) > 5 and cyrillic_count < len(reply) * 0.2:
-                    is_garbage = True
-                    
-            if is_garbage:
-                self.logger.info(f"RRN: MinGRU сгенерировал шум ('{reply[:20]}'). Передаём в глубокий анализ.")
-                # Для коротких запросов — не запускаем тяжёлый Ω-SSM
-                if len(prompt) < 15:
-                    return {"text": "Уточните запрос, пожалуйста.", "is_garbage": False, "confidence": 0.5}
-                return None  # Передаём в Ω-SSM
-
-            self.working_memory.append(f"Reflex: {prompt[:30]} -> {reply[:30]}")
-            return {"text": reply, "is_garbage": False, "confidence": neural_confidence}
+                return None
+            cyrillic_count = sum(1 for c in reply if '\u0400' <= c <= '\u04FF')
+            if len(reply) > 5 and cyrillic_count < len(reply) * 0.2:
+                self.logger.info(f"Spine: MinGRU garbage ('{reply[:20]}'), escalating")
+                return None
+            
+            # Сохранить в LEANN для долгосрочной памяти
+            if self.leann and confidence > 0.7:
+                try:
+                    self.leann.add_document(f"Q: {prompt}\nA: {reply}")
+                except Exception:
+                    pass
+            
+            self.working_memory.append(f"Reflex: {prompt[:30]} → {reply[:30]}")
+            return reply
             
         except Exception as e:
-            self.logger.warning(f"RRN fast_reply error: {e}")
-            # Для коротких запросов — не запускаем тяжёлый Ω-SSM
-            if len(prompt) < 15:
-                return {"text": "Уточните ваш запрос.", "is_garbage": False, "confidence": 0.5}
-            return None  # Передаём в Ω-SSM для глубокого анализа
+            self.logger.warning(f"Spine reflex error: {e}")
+            return None
+    
+    async def fast_reply(self, prompt: str) -> Optional[dict]:
+        """
+        Совместимый интерфейс: рефлекс (System 1).
+        Возвращает dict с text/confidence или None.
+        """
+        result = await self.process(prompt)
+        if result["response"]:
+            return {
+                "text": result["response"],
+                "confidence": result["confidence"],
+                "mode": result["mode"],
+            }
+        return None
 
     async def precompute_grounding(self, query: str, memory_engine, titans_engine=None) -> str:
         """

@@ -232,6 +232,7 @@ def load_corpus(data_path=None, download_wiki=True):
         repeat = max(1, 200_000 // corpus_bytes)
         corpus = ("\n\n" + corpus) * repeat
         print(f"[Data] Корпус повторён {repeat}x")
+        corpus_bytes = len(corpus.encode('utf-8'))
     
     print(f"[Data] Итого: {len(corpus):,} символов ({corpus_bytes / 1024:.0f} KB)")
     return corpus
@@ -421,6 +422,21 @@ def train(args):
             for bk, bv in v.items():
                 print(f"    {bk}: {bv:,}")
     
+    # ═══ Proper weight decay: исключить bias, norm, gamma из decay ═══
+    def split_params_wd(params_iter, wd=0.01):
+        decay, no_decay = [], []
+        for name, p in params_iter:
+            if not p.requires_grad:
+                continue
+            if p.dim() < 2 or 'norm' in name or 'gamma' in name or 'bias' in name:
+                no_decay.append(p)
+            else:
+                decay.append(p)
+        return [
+            {'params': decay, 'weight_decay': wd},
+            {'params': no_decay, 'weight_decay': 0.0},
+        ]
+    
     # ═══ Фазы обучения ═══
     # PersonalityAdapter ЗАМОРОЖЕН в Phase 1-4 (не портит стиль знаниями)
     for p in model.personality.parameters():
@@ -434,7 +450,7 @@ def train(args):
             optimizer = Muon(model.parameters(), lr=0.02, weight_decay=0.01)
             print("  ⚡ Optimizer: Muon (2x faster, NS orthogonalization)")
         else:
-            optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+            optimizer = torch.optim.AdamW(split_params_wd(model.named_parameters()), lr=args.lr)
     elif args.phase == 2:
         # Phase 2: Freeze SSD-specific params. Train: WKV + Fusion + Ω-SSM + MoLE + NoveltyGate
         print("[Phase 2] Fine-tune: WKV + Fusion + Ω-SSM + MoLE + NoveltyGate (SSD params frozen)")
@@ -446,9 +462,9 @@ def train(args):
             core.dt_bias.requires_grad = False
             for p in core.conv1d.parameters():
                 p.requires_grad = False
-        trainable = [p for p in model.parameters() if p.requires_grad]
-        print(f"  Trainable: {sum(p.numel() for p in trainable):,} params")
-        optimizer = torch.optim.AdamW(trainable, lr=args.lr * 0.1, weight_decay=0.01)
+        trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+        print(f"  Trainable: {sum(p.numel() for _, p in trainable):,} params")
+        optimizer = torch.optim.AdamW(split_params_wd(trainable), lr=args.lr * 0.1)
     elif args.phase == 3:
         # Phase 3: MoLE + MatrixPool + WaveMerge + WaveGate + NoveltyGate
         print("[Phase 3] Fine-tune: MoLE + MatrixPool + WaveMerge + WaveGate + NoveltyGate")
@@ -472,9 +488,9 @@ def train(args):
         # norm_f — должен адаптироваться при смене внутренних представлений
         for p in model.norm_f.parameters():
             p.requires_grad = True
-        trainable = [p for p in model.parameters() if p.requires_grad]
-        print(f"  Trainable: {sum(p.numel() for p in trainable):,} params")
-        optimizer = torch.optim.AdamW(trainable, lr=args.lr * 0.01, weight_decay=0.01)
+        trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+        print(f"  Trainable: {sum(p.numel() for _, p in trainable):,} params")
+        optimizer = torch.optim.AdamW(split_params_wd(trainable), lr=args.lr * 0.01)
     elif args.phase == 4:
         # Phase 4: WKV fusion + RAG + Dynamic Memory Injection + NoveltyGate + Ω-SSM
         print("[Phase 4] Fine-tune: WKV + RAG + Dynamic Memory + NoveltyGate + Ω-SSM")
@@ -493,12 +509,8 @@ def train(args):
                 p.requires_grad = True
             for p in block.rag_out.parameters():
                 p.requires_grad = True
-            # Dynamic Memory Injection (Tars.txt §4.3): mem_query, mem_proj, mem_gate
-            for p in block.mem_query_proj.parameters():
-                p.requires_grad = True
-            for p in block.mem_proj.parameters():
-                p.requires_grad = True
-            for p in block.mem_gate.parameters():
+            # Dynamic Memory Injection (Fused MemoryInjector)
+            for p in block.mem_injector.parameters():
                 p.requires_grad = True
             # NoveltyGate
             for p in block.novelty_gate.parameters():
@@ -521,14 +533,16 @@ def train(args):
             p.requires_grad = True
         for p in model.norm_f.parameters():
             p.requires_grad = True
-        trainable = [p for p in model.parameters() if p.requires_grad]
-        print(f"  Trainable: {sum(p.numel() for p in trainable):,} params")
-        optimizer = torch.optim.AdamW(trainable, lr=args.lr * 0.05, weight_decay=0.01)
+        trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+        print(f"  Trainable: {sum(p.numel() for _, p in trainable):,} params")
+        optimizer = torch.optim.AdamW(split_params_wd(trainable), lr=args.lr * 0.05)
     
     # Scheduler (estimate total steps from corpus size)
     estimated_samples = max(100, len(corpus.encode('cp1251', errors='replace')) // max(args.seq_len // 2, 1))
     total_steps = (estimated_samples // args.batch + 1) * args.epochs
     warmup = total_steps // 10
+    
+    min_lr_ratio = 0.1  # LR не падает ниже 10% от пика
     
     if getattr(args, 'wsd', False):
         # ═══ WSD: Warmup-Stable-Decay (SmolLM2/MiniCPM) ═══
@@ -539,17 +553,18 @@ def train(args):
             elif step < stable_end:
                 return 1.0  # stable phase — full LR
             else:
-                # decay phase: linear decay to 0.1
+                # decay phase: linear decay to min_lr_ratio
                 progress = (step - stable_end) / max(total_steps - stable_end, 1)
-                return max(0.1, 1.0 - 0.9 * progress)
+                return max(min_lr_ratio, 1.0 - (1.0 - min_lr_ratio) * progress)
         print("  ⚡ Scheduler: WSD (warmup → stable → decay)")
     else:
-        # Standard cosine annealing
+        # Standard cosine annealing with min LR floor
         def lr_fn(step):
             if step < warmup:
                 return step / max(warmup, 1)
             progress = (step - warmup) / max(total_steps - warmup, 1)
-            return 0.5 * (1.0 + np.cos(np.pi * progress))
+            cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
+            return max(min_lr_ratio, cosine)
     
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_fn)
     
@@ -645,7 +660,10 @@ def train(args):
                         label_smoothing=args.label_smoothing,
                     )
                     # MoLE auxiliary loss (load balancing + z-loss)
-                    loss = (lm_loss + model.mole_aux_loss) / accum_steps
+                    _aux = model.mole_aux_loss
+                    if not isinstance(_aux, torch.Tensor):
+                        _aux = torch.tensor(0.0, device=lm_loss.device)
+                    loss = (lm_loss + _aux) / accum_steps
                 if scaler is not None:
                     scaler.scale(loss).backward()
                 else:
@@ -658,7 +676,10 @@ def train(args):
                     label_smoothing=args.label_smoothing,
                 )
                 # MoLE auxiliary loss (load balancing + z-loss)
-                loss = (lm_loss + model.mole_aux_loss) / accum_steps
+                _aux = model.mole_aux_loss
+                if not isinstance(_aux, torch.Tensor):
+                    _aux = torch.tensor(0.0, device=lm_loss.device)
+                loss = (lm_loss + _aux) / accum_steps
                 loss.backward()
             
             total_loss += loss.item() * accum_steps

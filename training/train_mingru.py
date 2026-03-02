@@ -60,8 +60,11 @@ def parse_args():
     p.add_argument('--seq_len', type=int, default=512, help="Длина контекстного окна")
     p.add_argument('--batch', type=int, default=32, help="Стартовый размер батча (авто-увеличится)")
     p.add_argument('--epochs', type=int, default=100, help="Количество эпох")
-    p.add_argument('--lr', type=float, default=3e-3, help="Начальная скорость обучения")
+    p.add_argument('--lr', type=float, default=1e-3, help="Начальная скорость обучения")
     p.add_argument('--wd', type=float, default=1e-2, help="Weight decay")
+    p.add_argument('--label_smoothing', type=float, default=0.1, help="Label smoothing (0=off)")
+    p.add_argument('--dropout', type=float, default=0.1, help="Dropout rate")
+    p.add_argument('--patience', type=int, default=7, help="Early stopping patience (0=off)")
     p.add_argument('--augment', action='store_true', help="Скачать доп. данные с HuggingFace")
     p.add_argument('--max_samples', type=int, default=0, help="Макс. примеров (0 = без ограничений)")
     p.add_argument('--resume', action='store_true', help="Продолжить обучение с чекпоинта")
@@ -115,8 +118,8 @@ def prepare_data(text: str, seq_length: int, max_samples: int = 0):
     inputs = []
     targets = []
     
-    # Stride = seq_length (без перекрытия, экономит 2x RAM)
-    stride = seq_length
+    # Stride = seq_length // 2 (50% overlap — 2x больше данных, лучше обучение на стыках)
+    stride = max(1, seq_length // 2)
     for i in range(0, len(tokens) - seq_length - 1, stride):
         inp = tokens[i : i + seq_length]
         tgt = tokens[i + 1 : i + seq_length + 1]
@@ -301,6 +304,7 @@ def train(args):
         repeat = max(1, 100_000 // corpus_bytes)
         corpus = ("\n\n" + corpus) * repeat
         print(f"[Data] Корпус повторён {repeat}x для стабильности")
+        corpus_bytes = len(corpus.encode('cp1251', errors='replace'))
     
     corpus_mb = corpus_bytes / (1024 * 1024)
     print(f"[Data] Итоговый корпус: {len(corpus)} символов, {corpus_mb:.1f} MB")
@@ -341,7 +345,8 @@ def train(args):
         dim=args.dim, 
         num_tokens=256,
         num_layers=args.layers,
-        context_dim=args.context_dim
+        context_dim=args.context_dim,
+        dropout=args.dropout,
     )
     
     # Загрузка чекпоинта
@@ -410,19 +415,44 @@ def train(args):
         pin_memory=use_pin, num_workers=0,
     )
     
-    # ═══ Оптимизатор ═══
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    # ═══ Оптимизатор (proper weight decay — исключаем bias и norm) ═══
+    decay_params = []
+    no_decay_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.dim() < 2 or 'norm' in name or 'gamma' in name or 'bias' in name:
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+    
+    optimizer = torch.optim.AdamW([
+        {'params': decay_params, 'weight_decay': args.wd},
+        {'params': no_decay_params, 'weight_decay': 0.0},
+    ], lr=args.lr)
     
     total_steps = len(train_loader) * args.epochs // accum_steps
     warmup_steps = total_steps // 10
+    min_lr_ratio = 0.1  # LR не падает ниже 10% от пика
     
     def lr_lambda(step):
         if step < warmup_steps:
             return step / max(warmup_steps, 1)
         progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-        return 0.5 * (1.0 + np.cos(np.pi * progress))
+        cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
+        return max(min_lr_ratio, cosine)  # floor at min_lr_ratio
     
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    
+    # ═══ EMA (Exponential Moving Average) для стабильного inference ═══
+    ema_decay = 0.999
+    ema_state = {k: v.clone() for k, v in model.state_dict().items()}
+    
+    def update_ema():
+        with torch.no_grad():
+            for k, v in model.state_dict().items():
+                if v.is_floating_point():
+                    ema_state[k].mul_(ema_decay).add_(v, alpha=1.0 - ema_decay)
     
     # ═══ Mixed Precision ═══
     use_amp = device.type == 'cuda'
@@ -430,6 +460,7 @@ def train(args):
     scaler = torch.amp.GradScaler('cuda', enabled=(use_amp and amp_dtype == torch.float16))
     
     best_loss = float('inf')
+    patience_counter = 0
     training_start = time.time()
     
     # ═══ Баннер ═══
@@ -458,8 +489,11 @@ def train(args):
             batch_tgt = batch_tgt.to(device, non_blocking=True)
             
             with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
-                logits = model(batch_in, labels=None)
-                loss = F.cross_entropy(logits.transpose(1, 2), batch_tgt)
+                logits = model(batch_in)
+                loss = F.cross_entropy(
+                    logits.transpose(1, 2), batch_tgt,
+                    label_smoothing=args.label_smoothing,
+                )
                 loss = loss / accum_steps
             
             scaler.scale(loss).backward()
@@ -471,6 +505,7 @@ def train(args):
                 scaler.update()
                 optimizer.zero_grad()
                 scheduler.step()
+                update_ema()
             
             total_train_loss += loss.item() * accum_steps
             n_batches += 1
@@ -492,7 +527,7 @@ def train(args):
                 test_in = test_in.to(device, non_blocking=True)
                 test_tgt = test_tgt.to(device, non_blocking=True)
                 with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
-                    logits = model(test_in, labels=None)
+                    logits = model(test_in)
                     el = F.cross_entropy(logits.transpose(1, 2), test_tgt).item()
                 eval_losses.append(el)
             eval_loss = np.mean(eval_losses)
@@ -523,17 +558,28 @@ def train(args):
         # ═══ Сохранение ═══
         if eval_loss < best_loss:
             best_loss = eval_loss
+            patience_counter = 0
             os.makedirs(weights_path.parent, exist_ok=True)
+            # Сохраняем EMA веса (более стабильные для inference)
             torch.save({
-                'model_state_dict': model.state_dict(),
+                'model_state_dict': ema_state,
+                'model_state_dict_raw': model.state_dict(),
                 'dim': args.dim,
                 'num_tokens': 256,
                 'num_layers': args.layers,
                 'context_dim': args.context_dim,
+                'dropout': args.dropout,
                 'epoch': epoch,
                 'eval_loss': eval_loss,
                 'train_loss': avg_train_loss,
             }, str(weights_path))
+        else:
+            patience_counter += 1
+        
+        # ═══ Early Stopping ═══
+        if args.patience > 0 and patience_counter >= args.patience:
+            print(f"\n  ⏹ Early stopping: {args.patience} эпох без улучшения (best={best_loss:.4f})")
+            break
         
         if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
             cp_path = weights_path.parent / f"mingru_checkpoint_epoch{epoch+1}.pt"
@@ -543,6 +589,7 @@ def train(args):
                 'num_tokens': 256,
                 'num_layers': args.layers,
                 'context_dim': args.context_dim,
+                'dropout': args.dropout,
                 'epoch': epoch,
                 'eval_loss': eval_loss,
             }, str(cp_path))
