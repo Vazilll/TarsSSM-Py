@@ -86,7 +86,14 @@ def banner(phase: int, title: str, total: int = 10):
 
 def run(cmd: list, cwd=None, retries=3, check=True) -> bool:
     """Запускает команду с retry логикой (Windows Defender / launcher bugs)."""
-    cmd_str = " ".join(str(c) for c in cmd)
+    cmd = [str(c) for c in cmd]
+    
+    # Вставляем -u после python для unbuffered output
+    if len(cmd) >= 2 and ('python' in cmd[0].lower() or cmd[0] == PYTHON):
+        if '-u' not in cmd:
+            cmd.insert(1, '-u')
+    
+    cmd_str = " ".join(cmd)
     logger.info(f"▶ {cmd_str}")
     sys.stdout.flush()
     sys.stderr.flush()
@@ -98,7 +105,7 @@ def run(cmd: list, cwd=None, retries=3, check=True) -> bool:
     for attempt in range(retries):
         try:
             result = subprocess.run(
-                [str(c) for c in cmd],
+                cmd,
                 cwd=str(cwd or ROOT),
                 timeout=43200,  # 12 часов макс
                 env=env,
