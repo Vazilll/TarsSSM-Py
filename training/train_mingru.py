@@ -70,6 +70,36 @@ def parse_args():
 
 
 # ═══════════════════════════════════════════
+# GPU-адаптивные лимиты данных
+# ═══════════════════════════════════════════
+
+def _get_gpu_data_limits():
+    """
+    Возвращает (max_augment_mb, max_samples) по GPU.
+    
+    T4  (15 GB VRAM, ~12 GB RAM) → 50 MB augment, 200K samples
+    L4  (24 GB VRAM, ~25 GB RAM) → 150 MB augment, 500K samples
+    A100 (40+ GB,    ~80 GB RAM) → 400 MB augment, без лимита
+    CPU / unknown                → 30 MB augment, 100K samples
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            if vram_gb >= 35:   # A100 / H100
+                return 400, 0  # 0 = без лимита samples
+            elif vram_gb >= 20: # L4 / RTX 4090
+                return 150, 500_000
+            elif vram_gb >= 14: # T4
+                return 50, 200_000
+            else:               # маленький GPU
+                return 30, 100_000
+    except Exception:
+        pass
+    return 30, 100_000  # CPU fallback
+
+
+# ═══════════════════════════════════════════
 # Подготовка данных
 # ═══════════════════════════════════════════
 
@@ -100,25 +130,48 @@ def prepare_data(text: str, seq_length: int, max_samples: int = 0):
 
 
 def augment_with_huggingface():
-    """Загружает дополнительный русский текст — сначала из кэша, потом с HuggingFace."""
+    """Загружает дополнительный русский текст — сначала из кэша, потом с HuggingFace.
+    
+    Лимит данных определяется автоматически по GPU:
+      T4 (15GB):  50 MB   — 455MB убивает RAM
+      L4 (24GB):  150 MB  — больше данных, лучше качество
+      A100 (40GB): 400 MB — почти всё
+    """
+    MAX_AUGMENT_MB, _ = _get_gpu_data_limits()
+    MAX_AUGMENT_BYTES = MAX_AUGMENT_MB * 1024 * 1024
     
     hf_dir = ROOT / "data"
     cached_texts = []
+    total_bytes = 0
     if hf_dir.exists():
         for hf_file in sorted(hf_dir.glob("hf_*.txt")):
             try:
                 with open(hf_file, 'r', encoding='utf-8') as f:
                     text = f.read()
                 if len(text) > 1000:
+                    text_bytes = len(text.encode('cp1251', errors='replace'))
+                    # Проверяем лимит — MinGRU не нужно 455MB
+                    if total_bytes + text_bytes > MAX_AUGMENT_BYTES:
+                        # Обрезаем последний файл до остатка
+                        remaining = MAX_AUGMENT_BYTES - total_bytes
+                        if remaining > 10000:
+                            text = text[:remaining]
+                            cached_texts.append(text)
+                            total_bytes += remaining
+                            print(f"[Augment] Кэш: {hf_file.name} ({remaining // 1024} KB, обрезан)")
+                        print(f"[Augment] ⚠ Лимит {MAX_AUGMENT_MB} MB достигнут (MinGRU — System 1)")
+                        break
                     cached_texts.append(text)
-                    size_kb = len(text.encode('cp1251', errors='replace')) / 1024
+                    total_bytes += text_bytes
+                    size_kb = text_bytes / 1024
                     print(f"[Augment] Кэш: {hf_file.name} ({size_kb:.0f} KB)")
             except Exception:
                 pass
     
     if cached_texts:
         result = "\n\n".join(cached_texts)
-        print(f"[Augment] Итого из кэша: {len(result):,} символов")
+        result_mb = len(result.encode('cp1251', errors='replace')) / (1024 * 1024)
+        print(f"[Augment] Итого из кэша: {len(result):,} символов ({result_mb:.1f} MB)")
         return result
     
     try:
@@ -249,10 +302,20 @@ def train(args):
         corpus = ("\n\n" + corpus) * repeat
         print(f"[Data] Корпус повторён {repeat}x для стабильности")
     
-    print(f"[Data] Итоговый корпус: {len(corpus)} символов, {corpus_bytes} байт")
+    corpus_mb = corpus_bytes / (1024 * 1024)
+    print(f"[Data] Итоговый корпус: {len(corpus)} символов, {corpus_mb:.1f} MB")
+    
+    # ═══ RAM Safety: авто-лимит по GPU ═══
+    # T4: 200K samples, L4: 500K, A100: без лимита
+    _, gpu_max_samples = _get_gpu_data_limits()
+    max_samples = args.max_samples
+    if max_samples == 0 and gpu_max_samples > 0 and corpus_mb > 60:
+        max_samples = gpu_max_samples
+        print(f"[Data] ⚠ GPU авто-лимит: {max_samples:,} samples (корпус {corpus_mb:.0f} MB)")
+        print(f"[Data]   MinGRU System 1 — полный корпус обрабатывает Mamba-2")
     
     # ═══ Подготовка тензоров ═══
-    inputs, targets = prepare_data(corpus, args.seq_len, max_samples=args.max_samples)
+    inputs, targets = prepare_data(corpus, args.seq_len, max_samples=max_samples)
     print(f"[Data] Создано {len(inputs)} обучающих примеров (seq_len={args.seq_len})")
     
     # Освобождаем корпус из RAM

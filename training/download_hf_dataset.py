@@ -235,7 +235,7 @@ def format_row(row: dict, fmt: str) -> str:
     
     # Формат ShareGPT / Conversations
     if fmt == "sharegpt":
-        convs = row.get("conversations", row.get("messages", []))
+        convs = row.get("conversations", row.get("messages", row.get("conversation", [])))
         if not convs:
             return ""
         dialog = []
@@ -249,7 +249,7 @@ def format_row(row: dict, fmt: str) -> str:
     
     # Формат Chat (system/user/assistant messages)
     if fmt == "chat":
-        messages = row.get("messages", row.get("conversations", []))
+        messages = row.get("messages", row.get("conversations", row.get("conversation", [])))
         if not messages:
             if "chat" in row and isinstance(row["chat"], str):
                 system_prompt = row.get("system", "").strip()

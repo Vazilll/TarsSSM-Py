@@ -286,14 +286,52 @@ def clean_wiki_text(text: str) -> str:
     return text.strip()
 
 
+def _save_corpus(articles: list, output_path: str):
+    """Сохраняет текущий корпус на диск (инкрементально)."""
+    corpus = "\n\n".join(articles)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(corpus)
+    return corpus
+
+
+def _load_existing_corpus(output_path: str):
+    """
+    Загружает уже скачанные статьи из файла.
+    Возвращает (articles_list, titles_set).
+    """
+    if not os.path.exists(output_path):
+        return [], set()
+    
+    size = os.path.getsize(output_path)
+    if size < 1000:
+        return [], set()
+    
+    with open(output_path, 'r', encoding='utf-8') as f:
+        text = f.read()
+    
+    # Разделяем по двойному переносу (формат сохранения)
+    articles = [a.strip() for a in text.split("\n\n") if len(a.strip()) > 100]
+    
+    # Извлекаем "заголовки" — первые 50 символов каждой статьи для дедупликации
+    titles = set()
+    for a in articles:
+        first_line = a.split("\n")[0][:80]
+        titles.add(first_line)
+    
+    return articles, titles
+
+
 def download_corpus(count: int = 100000, output_path: str = None) -> str:
     """
-    Скачивает МАССИВНЫЙ корпус статей.
+    Скачивает МАССИВНЫЙ корпус статей с инкрементальным сохранением.
     
     Стратегия:
       1. Seed topics (300+ гарантированно качественных статей)
       2. Link crawl (ссылки из seed → ещё 2000+ статей)
       3. Random fill (случайные статьи до нужного count)
+    
+    Сохранение каждые 1000 статей → не теряется при Disconnect!
+    При повторном запуске продолжает с того места где остановился.
     
     Args:
         count: Количество статей (default: 5000)
@@ -305,39 +343,61 @@ def download_corpus(count: int = 100000, output_path: str = None) -> str:
     if output_path is None:
         output_path = str(ROOT / "data" / "wiki_ru.txt")
     
-    # Проверяем кеш
-    if os.path.exists(output_path):
-        size = os.path.getsize(output_path)
-        if size > 1_000_000:  # > 1MB = уже скачано
-            print(f"[Wiki] ✓ Корпус уже существует: {output_path} ({size / 1024 / 1024:.1f} MB)")
-            with open(output_path, 'r', encoding='utf-8') as f:
-                return f.read()
-    
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     
+    SAVE_EVERY = 1000  # Сохранять каждые 1000 статей
+    
+    # ═══ Загрузка существующего прогресса ═══
+    articles, titles_done = _load_existing_corpus(output_path)
+    
+    if len(articles) >= count:
+        size_mb = os.path.getsize(output_path) / (1024 * 1024)
+        print(f"[Wiki] ✓ Корпус уже полон: {len(articles)} статей ({size_mb:.1f} MB)")
+        print(f"[Wiki]   Файл: {output_path}")
+        with open(output_path, 'r', encoding='utf-8') as f:
+            return f.read()
+    
+    if articles:
+        print(f"[Wiki] ♻ Продолжаю с {len(articles)} уже скачанных статей ({len(titles_done)} уникальных)")
+    
+    last_saved_count = len(articles)
+    
     print(f"[Wiki] ═══ Скачиваю {count} статей из русской Википедии ═══")
+    print(f"[Wiki] 💾 Автосохранение каждые {SAVE_EVERY} статей → не потеряется при Disconnect")
     print(f"[Wiki] Это может занять 10-30 минут. Результат будет кеширован.")
-    articles = []
-    titles_done = set()
     
     # ═══════════════════════════════════════
     # Фаза 1: Seed topics (300+ статей)
     # ═══════════════════════════════════════
-    print(f"\n[Wiki] Фаза 1/3: {len(SEED_TOPICS)} ключевых статей...")
+    # Пропускаем уже скачанные seed-статьи
+    seeds_to_fetch = [t for t in SEED_TOPICS if t not in titles_done]
     
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {pool.submit(fetch_wiki_article, t): t for t in SEED_TOPICS}
-        done = 0
-        for future in as_completed(futures):
-            title, text = future.result()
-            done += 1
-            if text and len(text) > 100:
-                articles.append(text)
-                titles_done.add(title)
-            if done % 50 == 0:
-                print(f"  [{done}/{len(SEED_TOPICS)}] → {len(articles)} статей")
-    
-    print(f"  Фаза 1 завершена: {len(articles)} статей")
+    if seeds_to_fetch:
+        print(f"\n[Wiki] Фаза 1/3: {len(seeds_to_fetch)} ключевых статей...")
+        
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(fetch_wiki_article, t): t for t in seeds_to_fetch}
+            done = 0
+            for future in as_completed(futures):
+                title, text = future.result()
+                done += 1
+                if text and len(text) > 100:
+                    articles.append(text)
+                    titles_done.add(title)
+                    # Инкрементальное сохранение
+                    if len(articles) - last_saved_count >= SAVE_EVERY:
+                        _save_corpus(articles, output_path)
+                        last_saved_count = len(articles)
+                        print(f"  💾 Сохранено: {len(articles)} статей")
+                if done % 50 == 0:
+                    print(f"  [{done}/{len(seeds_to_fetch)}] → {len(articles)} статей")
+        
+        print(f"  Фаза 1 завершена: {len(articles)} статей")
+        # Сохраняем после фазы
+        _save_corpus(articles, output_path)
+        last_saved_count = len(articles)
+    else:
+        print(f"\n[Wiki] Фаза 1/3: все seed-статьи уже скачаны ✓")
     
     # ═══════════════════════════════════════
     # Фаза 2: Link crawl (из seed статей)
@@ -347,7 +407,7 @@ def download_corpus(count: int = 100000, output_path: str = None) -> str:
         print(f"\n[Wiki] Фаза 2/3: обход ссылок (нужно ещё {remaining})...")
         
         # Собираем ссылки из seed-статей
-        crawl_seeds = list(SEED_TOPICS[:100])  # Берём первые 100 для crawl
+        crawl_seeds = list(SEED_TOPICS[:100])
         all_linked = []
         
         with ThreadPoolExecutor(max_workers=8) as pool:
@@ -360,7 +420,6 @@ def download_corpus(count: int = 100000, output_path: str = None) -> str:
         
         print(f"  Найдено {len(all_linked)} связанных статей, скачиваю...")
         
-        # Скачиваем связанные статьи
         batch_size = min(len(all_linked), remaining + 500)
         to_fetch = all_linked[:batch_size]
         
@@ -373,12 +432,19 @@ def download_corpus(count: int = 100000, output_path: str = None) -> str:
                 if text and len(text) > 300 and title not in titles_done:
                     articles.append(text)
                     titles_done.add(title)
+                    # Инкрементальное сохранение
+                    if len(articles) - last_saved_count >= SAVE_EVERY:
+                        _save_corpus(articles, output_path)
+                        last_saved_count = len(articles)
+                        print(f"  💾 Сохранено: {len(articles)} статей")
                 if done % 100 == 0:
                     print(f"  [{done}/{len(to_fetch)}] → {len(articles)} статей")
                 if len(articles) >= count:
                     break
         
         print(f"  Фаза 2 завершена: {len(articles)} статей")
+        _save_corpus(articles, output_path)
+        last_saved_count = len(articles)
     
     # ═══════════════════════════════════════
     # Фаза 3: Random fill (оставшиеся)
@@ -404,6 +470,11 @@ def download_corpus(count: int = 100000, output_path: str = None) -> str:
                     if text and len(text) > 300 and title not in titles_done:
                         articles.append(text)
                         titles_done.add(title)
+                        # Инкрементальное сохранение
+                        if len(articles) - last_saved_count >= SAVE_EVERY:
+                            _save_corpus(articles, output_path)
+                            last_saved_count = len(articles)
+                            print(f"  💾 Сохранено: {len(articles)} статей")
                     if len(articles) >= count:
                         break
             
@@ -412,18 +483,16 @@ def download_corpus(count: int = 100000, output_path: str = None) -> str:
         print(f"  Фаза 3 завершена: {len(articles)} статей")
     
     # ═══════════════════════════════════════
-    # Сохранение
+    # Финальное сохранение
     # ═══════════════════════════════════════
-    corpus = "\n\n".join(articles)
-    
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write(corpus)
+    corpus = _save_corpus(articles, output_path)
     
     size_mb = len(corpus.encode('utf-8')) / (1024 * 1024)
     print(f"\n[Wiki] ═══ Готово ═══")
     print(f"  Статей:  {len(articles)}")
     print(f"  Размер:  {size_mb:.1f} MB")
     print(f"  Файл:    {output_path}")
+    print(f"  💾 Данные сохранены на диск — не потеряются при Disconnect!")
     
     return corpus
 
