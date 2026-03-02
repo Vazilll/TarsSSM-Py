@@ -19,7 +19,12 @@ class LeannIndex:
     def __init__(self, model_path='models/embeddings', index_path=None):
         self.logger = logging.getLogger("Tars.LEANN")
         if index_path is None:
-            index_path = str(_LEANN_ROOT / "memory" / "leann.index")
+            # На Colab → сохраняем прямо на Drive (symlink для npz не работает)
+            drive_idx = _LEANN_ROOT / ".." / "drive" / "MyDrive" / "TarsMemory" / "leann.index"
+            if drive_idx.parent.exists():
+                index_path = str(drive_idx.resolve())
+            else:
+                index_path = str(_LEANN_ROOT / "memory" / "leann.index")
         self.index_path = index_path
         self.texts = []
         self.embeddings = None  # numpy array (int8) или None

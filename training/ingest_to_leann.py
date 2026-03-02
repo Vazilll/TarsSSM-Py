@@ -217,7 +217,12 @@ def ingest_file(file_path: str, index_path: str = None,
     Returns: (texts, embeddings) — обновлённые
     """
     if index_path is None:
-        index_path = str(ROOT / "memory" / "leann.index")
+        # На Colab → сохраняем прямо на Drive
+        drive_idx = ROOT / ".." / "drive" / "MyDrive" / "TarsMemory" / "leann.index"
+        if drive_idx.parent.exists():
+            index_path = str(drive_idx.resolve())
+        else:
+            index_path = str(ROOT / "memory" / "leann.index")
     
     if not os.path.exists(file_path):
         logger.error(f"❌ Файл не найден: {file_path}")
@@ -304,7 +309,12 @@ def ingest_all(data_dir: str = None, index_path: str = None,
     if data_dir is None:
         data_dir = str(ROOT / "data")
     if index_path is None:
-        index_path = str(ROOT / "memory" / "leann.index")
+        # На Colab → сохраняем прямо на Drive
+        drive_idx = ROOT / ".." / "drive" / "MyDrive" / "TarsMemory" / "leann.index"
+        if drive_idx.parent.exists():
+            index_path = str(drive_idx.resolve())
+        else:
+            index_path = str(ROOT / "memory" / "leann.index")
     
     if not os.path.exists(data_dir):
         logger.error(f"❌ Директория не найдена: {data_dir}")
