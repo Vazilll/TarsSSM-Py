@@ -185,7 +185,7 @@ if not leann_index.exists():
 
 configs = {
     "a100": {"batch": 32, "accum": 1, "amp": "bf16",  "time": "30-45 мин"},
-    "l4":   {"batch": 24, "accum": 1, "amp": "bf16",  "time": "45-60 мин"},
+    "l4":   {"batch": 48, "accum": 2, "amp": "bf16",  "time": "30-50 мин"},
     "t4":   {"batch": 16, "accum": 2, "amp": "fp16",  "time": "1-2 часа"},
     "small":{"batch": 8,  "accum": 4, "amp": "fp16",  "time": "2-4 часа"},
 }

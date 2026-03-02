@@ -797,10 +797,10 @@ def phase_4_mamba2(device: str, resume: bool = False, quick: bool = False, max_m
             bf16_capable = True
             logger.info("  🔥 A100/H100 detected → batch=32, bf16, max speed")
         elif vram_m >= 20:
-            # L4 (24GB) / RTX 3090/4090
-            med_batch, med_accum = "24", "1"
+            # L4 (24GB) / RTX 3090/4090 — максимальная утилизация
+            med_batch, med_accum = "48", "2"
             bf16_capable = True
-            logger.info("  ⚡ L4/RTX detected → batch=24, bf16")
+            logger.info("  ⚡ L4/RTX detected → batch=48, accum=2, bf16 (effective=96)")
         elif vram_m >= 14:
             # T4 (15GB) — стандарт
             med_batch, med_accum = "16", "2"

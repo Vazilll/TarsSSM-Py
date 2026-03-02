@@ -78,7 +78,7 @@ def _get_gpu_data_limits():
     Возвращает (max_augment_mb, max_samples) по GPU.
     
     T4  (15 GB VRAM, ~12 GB RAM) → 50 MB augment, 200K samples
-    L4  (24 GB VRAM, ~25 GB RAM) → 150 MB augment, 500K samples
+    L4  (24 GB VRAM, ~53 GB RAM) → 300 MB augment, 1M samples
     A100 (40+ GB,    ~80 GB RAM) → 400 MB augment, без лимита
     CPU / unknown                → 30 MB augment, 100K samples
     """
@@ -88,8 +88,8 @@ def _get_gpu_data_limits():
             vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
             if vram_gb >= 35:   # A100 / H100
                 return 400, 0  # 0 = без лимита samples
-            elif vram_gb >= 20: # L4 / RTX 4090
-                return 150, 500_000
+            elif vram_gb >= 20: # L4 / RTX 4090 (53 GB RAM на Colab)
+                return 400, 0  # 0 = без лимита (RAM позволяет)
             elif vram_gb >= 14: # T4
                 return 50, 200_000
             else:               # маленький GPU
@@ -134,7 +134,7 @@ def augment_with_huggingface():
     
     Лимит данных определяется автоматически по GPU:
       T4 (15GB):  50 MB   — 455MB убивает RAM
-      L4 (24GB):  150 MB  — больше данных, лучше качество
+      L4 (24GB):  400 MB  — максимум данных (53 GB RAM)
       A100 (40GB): 400 MB — почти всё
     """
     MAX_AUGMENT_MB, _ = _get_gpu_data_limits()
@@ -237,7 +237,7 @@ def load_tars_memories():
 def _find_max_batch(model, device, seq_len):
     """Бинарный поиск максимального батча, влезающего в VRAM."""
     model.eval()
-    lo, hi = 32, 4096
+    lo, hi = 32, 8192
     best = 32
     while lo <= hi:
         mid = (lo + hi) // 2
