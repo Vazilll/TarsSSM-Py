@@ -112,13 +112,11 @@ if IS_COLAB:
                     f.unlink()
         
         # Создаём symlink: memory/leann.npz → Drive/TarsMemory/leann.npz
+        # НЕ создаём пустые файлы! LEANN сам создаст при первом save()
         for leann_file in ("leann.npz", "leann.texts.json"):
             local_f = local_memory / leann_file
             drive_f = DRIVE_MEMORY / leann_file
             if not local_f.exists() and not local_f.is_symlink():
-                # Создаём пустой файл на Drive если ещё нет
-                if not drive_f.exists():
-                    drive_f.touch()
                 local_f.symlink_to(drive_f)
         
         print(f"  ☁️  Google Drive подключён")
