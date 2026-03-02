@@ -88,6 +88,12 @@ def run(cmd: list, cwd=None, retries=3, check=True) -> bool:
     """Запускает команду с retry логикой (Windows Defender / launcher bugs)."""
     cmd_str = " ".join(str(c) for c in cmd)
     logger.info(f"▶ {cmd_str}")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    
+    # PYTHONUNBUFFERED=1 → вывод подпроцесса виден в Colab в реальном времени
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
     
     for attempt in range(retries):
         try:
@@ -95,6 +101,7 @@ def run(cmd: list, cwd=None, retries=3, check=True) -> bool:
                 [str(c) for c in cmd],
                 cwd=str(cwd or ROOT),
                 timeout=43200,  # 12 часов макс
+                env=env,
             )
             if result.returncode == 0:
                 return True
