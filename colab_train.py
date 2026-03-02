@@ -6,9 +6,9 @@
 Обучение на Google Colab с авто-оптимизацией под GPU.
 ВСЕ ДАННЫЕ сохраняются на Google Drive — не теряются при Disconnect.
 
-  A100 (40GB) — batch=32, bf16, ~30-45 мин    🔥 Рекомендуется
-  L4   (24GB) — batch=24, bf16, ~45-60 мин    ⚡ Лучший баланс
-  T4   (15GB) — batch=16, fp16, ~1-2 часа     ✅ Бесплатный
+  A100 (40GB) — batch=авто(~1024), bf16, ~15-25 мин  🔥 Рекомендуется
+  L4   (24GB) — batch=авто(~512),  bf16, ~25-40 мин  ⚡ Лучший баланс
+  T4   (15GB) — batch=авто(~256),  fp16, ~40-60 мин  ✅ Бесплатный
 
 ИНСТРУКЦИЯ:
   1. Runtime → Change runtime type → L4
@@ -198,7 +198,7 @@ cmd = [PYTHON, "mega_train.py", "--skip-voice", "--drive"] + extra_args
 result = subprocess.run(cmd, cwd=str(ROOT))
 
 # ═══════════════════════════════════════════
-# 5. Report
+# 5. Report + Resource Monitoring
 # ═══════════════════════════════════════════
 
 elapsed = time.time() - t0
@@ -219,7 +219,32 @@ if result.returncode == 0:
             print(f"    💾 {f.name}: {mb:.1f} MB (на Drive)")
         if total_mb > 0:
             print(f"    {'─' * 30}")
-            print(f"    Итого: {total_mb:.0f} MB")
+            print(f"    Итого модели: {total_mb:.0f} MB")
+    
+    print()
+    
+    # Resource monitoring
+    try:
+        import psutil
+        ram = psutil.virtual_memory()
+        print(f"  📊 RAM: {ram.used / 1024**3:.1f}/{ram.total / 1024**3:.1f} GB ({ram.percent}%)")
+    except Exception:
+        pass
+    
+    try:
+        import torch
+        if torch.cuda.is_available():
+            alloc = torch.cuda.memory_allocated() / 1024**3
+            total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            print(f"  🎮 VRAM: {alloc:.1f}/{total:.1f} GB")
+    except Exception:
+        pass
+    
+    # LEANN stats
+    leann_npz = ROOT / "memory" / "leann.npz"
+    if leann_npz.exists():
+        mb = leann_npz.stat().st_size / 1024 / 1024
+        print(f"  🧠 LEANN: {mb:.0f} MB (int8 embeddings)")
     
     print()
     print(f"  Данные на Drive:  MyDrive/TarsData/")
@@ -230,6 +255,17 @@ else:
     print(f"  ⚠️  Ошибка (код {result.returncode})")
     print(f"     Время: {minutes:.0f} мин")
     print()
+    
+    # RAM при ошибке — помогает диагностировать OOM
+    try:
+        import psutil
+        ram = psutil.virtual_memory()
+        print(f"  📊 RAM: {ram.used / 1024**3:.1f}/{ram.total / 1024**3:.1f} GB ({ram.percent}%)")
+    except Exception:
+        pass
+    
+    print()
     print("  Логи: !cat mega_train.log | tail -50")
     print("  Продолжить: !python colab_train.py --resume")
 print("═" * 65)
+

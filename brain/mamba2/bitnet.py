@@ -118,6 +118,37 @@ class STEActivationQuant(torch.autograd.Function):
 
 
 # ═══════════════════════════════════════════════════════════════
+#  ActivationQuantizer — int8 квантизация между блоками/слоями
+# ═══════════════════════════════════════════════════════════════
+
+class ActivationQuantizer(nn.Module):
+    """
+    Int8 квантизация активаций между блоками TARS.
+    
+    Назначение: уменьшает memory bandwidth в 4x между слоями.
+    Работает прозрачно — при обучении через STE, при инференсе напрямую.
+    
+    Использование:
+        self.act_quant = ActivationQuantizer()
+        x = self.act_quant(x)  # x остаётся float, но пропущен через int8
+    """
+    def __init__(self, enabled: bool = True):
+        super().__init__()
+        self.enabled = enabled
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.enabled:
+            return x
+        if self.training:
+            return STEActivationQuant.apply(x)
+        x_q, scale = _activation_quant_int8(x)
+        return x_q * scale
+    
+    def extra_repr(self) -> str:
+        return f"enabled={self.enabled}"
+
+
+# ═══════════════════════════════════════════════════════════════
 #  RMSNorm (нужен для BitNet — нормализация перед квантованием)
 # ═══════════════════════════════════════════════════════════════
 

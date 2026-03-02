@@ -20,8 +20,59 @@ from brain.mamba2.ssd import TarsCoreBlock
 from brain.mamba2.omega_layer import OmegaSSMLayer
 from brain.mamba2.mole_router import MoLELayer
 from brain.mamba2.novelty import NoveltyGate
-from brain.mamba2.bitnet import UniversalLinear
+from brain.mamba2.bitnet import UniversalLinear, ActivationQuantizer
 from brain.mamba2.neuromodulator import PredictiveCodingLayer
+
+
+class MemoryInjector(nn.Module):
+    """
+    Fused Memory Injection: запрос + гейт + проекция в одном модуле.
+    
+    Заменяет 4 отдельных операции (mem_query_proj, cosine_similarity,
+    mem_gate, mem_proj) одним проходом.
+    
+    Два режима:
+      - Per-block mode: каждый блок вызывает inject() самостоятельно
+      - Shared mode: model.py вызывает compute_signal() один раз,
+        оба блока в wave-паре получают готовый mem_signal
+    """
+    def __init__(self, d_model: int, mem_dim: int = 384, quant_mode: str = "fp16"):
+        super().__init__()
+        self.mem_dim = mem_dim
+        # Fused: [h_mean, memory_vec] → gate + signal за один проход
+        self.fused_proj = UniversalLinear(d_model + mem_dim, d_model, bias=False, mode=quant_mode)
+        self.gate = nn.Sequential(
+            UniversalLinear(d_model + mem_dim, 1, bias=True, mode=quant_mode),
+            nn.Sigmoid(),
+        )
+        self.quant = ActivationQuantizer(enabled=(quant_mode == "158bit"))
+    
+    def compute_signal(self, h_mean: torch.Tensor, memory_vec: torch.Tensor) -> torch.Tensor:
+        """
+        Вычислить memory signal (для shared mode в wave-parallel).
+        
+        Returns: mem_signal [B, d_model] — готовый сигнал для injection
+        """
+        memory_vec_q = self.quant(memory_vec)
+        combined = torch.cat([h_mean, memory_vec_q], dim=-1)  # [B, d_model + 384]
+        gate = self.gate(combined)                              # [B, 1]
+        signal = self.fused_proj(combined)                      # [B, d_model]
+        return gate * signal  # [B, d_model]
+    
+    def inject(self, x: torch.Tensor, memory_vec: torch.Tensor,
+               drop: nn.Dropout = None) -> Tuple[torch.Tensor, float]:
+        """
+        Per-block injection (fallback для случаев без wave-parallel).
+        
+        Returns: (x + mem_signal, gate_value)
+        """
+        h_mean = x.mean(dim=1)
+        signal = self.compute_signal(h_mean, memory_vec)
+        if drop is not None:
+            signal = drop(signal)
+        x = x + signal.unsqueeze(1)
+        gate_val = signal.abs().mean().item()
+        return x, gate_val
 
 
 class TarsBlock(nn.Module):
@@ -34,6 +85,7 @@ class TarsBlock(nn.Module):
       3. MoLE (per-block, sparse top-2) — экспертная маршрутизация
       4. NoveltyGate — пропуск бесполезных обновлений
       5. RAG injection — впрыск знаний из сжатого RWKV-состояния
+      6. Fused MemoryInjector — оптимизированный впрыск из спинного мозга
     """
     
     def __init__(
@@ -73,30 +125,21 @@ class TarsBlock(nn.Module):
         self.rag_query = UniversalLinear(d_model, d_state, bias=False, mode=quant_mode)
         self.rag_out = UniversalLinear(d_state, d_model, bias=False, mode=quant_mode)
         
-        # ═══ 6. Dynamic Memory Injection (вместо статичного 0.05) ═══
-        # Проекция h → пространство памяти для динамического запроса
-        self.mem_query_proj = UniversalLinear(d_model, 384, bias=False, mode=quant_mode)
-        self.mem_proj = UniversalLinear(384, d_model, bias=False, mode=quant_mode)
-        # Обучаемый гейт: насколько сильно слой использует память
-        self.mem_gate = nn.Sequential(
-            nn.Linear(d_model + 384, 1),
-            nn.Sigmoid(),
-        )
+        # ═══ 6. Fused Memory Injection (оптимизировано: 4 ops → 1) ═══
+        self.mem_injector = MemoryInjector(d_model, mem_dim=384, quant_mode=quant_mode)
         
-        # ═══ 7. Dropout (регуляризация против overfitting) ═══
-        # Применяется в 3 точках: после core, после MoLE, после memory injection.
-        # Стандартный 0.1 для SSM-моделей. При eval автоматически отключается.
+        # ═══ 7. Dropout ═══
         self.drop = nn.Dropout(dropout)
         
         # ═══ 8. Predictive Coding (Rao & Ballard, 1999) ═══
-        # Каждый слой коры предсказывает вход следующего слоя.
-        # Обрабатывается только precision-weighted prediction error.
-        # ~80% корковых top-down соединений → предсказание, не обработка.
         self.predictive_coding = PredictiveCodingLayer(d_model)
+        
+        # ═══ 9. BitNative int8 — квантизация активаций между блоками ═══
+        self.output_quant = ActivationQuantizer(enabled=(quant_mode == "158bit"))
         
         # Stats
         self.last_stats = {}
-        self.last_surprise = 0.0  # Для Titans feedback
+        self.last_surprise = 0.0
     
     def forward(
         self,
@@ -108,6 +151,7 @@ class TarsBlock(nn.Module):
         ssd_state: Optional[torch.Tensor] = None,
         conv_state: Optional[torch.Tensor] = None,
         x_prev_layer: Optional[torch.Tensor] = None,
+        mem_signal: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict,
                Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
@@ -115,11 +159,11 @@ class TarsBlock(nn.Module):
             x: [B, L, d_model]
             wkv_state: [B, d_state, d_state] — RWKV carry state
             x_prev: [B, 1, d_model] — last token for time-shift
-            memory_vec: [B, 384] — LEANN/RAG vector
+            memory_vec: [B, 384] — LEANN/RAG vector (per-block mode)
             rag_state: [B, d_state, d_state] — compressed knowledge
-            ssd_state: [B, nheads, headdim, d_state] — SSD recurrent state
-            conv_state: [B, conv_dim, d_conv] — conv1d rolling state
-            x_prev_layer: [B, L, d_model] — output of previous layer (для predictive coding)
+            ssd_state, conv_state: recurrent states
+            x_prev_layer: [B, L, d_model] — for predictive coding
+            mem_signal: [B, d_model] — pre-computed memory signal (wave-parallel mode)
         
         Returns:
             output, wkv_state, x_prev, stats, ssd_state, conv_state
@@ -135,13 +179,13 @@ class TarsBlock(nn.Module):
         )
         x = residual + self.drop(core_out)
         
-        # ═══ Cache h_mean once (used by RAG, NoveltyGate, Memory) ═══
+        # ═══ Cache h_mean once (used by RAG, NoveltyGate) ═══
         h_mean = x.mean(dim=1)  # [B, d_model]
         
         # ═══ RAG injection ═══
         if rag_state is not None:
-            q = self.rag_query(h_mean)                                # [B, d_state]
-            info = torch.bmm(rag_state, q.unsqueeze(-1)).squeeze(-1)  # [B, d_state]
+            q = self.rag_query(h_mean)
+            info = torch.bmm(rag_state, q.unsqueeze(-1)).squeeze(-1)
             x = x + 0.1 * self.rag_out(info).unsqueeze(1)
         
         # ═══ 2. Ω-SSM ═══
@@ -152,26 +196,25 @@ class TarsBlock(nn.Module):
         x = self.drop(x)
         
         # ═══ 4. NoveltyGate — adaptive residual ═══
-        h_old = residual.mean(dim=1)                             # [B, d_model]
-        h_new = x.mean(dim=1)                                    # [B, d_model]
-        _, novelty = self.novelty_gate(h_old, h_new)             # novelty: [B]
-        n = novelty.unsqueeze(-1).unsqueeze(-1)                  # [B, 1, 1]
+        h_old = residual.mean(dim=1)
+        h_new = x.mean(dim=1)
+        _, novelty = self.novelty_gate(h_old, h_new)
+        n = novelty.unsqueeze(-1).unsqueeze(-1)
         x = n * x + (1 - n) * residual
         
-        # ═══ 5. Dynamic Memory Injection (спинной мозг → кора) ═══
+        # ═══ 5. Memory Injection (2 режима) ═══
         mem_relevance = 0.0
-        if memory_vec is not None:
-            # Re-compute h_mean after novelty gate changed x
-            h_mean_post = x.mean(dim=1)                               # [B, d_model]
-            h_query = self.mem_query_proj(h_mean_post)                # [B, 384]
-            similarity = F.cosine_similarity(h_query, memory_vec, dim=-1)  # [B]
-            gate_input = torch.cat([h_mean_post, memory_vec], dim=-1) # [B, d_model+384]
-            gate = self.mem_gate(gate_input).squeeze(-1)              # [B]
-            mem_strength = (similarity * gate).unsqueeze(-1).unsqueeze(-1)
-            mem_signal = self.mem_proj(memory_vec).unsqueeze(1)       # [B, 1, d_model]
-            x = x + self.drop(mem_strength * mem_signal)
-            mem_relevance = similarity.mean().item()
-            self.last_surprise = gate.mean().item()
+        if mem_signal is not None:
+            # Wave-parallel mode: сигнал уже вычислен model.py
+            x = x + self.drop(mem_signal.unsqueeze(1))
+            mem_relevance = mem_signal.abs().mean().item()
+        elif memory_vec is not None:
+            # Per-block mode: fallback
+            x, self.last_surprise = self.mem_injector.inject(x, memory_vec, self.drop)
+            mem_relevance = self.last_surprise
+        
+        # ═══ 6. BitNative Int8 — квантизация выхода блока ═══
+        x = self.output_quant(x)
         
         # Stats
         self.last_stats = {

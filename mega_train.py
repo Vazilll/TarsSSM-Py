@@ -451,13 +451,15 @@ def drive_restore():
         if restored:
             logger.info(f"  📥 Из Drive: голосовые модели")
     
-    # Восстановить memory/leann.index
-    drive_leann = DRIVE_BASE / "leann.index"
-    local_leann = ROOT / "memory" / "leann.index"
-    if drive_leann.exists() and not local_leann.exists():
-        shutil.copy2(str(drive_leann), str(local_leann))
-        logger.info("  📥 Из Drive: LEANN индекс")
-        restored += 1
+    # Восстановить memory/leann.npz + leann.texts.json
+    for leann_file in ["leann.npz", "leann.texts.json"]:
+        drive_f = DRIVE_BASE / leann_file
+        local_f = ROOT / "memory" / leann_file
+        if drive_f.exists() and not local_f.exists():
+            local_f.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(drive_f), str(local_f))
+            logger.info(f"  📥 Из Drive: {leann_file}")
+            restored += 1
     
     if restored:
         logger.info(f"  ✅ Восстановлено {restored} элементов из Drive (скачивание пропущено)")
@@ -503,12 +505,13 @@ def drive_save():
         logger.info("  💾 → Drive: voice модели")
         saved += 1
     
-    # Сохранить LEANN
-    local_leann = ROOT / "memory" / "leann.index"
-    drive_leann = DRIVE_BASE / "leann.index"
-    if local_leann.exists():
-        shutil.copy2(str(local_leann), str(drive_leann))
-        saved += 1
+    # Сохранить LEANN (npz + texts)
+    for leann_file in ["leann.npz", "leann.texts.json"]:
+        local_f = ROOT / "memory" / leann_file
+        drive_f = DRIVE_BASE / leann_file
+        if local_f.exists():
+            shutil.copy2(str(local_f), str(drive_f))
+            saved += 1
     
     # НЕ сохраняем обученные модели (tars_v3) — обучение всегда с нуля
     
@@ -542,37 +545,34 @@ def phase_1_download(quick: bool = False):
                 logger.warning("  ⚠ Часть датасетов не скачана — продолжаем")
                 success = False
     
-    # 1.3 LEANN embedding model (пропуск на Colab — OOM)
-    IS_COLAB = "COLAB_GPU" in os.environ or Path("/content").exists()
-    if IS_COLAB:
-        logger.info("  🧠 LEANN + Embeddings: пропуск (Colab, экономия RAM)")
+    # 1.3 LEANN embedding model
+    emb_path = MODELS / "embeddings"
+    if emb_path.exists() and (emb_path / "config.json").exists():
+        logger.info(f"  🧠 LEANN embeddings: уже есть ({emb_path})")
     else:
-        emb_path = MODELS / "embeddings"
-        if emb_path.exists() and (emb_path / "config.json").exists():
-            logger.info(f"  🧠 LEANN embeddings: уже есть ({emb_path})")
-        else:
-            logger.info("  🧠 Скачивание модели эмбеддингов (all-MiniLM-L6-v2)...")
-            try:
-                from sentence_transformers import SentenceTransformer
-                model = SentenceTransformer('all-MiniLM-L6-v2')
-                model.save(str(emb_path))
-                logger.info(f"  ✅ Сохранена в {emb_path}")
-            except Exception as e:
-                logger.warning(f"  ⚠ Embeddings: {e}")
-        
-        # 1.4 Инициализация LEANN памяти
-        leann_index = ROOT / "memory" / "leann.index"
-        if leann_index.exists() and quick:
-            logger.info("  🧠 LEANN: индекс уже есть, пропуск (quick mode)")
-        else:
-            logger.info("  🧠 Загрузка данных в LEANN...")
-            try:
-                sys.path.insert(0, str(TRAINING))
-                from ingest_to_leann import ingest_all
-                ingest_all()
-                logger.info("  ✅ LEANN заполнена")
-            except Exception as e:
-                logger.info(f"  ℹ LEANN: {e} (не критично)")
+        logger.info("  🧠 Скачивание модели эмбеддингов (all-MiniLM-L6-v2)...")
+        try:
+            from sentence_transformers import SentenceTransformer
+            model = SentenceTransformer('all-MiniLM-L6-v2')
+            model.save(str(emb_path))
+            logger.info(f"  ✅ Сохранена в {emb_path}")
+        except Exception as e:
+            logger.warning(f"  ⚠ Embeddings: {e}")
+    
+    # 1.4 Инициализация LEANN памяти (float16 npz формат)
+    leann_npz = ROOT / "memory" / "leann.npz"
+    leann_index = ROOT / "memory" / "leann.index"
+    if (leann_npz.exists() or leann_index.exists()) and quick:
+        logger.info("  🧠 LEANN: индекс уже есть, пропуск (quick mode)")
+    else:
+        logger.info("  🧠 Загрузка данных в LEANN (float16, ~750 MB RAM)...")
+        try:
+            sys.path.insert(0, str(TRAINING))
+            from ingest_to_leann import ingest_all
+            ingest_all()
+            logger.info("  ✅ LEANN заполнена")
+        except Exception as e:
+            logger.info(f"  ℹ LEANN: {e} (не критично)")
     
     # 1.5 Голосовые модели (Whisper CTranslate2 + Piper ONNX + Silero VAD)
     if quick:
@@ -672,6 +672,7 @@ def phase_3_mingru(device: str, quick: bool = False):
     """Обучение MinGRU LM — быстрый языковой генератор."""
     banner(3, "MinGRU Language Model (System 1)")
     
+    
     if quick:
         logger.info("  ⚡ Quick mode: dim=256, layers=4, 3 эпохи")
         return run([PYTHON, TRAINING / "train_mingru.py",
@@ -688,7 +689,7 @@ def phase_3_mingru(device: str, quick: bool = False):
         "--lr", "3e-3",
         "--dim", "512",             # Полноценная размерность
         "--layers", "6",            # 6 слоёв MinGRU
-        "--batch", "32",            # Большой батч (64GB RAM)
+        "--batch", "32",            # Начальный (авто-увеличится на GPU)
         "--seq_len", "256",
         "--augment",                # + HuggingFace данные
     ])

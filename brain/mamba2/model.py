@@ -30,7 +30,7 @@ import logging
 from typing import Optional, Tuple, Any
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
-from brain.mamba2.tars_block import TarsBlock
+from brain.mamba2.tars_block import TarsBlock, MemoryInjector
 from brain.mamba2.integral_auditor import IntegralAuditor, MetaAuditor
 from brain.mamba2.matrix_pool import MatrixPool
 from brain.mamba2.novelty import NoveltyGate, HankelDetector
@@ -397,7 +397,7 @@ class TarsMamba2LM(nn.Module):
         self.global_workspace = GlobalWorkspace(d_model, n_layers)
         
         # ═══ IDME Matrix Pool (48+, бесконечное расширение) ═══
-        self.matrix_pool = MatrixPool(d_model, pool_size)
+        self.matrix_pool = MatrixPool(d_model, pool_size, quant_mode=quant_mode)
         
         # ═══ Integral Auditor ═══
         self.integral_auditor = IntegralAuditor(window=8, default_threshold=1.1)
@@ -445,7 +445,10 @@ class TarsMamba2LM(nn.Module):
         self.mem_dim = 384
         self.to_memory_space = nn.Linear(d_model, self.mem_dim, bias=False)
         self.from_memory_space = nn.Linear(self.mem_dim, d_model, bias=False)
-        self.titans_memory = None  # Set externally: model.titans_memory = TitansMemory(384)
+        self.titans_memory = None
+        
+        # ═══ Shared Memory Injector (wave-parallel: 1 lookup → 2 blocks) ═══
+        self.shared_mem_injector = MemoryInjector(d_model, mem_dim=384, quant_mode=quant_mode)
         
         # ═══ Output head ═══
         self.norm_f = nn.LayerNorm(d_model)
@@ -567,23 +570,31 @@ class TarsMamba2LM(nn.Module):
             b_left = wave_idx * 2
             b_right = wave_idx * 2 + 1
             
+            # Wave-Parallel Memory: 1 lookup → 2 блока
+            mem_signal = None
+            if c["memory_vec"] is not None:
+                h_mean = x.mean(dim=1)
+                mem_signal = self.shared_mem_injector.compute_signal(h_mean, c["memory_vec"])
+            
             x_left, c["wkv_states"][b_left], c["x_prevs"][b_left], _, \
                 c["ssd_states"][b_left], c["conv_states"][b_left] = self.blocks[b_left](
                     x, c["wkv_states"][b_left], c["x_prevs"][b_left],
-                    c["memory_vec"], None,
-                    c["ssd_states"][b_left], c["conv_states"][b_left]
+                    None, None,
+                    c["ssd_states"][b_left], c["conv_states"][b_left],
+                    None, mem_signal
                 )
             x_right, c["wkv_states"][b_right], c["x_prevs"][b_right], _, \
                 c["ssd_states"][b_right], c["conv_states"][b_right] = self.blocks[b_right](
                     x, c["wkv_states"][b_right], c["x_prevs"][b_right],
-                    c["memory_vec"], None,
-                    c["ssd_states"][b_right], c["conv_states"][b_right]
+                    None, None,
+                    c["ssd_states"][b_right], c["conv_states"][b_right],
+                    None, mem_signal
                 )
             
             # Wave Consolidation (full merge layer)
             x, _ = self.wave_consolidations[wave_idx](x_left, x_right)
             
-            # Spine: обновляем память между волнами
+            # Lazy Spine: обновление только при новизне > 5%
             if wave_idx < n_waves - 1 and hasattr(self, 'to_memory_space'):
                 try:
                     h_curr = x.mean(dim=1)
@@ -591,7 +602,11 @@ class TarsMamba2LM(nn.Module):
                     if c["memory_vec"] is None:
                         c["memory_vec"] = h_for_mem
                     else:
-                        c["memory_vec"] = 0.7 * c["memory_vec"] + 0.3 * h_for_mem
+                        novelty = 1.0 - F.cosine_similarity(
+                            c["memory_vec"], h_for_mem, dim=-1
+                        ).mean()
+                        if novelty > 0.05:
+                            c["memory_vec"] = 0.7 * c["memory_vec"] + 0.3 * h_for_mem
                 except Exception:
                     pass
         
@@ -743,32 +758,38 @@ class TarsMamba2LM(nn.Module):
             if b_right >= self.n_layers:
                 break
             
-            # 2 блока параллельно
+            # ═══ Wave-Parallel Memory: 1 lookup → 2 блока ═══
+            mem_signal = None
+            if memory_vec is not None:
+                h_mean = x.mean(dim=1)
+                mem_signal = self.shared_mem_injector.compute_signal(h_mean, memory_vec)
+            
+            # 2 блока параллельно (получают готовый mem_signal вместо memory_vec)
             if self.use_checkpointing and self.training:
                 x_left, wkv_states[b_left], x_prevs[b_left], stats_l, \
                     ssd_states[b_left], conv_states[b_left] = grad_checkpoint(
                     self.blocks[b_left], x, wkv_states[b_left],
-                    x_prevs[b_left], memory_vec, rag_state,
-                    ssd_states[b_left], conv_states[b_left],
+                    x_prevs[b_left], None, rag_state,
+                    ssd_states[b_left], conv_states[b_left], None, mem_signal,
                     use_reentrant=False
                 )
                 x_right, wkv_states[b_right], x_prevs[b_right], stats_r, \
                     ssd_states[b_right], conv_states[b_right] = grad_checkpoint(
                     self.blocks[b_right], x, wkv_states[b_right],
-                    x_prevs[b_right], memory_vec, rag_state,
-                    ssd_states[b_right], conv_states[b_right],
+                    x_prevs[b_right], None, rag_state,
+                    ssd_states[b_right], conv_states[b_right], None, mem_signal,
                     use_reentrant=False
                 )
             else:
                 x_left, wkv_states[b_left], x_prevs[b_left], stats_l, \
                     ssd_states[b_left], conv_states[b_left] = self.blocks[b_left](
-                    x, wkv_states[b_left], x_prevs[b_left], memory_vec, rag_state,
-                    ssd_states[b_left], conv_states[b_left]
+                    x, wkv_states[b_left], x_prevs[b_left], None, rag_state,
+                    ssd_states[b_left], conv_states[b_left], None, mem_signal
                 )
                 x_right, wkv_states[b_right], x_prevs[b_right], stats_r, \
                     ssd_states[b_right], conv_states[b_right] = self.blocks[b_right](
-                    x, wkv_states[b_right], x_prevs[b_right], memory_vec, rag_state,
-                    ssd_states[b_right], conv_states[b_right]
+                    x, wkv_states[b_right], x_prevs[b_right], None, rag_state,
+                    ssd_states[b_right], conv_states[b_right], None, mem_signal
                 )
             
             # Collect MoLE aux losses from both blocks
@@ -779,18 +800,16 @@ class TarsMamba2LM(nn.Module):
             # Wave Consolidation: full merge with reflex integration
             x, _ = self.wave_consolidations[wave_idx](x_left, x_right, stats_l, stats_r)
             
-            # ═══ Спинной мозг: обновление памяти между волнами (Tars.txt §2.4) ═══
-            # Без этого to_memory_space, mem_query_proj, mem_gate не получают
-            # градиенты. Каждая следующая волна должна получать обогащённый контекст.
+            # ═══ Lazy Spine: обновлять memory_vec только при реальной новизне ═══
             if wave_idx < n_waves - 1:
-                h_curr = x.mean(dim=1)  # [B, d_model]
-                h_for_mem = self.to_memory_space(h_curr)  # [B, 384]
+                h_curr = x.mean(dim=1)
+                h_for_mem = self.to_memory_space(h_curr)
                 if memory_vec is None:
-                    # Первая волна — инициализируем memory_vec из вычислений мозга
                     memory_vec = h_for_mem
                 else:
-                    # Спинной мозг: 70% старая память + 30% новые выводы (§2.4)
-                    memory_vec = 0.7 * memory_vec + 0.3 * h_for_mem
+                    novelty = 1.0 - F.cosine_similarity(memory_vec, h_for_mem, dim=-1).mean()
+                    if novelty > 0.05:
+                        memory_vec = 0.7 * memory_vec + 0.3 * h_for_mem
         
         # Handle odd number of blocks
         if self.n_layers % 2 == 1:

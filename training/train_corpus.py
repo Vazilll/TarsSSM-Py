@@ -298,12 +298,128 @@ FREE_TEXT_CORPUS = [
 ]
 
 
+# ═══════════════════════════════════════════════════════════════
+# ЧАСТЬ 3: СИСТЕМНЫЕ ЗАДАЧИ (быстрый мозг = роутер данных)
+# ═══════════════════════════════════════════════════════════════
+
+SYSTEM_TASK_CORPUS = [
+    # ─── Поиск файлов ───
+    "Вопрос: Найди файл config.json\nОтвет: [FILE_SEARCH] config.json → Ищу в директории и подпапках...",
+    "Вопрос: Где лежит модель?\nОтвет: [FILE_SEARCH] models/ → Модели в models/tars_v3/",
+    "Вопрос: Покажи файлы в data\nОтвет: [FILE_LIST] data/ → hf_*.txt, tars_memories.json",
+    "Вопрос: Найди все Python файлы\nОтвет: [FILE_SEARCH] *.py → brain/, training/, memory/",
+    "Вопрос: Где мои логи?\nОтвет: [FILE_SEARCH] *.log → mega_train.log в корне",
+    "Вопрос: Покажи последние файлы\nОтвет: [FILE_LIST] --recent → model.py, tars_block.py, leann.py",
+    "Вопрос: Открой model.py\nОтвет: [FILE_READ] brain/mamba2/model.py → Открываю...",
+    "Вопрос: Есть ли чекпоинт?\nОтвет: [FILE_SEARCH] *.pt → Ищу в models/",
+    "Вопрос: Найди readme\nОтвет: [FILE_SEARCH] README* → README.md в корне",
+    "Вопрос: Структура проекта\nОтвет: [FILE_LIST] brain/ training/ memory/ models/",
+    "Вопрос: Где данные обучения?\nОтвет: [FILE_LIST] data/ → корпус, HF кэш, воспоминания",
+    "Вопрос: Размер индекса LEANN?\nОтвет: [FILE_INFO] memory/leann.npz → Проверяю...",
+
+    # ─── Заметки и память ───
+    "Вопрос: Запомни что сервер на порту 8080\nОтвет: [MEMORY_SAVE] Сохраняю: сервер порт 8080. Записано.",
+    "Вопрос: Запомни встреча в 15:00\nОтвет: [MEMORY_SAVE] Встреча в 15:00. Добавлено.",
+    "Вопрос: Сделай заметку купить молоко\nОтвет: [NOTE_CREATE] Заметка: купить молоко. Сохранено.",
+    "Вопрос: Что я просил запомнить?\nОтвет: [MEMORY_SEARCH] Ищу ваши заметки в памяти...",
+    "Вопрос: Какие у меня заметки?\nОтвет: [MEMORY_LIST] Загружаю список заметок...",
+    "Вопрос: Удали заметку про молоко\nОтвет: [NOTE_DELETE] Удаляю: купить молоко.",
+    "Вопрос: Я говорил про сервер?\nОтвет: [MEMORY_SEARCH] Да: сервер на порту 8080.",
+    "Вопрос: Что ты знаешь о проекте?\nОтвет: [MEMORY_SEARCH] Загружаю контекст из LEANN...",
+    "Вопрос: Запомни этот код\nОтвет: [MEMORY_SAVE] Вставьте код — сохраню в память.",
+    "Вопрос: Что было в прошлом разговоре?\nОтвет: [MEMORY_SEARCH] Ищу историю в LEANN...",
+    "Вопрос: Сохрани контекст\nОтвет: [MEMORY_SAVE] Сохраняю контекст в долговременную память.",
+
+    # ─── Поиск LEANN ───
+    "Вопрос: Найди в памяти про нейросети\nОтвет: [LEANN_SEARCH] нейросети → IVF поиск...",
+    "Вопрос: Что я спрашивал про Python?\nОтвет: [LEANN_SEARCH] Python → Ищу в истории...",
+    "Вопрос: Найди в базе про SSM\nОтвет: [LEANN_SEARCH] SSM → 5 документов найдено",
+    "Вопрос: Поищи ошибки обучения\nОтвет: [LEANN_SEARCH] ошибки → Проверяю индекс...",
+    "Вопрос: Есть инфо про трансформеры?\nОтвет: [LEANN_SEARCH] трансформеры → Да, найдено",
+
+    # ─── Быстрые ответы ───
+    "Вопрос: Который час?\nОтвет: [SYSTEM_TIME] Проверяю время...",
+    "Вопрос: Какая дата?\nОтвет: [SYSTEM_TIME] Проверяю дату...",
+    "Вопрос: Сколько RAM свободно?\nОтвет: [SYSTEM_INFO] Проверяю RAM...",
+    "Вопрос: Какой GPU?\nОтвет: [SYSTEM_INFO] Проверяю GPU...",
+    "Вопрос: Статус системы\nОтвет: [SYSTEM_STATUS] MinGRU: OK. Mamba-2: OK. LEANN: OK.",
+    "Вопрос: Очисти кэш\nОтвет: [SYSTEM_CMD] cuda.empty_cache() + gc.collect(). Очищено.",
+    "Вопрос: Размер модели?\nОтвет: [SYSTEM_INFO] ~103M params, ~200MB fp16, ~13MB 1.58-bit.",
+
+    # ─── Маршрутизация ───
+    "Вопрос: Напиши эссе о физике\nОтвет: [ROUTE_DEEP] Сложная задача → Omega-SSM...",
+    "Вопрос: Проанализируй код\nОтвет: [ROUTE_DEEP] Анализ → Mamba-2...",
+    "Вопрос: Объясни теорему Гёделя\nОтвет: [ROUTE_DEEP] Сложная тема → глубокое ядро...",
+    "Вопрос: Сравни Python и Rust\nОтвет: [ROUTE_DEEP] Сравнение → Mamba-2...",
+    "Вопрос: Привет\nОтвет: [ROUTE_FAST] Привет! Готов помочь.",
+    "Вопрос: Да\nОтвет: [ROUTE_FAST] Понял. Продолжаю.",
+    "Вопрос: Два плюс два\nОтвет: [ROUTE_FAST] Четыре.",
+
+    # ─── Межслойный обмен ───
+    "Вопрос: [LAYER] Слой 3: контекст программирование\nОтвет: [SUPPLY] Python, функции, классы. dim=512.",
+    "Вопрос: [LAYER] Слой 5: memory_vec нейросеть\nОтвет: [SUPPLY] LEANN top-3: нейросети, SSM, обучение.",
+    "Вопрос: [LAYER] Spine: обновление memory_vec\nОтвет: [SUPPLY] Novelty > 5%. Update: 0.7*old + 0.3*new.",
+    "Вопрос: [LAYER] MatrixPool: выбрать 4 матрицы\nОтвет: [SUPPLY] Cosine sim → [12, 7, 31, 45].",
+    "Вопрос: [LAYER] WaveConsolidation: нормализация\nОтвет: [SUPPLY] Cross-norm. Alpha: 0.65.",
+    "Вопрос: [LAYER] MemoryInjector: mem_signal\nОтвет: [SUPPLY] Fused pass. Shape: [B, 512].",
+    "Вопрос: [LAYER] IVF: машинное обучение\nОтвет: [SUPPLY] 8/256 кластеров. Top-1: 0.89.",
+    "Вопрос: [LAYER] Рефлекс: классификация\nОтвет: [SUPPLY] greeting. Уверенность: 0.95.",
+
+    # ─── Команды ───
+    "Вопрос: Запусти train.py\nОтвет: [EXEC] python training/train_mingru.py → Запускаю...",
+    "Вопрос: Проверь GPU\nОтвет: [EXEC] nvidia-smi → Проверяю...",
+    "Вопрос: Установи torch\nОтвет: [EXEC] pip install torch → Устанавливаю...",
+
+    # ─── Контекст проекта ───
+    "Вопрос: Что такое LEANN?\nОтвет: Семантическая память. Int8 + IVF. O(√N) поиск. ~1M docs в ~1GB.",
+    "Вопрос: Как работает MatrixPool?\nОтвет: 48+ матриц. Top-k по cosine sim. Anti-loop маска.",
+    "Вопрос: Что такое спинной мозг?\nОтвет: memory_vec — lazy update при novelty > 5%. Fused injection.",
+    "Вопрос: System 1 vs System 2?\nОтвет: S1 (MinGRU): 2 шага. S2 (Mamba-2): 20+ рекурсий.",
+    "Вопрос: Hello\nОтвет: Hi! I'm TARS. How can I help?",
+    "Вопрос: Speak English\nОтвет: Sure! What do you need?",
+]
+
+
+# ═══════════════════════════════════════════════════════════════
+# ЧАСТЬ 4: ПАТТЕРНЫ МЕЖСЛОЙНОГО ОБМЕНА
+# ═══════════════════════════════════════════════════════════════
+
+INTERLAYER_CORPUS = [
+    "Межслойный протокол ТАРС: MinGRU принимает запрос и решает — обработать самому "
+    "или передать в Mamba-2. Решение за микросекунды по рефлексной таблице.",
+
+    "Формат сообщения: [LAYER_ID] [ACTION] [SHAPE] [PAYLOAD]. "
+    "MinGRU возвращает context_vec размерности d_model. "
+    "Параллельно запрашивает LEANN для контекста.",
+
+    "Memory injection через fused MemoryInjector. "
+    "mem_signal предвычисляется раз для wave-пары. Экономия 50%.",
+
+    "LEANN IVF: int8 запрос → 8 кластеров из 256 → top-5 за O(√N). "
+    "На миллионе документов 32x быстрее brute-force.",
+
+    "MatrixPool: MiniBlock = UniversalLinear + gate + norm. "
+    "Domain embeddings ортогонализированы. Recirculation приоритизирует эффективные.",
+
+    "Lazy Spine: novelty = 1 - cos_sim(old, new). "
+    "Порог 5%. Экономия ~40% обновлений.",
+
+    "Wave-Parallel: пары блоков. Один mem_signal на пару. "
+    "shared_mem_injector. Удвоение throughput.",
+]
+
+
+
 def get_training_text() -> str:
     """Собирает весь корпус в единый текст для обучения."""
     parts = []
     for dialog in DIALOG_CORPUS:
         parts.append(dialog)
+    for task in SYSTEM_TASK_CORPUS:
+        parts.append(task)
     for text in FREE_TEXT_CORPUS:
+        parts.append(text)
+    for text in INTERLAYER_CORPUS:
         parts.append(text)
     return "\n\n".join(parts)
 
@@ -312,6 +428,9 @@ if __name__ == "__main__":
     text = get_training_text()
     print(f"Размер корпуса: {len(text)} символов, {len(text.encode('utf-8'))} байт")
     print(f"Диалогов: {len(DIALOG_CORPUS)}")
+    print(f"Системных задач: {len(SYSTEM_TASK_CORPUS)}")
     print(f"Свободных текстов: {len(FREE_TEXT_CORPUS)}")
+    print(f"Межслойных паттернов: {len(INTERLAYER_CORPUS)}")
     tokens = list(text.encode('utf-8'))
     print(f"Токенов (байт): {len(tokens)}")
+

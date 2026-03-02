@@ -19,26 +19,28 @@ import torch.nn as nn
 import torch.nn.functional as F
 import logging
 from typing import List, Tuple
+from brain.mamba2.bitnet import UniversalLinear
 
 
 class MiniBlock(nn.Module):
     """
     Одна матрица из пула: mini Mamba-like block.
     
-    Легче чем полный Mamba2Block — только linear + gate + norm.
+    BitNative: UniversalLinear для int8/1.58-bit квантизации.
     Стоимость: O(d²) за один проход.
     """
     
-    def __init__(self, d_model: int = 768):
+    def __init__(self, d_model: int = 768, quant_mode: str = "fp16"):
         super().__init__()
-        self.transform = nn.Linear(d_model, d_model, bias=False)
-        self.gate = nn.Linear(d_model, d_model)
+        self.transform = UniversalLinear(d_model, d_model, bias=False, mode=quant_mode)
+        self.gate = UniversalLinear(d_model, d_model, bias=True, mode=quant_mode)
         self.norm = nn.LayerNorm(d_model)
         self.act = nn.SiLU()
         
-        # Инициализация: identity + шум (начинаем с residual)
-        nn.init.eye_(self.transform.weight)
-        self.transform.weight.data += 0.01 * torch.randn_like(self.transform.weight)
+        # Инициализация: identity + шум
+        if hasattr(self.transform, 'weight'):
+            nn.init.eye_(self.transform.weight)
+            self.transform.weight.data += 0.01 * torch.randn_like(self.transform.weight)
     
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         """h: [B, d_model] → [B, d_model]"""
@@ -56,15 +58,16 @@ class MatrixPool(nn.Module):
     Каждый запрос: used_mask обнуляется.
     """
     
-    def __init__(self, d_model: int = 768, pool_size: int = 48):
+    def __init__(self, d_model: int = 768, pool_size: int = 48, quant_mode: str = "fp16"):
         super().__init__()
         self.d_model = d_model
         self.pool_size = pool_size
+        self.quant_mode = quant_mode
         self.logger = logging.getLogger("Tars.MatrixPool")
         
-        # Пул матриц
+        # Пул матриц (BitNative: UniversalLinear)
         self.matrices = nn.ModuleList([
-            MiniBlock(d_model) for _ in range(pool_size)
+            MiniBlock(d_model, quant_mode=quant_mode) for _ in range(pool_size)
         ])
         
         # Обучаемые domain embeddings для каждой матрицы
@@ -179,7 +182,7 @@ class MatrixPool(nn.Module):
         self.logger.info(f"MatrixPool: IDME расширение +{n} матриц (итого: {self.pool_size + len(self._expanded) + n})")
         
         for _ in range(n):
-            block = MiniBlock(self.d_model).to(device)
+            block = MiniBlock(self.d_model, quant_mode=self.quant_mode).to(device)
             self._expanded.append(block)
     
     def recirculate(self, idx: int, delta_p: float):
