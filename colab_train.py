@@ -94,9 +94,37 @@ if IS_COLAB:
                 shutil.rmtree(str(local_models))
             local_models.symlink_to(DRIVE_MODELS)
         
+        # === LEANN int8 index → Drive/TarsMemory ===
+        # memory/ содержит .py код, нельзя symlink всю папку!
+        # Создаём symlink-и только для файлов данных (npz, json)
+        DRIVE_MEMORY = DRIVE_BASE / "TarsMemory"
+        DRIVE_MEMORY.mkdir(parents=True, exist_ok=True)
+        local_memory = ROOT / "memory"
+        local_memory.mkdir(exist_ok=True)
+        
+        # Переносим существующие LEANN данные на Drive
+        for ext in ("*.npz", "*.json", "*.index"):
+            for f in local_memory.glob(ext):
+                dest = DRIVE_MEMORY / f.name
+                if not dest.exists():
+                    shutil.move(str(f), str(dest))
+                elif f.exists() and not f.is_symlink():
+                    f.unlink()
+        
+        # Создаём symlink: memory/leann.npz → Drive/TarsMemory/leann.npz
+        for leann_file in ("leann.npz", "leann.texts.json"):
+            local_f = local_memory / leann_file
+            drive_f = DRIVE_MEMORY / leann_file
+            if not local_f.exists() and not local_f.is_symlink():
+                # Создаём пустой файл на Drive если ещё нет
+                if not drive_f.exists():
+                    drive_f.touch()
+                local_f.symlink_to(drive_f)
+        
         print(f"  ☁️  Google Drive подключён")
         print(f"     data/   → {DRIVE_DATA}")
         print(f"     models/ → {DRIVE_MODELS}")
+        print(f"     LEANN   → {DRIVE_MEMORY}")
         
         # Показать что уже есть на Drive
         existing_data = list(DRIVE_DATA.glob("hf_*.txt"))

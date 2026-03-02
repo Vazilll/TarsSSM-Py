@@ -1,7 +1,13 @@
 import torch
 import torch.nn.functional as F
-from torch.nn import Linear, Identity, Module
+from torch.nn import Identity, Module
 from .utils import exists
+
+# UniversalLinear для 1.58-bit квантизации (fallback → nn.Linear)
+try:
+    from brain.mamba2.bitnet import UniversalLinear as _Linear
+except ImportError:
+    from torch.nn import Linear as _Linear
 
 def heinsen_associative_scan_log(log_coeffs, log_values):
     a_star = log_coeffs.cumsum(dim=1)
@@ -17,10 +23,10 @@ class MinGRU(Module):
         super().__init__()
         dim_inner = int(dim * expansion_factor)
         # Combined transformation for hidden state and gate
-        self.to_hidden = Linear(dim, dim_inner, bias=False)
-        self.to_gate = Linear(dim,dim_inner,bias=False)
+        self.to_hidden = _Linear(dim, dim_inner, bias=False)
+        self.to_gate = _Linear(dim, dim_inner, bias=False)
         # Output projection (Identity if no expansion)
-        self.to_out = Linear(dim_inner, dim, bias=False) if expansion_factor != 1. else Identity()
+        self.to_out = _Linear(dim_inner, dim, bias=False) if expansion_factor != 1. else Identity()
     
     def forward(self, x, prev_hidden=None, return_next_prev_hidden=False):
         # Split combined transformation into hidden and gate components

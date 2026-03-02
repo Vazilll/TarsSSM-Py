@@ -5,14 +5,20 @@ import torch.nn.functional as F
 from .mingru import MinGRU
 from .utils import exists, default, count_parameters
 
+# UniversalLinear для 1.58-bit квантизации (fallback → nn.Linear)
+try:
+    from brain.mamba2.bitnet import UniversalLinear as _Linear
+except ImportError:
+    from torch.nn import Linear as _Linear
+
 class FeedForward(nn.Module):
     def __init__(self, dim, mult=4):
         super().__init__()
         self.dim_inner = int(dim * mult)
         self.net = nn.Sequential(
-            nn.Linear(dim, self.dim_inner),
+            _Linear(dim, self.dim_inner),
             nn.GELU(),  
-            nn.Linear(self.dim_inner, dim)
+            _Linear(self.dim_inner, dim)
         )
 
     def forward(self, x):
@@ -55,7 +61,7 @@ class MinGRU_Layers(nn.Module):
         self.ff = FeedForward(dim)
         
         self.norm = RMSNorm(dim)
-        self.to_logits = nn.Linear(dim, num_tokens, bias=False)
+        self.to_logits = _Linear(dim, num_tokens, bias=False)
 
     def forward(self, inputs, labels=None, is_first_layer=True, prev_hiddens=None):
         if is_first_layer:
@@ -103,23 +109,41 @@ class MinGRU_LM(nn.Module):
         # Каждый слой уже имеет to_logits, но мы привязываем первый к shared_embedding
         self.layers[0].to_logits.weight = self.shared_embedding.weight
         
-        # Проекция контекста из Ω-SSM (1024-dim) → MinGRU hidden (256-dim)
-        self.context_proj = nn.Linear(context_dim, dim)
+        # ═══ QuantBridge: int8 LEANN → float32 context ═══
+        # Адаптивный мост между int8 памятью (384-dim) и MinGRU (dim)
+        try:
+            from .quant_bridge import QuantBridge
+            self.quant_bridge = QuantBridge(
+                leann_dim=384, context_dim=context_dim
+            )
+            self._has_bridge = True
+        except Exception:
+            self._has_bridge = False
+        
+        # Проекция контекста → MinGRU hidden dim
+        self.context_proj = _Linear(context_dim, dim)
 
     def forward(self, inputs, labels=None, context_vec=None):
         """
         Args:
             inputs: [B, L] token indices
             labels: [B, L] target indices (для обучения)
-            context_vec: [B, 1024] вектор из Ω-SSM/RRN для кондиционирования генерации
+            context_vec: один из вариантов:
+                - [B, 1024] float tensor (из Ω-SSM)
+                - tuple (int8_vecs, scales) из LEANN (автоматически через QuantBridge)
+                - None (без контекста)
         """
         total_loss = 0
         hidden_states = [None] * len(self.layers)
         
-        # Если есть контекст из Ω-SSM, инжектируем как начальное скрытое состояние
+        # Если контекст — raw LEANN int8, пропустить через QuantBridge
         if context_vec is not None:
+            if isinstance(context_vec, tuple) and self._has_bridge:
+                int8_vecs, scales = context_vec
+                context_vec = self.quant_bridge(int8_vecs, scales)
+            
             ctx = self.context_proj(context_vec)  # [B, dim]
-            hidden_states[0] = [ctx.unsqueeze(1)]  # [B, 1, dim] — prev_hidden для первого слоя
+            hidden_states[0] = [ctx.unsqueeze(1)]  # [B, 1, dim]
         
         current_input = inputs
 
@@ -140,4 +164,15 @@ class MinGRU_LM(nn.Module):
         if labels is not None:
             return total_loss / len(self.layers), logits
         return logits
+
+    def from_leann_memory(self, inputs, int8_vecs, scales, labels=None):
+        """
+        Удобный метод: генерация с контекстом напрямую из LEANN.
+        
+        Args:
+            inputs: [B, L] token indices
+            int8_vecs: numpy int8[B, 384] или torch int8[B, 384]
+            scales: numpy float32[B] или torch float32[B]
+        """
+        return self.forward(inputs, labels=labels, context_vec=(int8_vecs, scales))
 

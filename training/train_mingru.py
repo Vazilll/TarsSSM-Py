@@ -499,6 +499,49 @@ def train(args):
         print(f"  Peak VRAM: {peak:.1f} GB / {gpu_mem:.1f} GB ({peak/gpu_mem*100:.0f}%)")
     print(f"{'═'*70}\n")
     
+    # ═══ Квантизация 1.58-bit ═══
+    print("[Quant] Конвертация MinGRU → 1.58-bit...")
+    try:
+        from brain.mamba2.bitnet import convert_model_to_158bit, model_stats
+        
+        # Загружаем лучшие веса
+        best_ckpt = torch.load(str(weights_path), map_location='cpu', weights_only=False)
+        quant_model = MinGRU_LM(
+            dim=args.dim, num_tokens=256,
+            num_layers=args.layers, context_dim=args.context_dim
+        )
+        quant_model.load_state_dict(best_ckpt['model_state_dict'])
+        
+        fp32_mb = sum(p.numel() * p.element_size() for p in quant_model.parameters()) / 1048576
+        
+        # Конвертация всех UniversalLinear → 1.58-bit
+        convert_model_to_158bit(quant_model)
+        stats = model_stats(quant_model)
+        
+        # Сохранение
+        quant_path = weights_path.parent / "mingru_158bit.pt"
+        torch.save({
+            'model_state_dict': quant_model.state_dict(),
+            'dim': args.dim,
+            'num_tokens': 256,
+            'num_layers': args.layers,
+            'context_dim': args.context_dim,
+            'quant_mode': '158bit',
+            'eval_loss': best_loss,
+        }, str(quant_path))
+        
+        quant_mb = os.path.getsize(str(quant_path)) / 1048576
+        print(f"  ✅ Квантизировано: {stats['universal_linear_count']} слоёв")
+        print(f"  Разреженность: {stats['avg_sparsity']:.1%}")
+        print(f"  Размер: {fp32_mb:.1f} MB → {quant_mb:.1f} MB ({fp32_mb/max(quant_mb, 0.1):.1f}x сжатие)")
+        print(f"  Файл: {quant_path}")
+        
+        del quant_model
+        gc.collect()
+    except Exception as e:
+        print(f"  ⚠ Квантизация пропущена: {e}")
+        print(f"    (Модель сохранена в fp32: {weights_path})")
+    
     # ═══ Финальная демонстрация ═══
     print("Финальные примеры генерации:\n")
     test_prompts = [
