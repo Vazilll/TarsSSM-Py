@@ -351,9 +351,12 @@ def train_cot(args):
     )
     
     save_path = Path(args.save_dir) / "mamba2_omega.pt"
-    if args.resume and save_path.exists():
-        print(f"[Model] Loading: {save_path}")
-        ckpt = torch.load(str(save_path), map_location='cpu', weights_only=False)
+    # Prefer consolidated model (mamba2.pt) over raw training checkpoint
+    alt_path = Path(args.save_dir) / "mamba2.pt"
+    load_path = alt_path if alt_path.exists() else save_path
+    if args.resume and load_path.exists():
+        print(f"[Model] Loading: {load_path}")
+        ckpt = torch.load(str(load_path), map_location='cpu', weights_only=False)
         model.load_state_dict(ckpt['model_state_dict'], strict=False)
     
     if args.grad_ckpt:

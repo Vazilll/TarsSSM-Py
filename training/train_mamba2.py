@@ -582,11 +582,13 @@ def train(args):
     print(f"{'═'*60}\n")
     
     # ═══ torch.compile (30-50% ускорение) ═══
+    # NOTE: "reduce-overhead" mode uses CUDA graphs which crash on T4/small GPUs
+    # (AssertionError in cudagraph_trees.py). Use "default" mode instead.
     compiled_model = None
     if hasattr(torch, 'compile') and not args.no_compile and device.type == 'cuda':
         try:
-            compiled_model = torch.compile(model, mode="reduce-overhead")
-            print("  ⚡ torch.compile enabled (reduce-overhead mode)")
+            compiled_model = torch.compile(model, mode="default")
+            print("  ⚡ torch.compile enabled (default mode)")
         except Exception as e:
             print(f"  ⚠ torch.compile failed: {e}")
     forward_model = compiled_model if compiled_model is not None else model

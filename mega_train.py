@@ -545,6 +545,17 @@ def phase_1_download(quick: bool = False):
                 logger.warning("  ⚠ Часть датасетов не скачана — продолжаем")
                 success = False
     
+    # 1.2 Синтетические STEM-данные (math, logic, code)
+    synth_path = DATA / "synthetic_stem.txt"
+    if synth_path.exists() and synth_path.stat().st_size > 1000:
+        logger.info(f"  🔬 Synthetic STEM: уже есть ({synth_path.stat().st_size / 1024:.0f} KB)")
+    else:
+        n_synth = 1000 if quick else 5000
+        logger.info(f"  🔬 Генерация {n_synth} синтетических STEM-задач...")
+        run([PYTHON, TRAINING / "generate_synthetic.py",
+             "--provider", "offline", "--n_samples", str(n_synth),
+             "--output", str(synth_path)], check=False)
+    
     # 1.3 LEANN embedding model
     emb_path = MODELS / "embeddings"
     if emb_path.exists() and (emb_path / "config.json").exists():
@@ -1219,6 +1230,247 @@ def phase_10_quantize_voice():
 
 
 # ═════════════════════════════════════════════════════════════════════════
+#  ФАЗА 12: CHAIN-OF-THOUGHT (пошаговые рассуждения)
+# ═════════════════════════════════════════════════════════════════════════
+
+def phase_12_cot(device: str = "cuda", quick: bool = False):
+    """CoT fine-tune: учит модель рассуждать пошагово (<think>...<answer>)."""
+    banner(12, "Chain-of-Thought Training")
+    
+    model_path = TARS_V3 / "mamba2.pt"
+    if not model_path.exists():
+        logger.warning("  ⚠ mamba2.pt не найден — пропуск CoT")
+        return False
+    
+    # Читаем config из checkpoint
+    import torch
+    ckpt = torch.load(str(model_path), map_location="cpu", weights_only=False)
+    cfg = ckpt.get("config", {})
+    d_model = cfg.get("d_model", 768)
+    n_layers = cfg.get("n_layers", 12)
+    del ckpt
+    
+    # Шаг 1: Генерация CoT данных (если нет)
+    cot_data = DATA / "cot_reasoning.txt"
+    if not cot_data.exists() or cot_data.stat().st_size < 1000:
+        n_samples = 2000 if quick else 10000
+        logger.info(f"  📝 Генерация {n_samples} CoT-задач...")
+        run([PYTHON, TRAINING / "train_cot.py",
+             "--generate", "--n_samples", str(n_samples),
+             "--cot_data", str(cot_data)])
+    
+    # Шаг 2: Fine-tune
+    args_list = [
+        PYTHON, TRAINING / "train_cot.py", "--train", "--resume",
+        "--d_model", str(d_model), "--n_layers", str(n_layers),
+        "--save_dir", str(TARS_V3),
+        "--device", device,
+    ]
+    if quick:
+        args_list += ["--epochs", "1", "--batch", "8", "--seq_len", "256"]
+    else:
+        args_list += ["--epochs", "3", "--batch", "4", "--seq_len", "512", "--bf16"]
+    
+    return run(args_list)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  ГЕНЕРАЦИЯ DPO-ПАР (chosen vs rejected)
+# ═════════════════════════════════════════════════════════════════════════
+
+def generate_dpo_pairs(output_path: Path, n_pairs: int = 500):
+    """
+    Генерирует синтетические DPO-пары из instruction dataset.
+    
+    chosen  = корректный ответ из корпуса
+    rejected = искажённая версия (обрезка, шум, неверный формат)
+    """
+    import json as _json
+    import random
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Загрузить instruction data
+    try:
+        sys.path.insert(0, str(TRAINING))
+        from train_instruct import load_instruction_dataset
+        instructions = load_instruction_dataset()
+    except Exception as e:
+        logger.warning(f"  ⚠ Не удалось загрузить instructions: {e}")
+        # Fallback: простые пары
+        instructions = [
+            "Вопрос: Кто ты?\nОтвет: Я ТАРС — нейронный ассистент.",
+            "Вопрос: Сколько будет 2+2?\nОтвет: 4",
+            "Вопрос: Что такое Python?\nОтвет: Python — это язык программирования.",
+        ] * 50
+    
+    pairs = []
+    for text in instructions[:n_pairs]:
+        text = text.strip()
+        if not text or len(text) < 20:
+            continue
+        
+        # Split into prompt + response
+        parts = text.split("\n", 1)
+        if len(parts) < 2:
+            prompt = text[:len(text)//2]
+            chosen = text[len(text)//2:]
+        else:
+            prompt = parts[0]
+            chosen = parts[1]
+        
+        # Generate rejected: corruption strategies
+        strategy = random.choice(["truncate", "noise", "generic", "repeat"])
+        if strategy == "truncate":
+            rejected = chosen[:max(5, len(chosen)//4)]
+        elif strategy == "noise":
+            chars = list(chosen)
+            for _ in range(max(1, len(chars)//5)):
+                idx = random.randint(0, len(chars)-1)
+                chars[idx] = random.choice("абвгдежзиклмнопрст !?.")
+            rejected = "".join(chars)
+        elif strategy == "generic":
+            rejected = random.choice([
+                "Не знаю.", "Ошибка.", "...",
+                "Это сложный вопрос.", "Не могу ответить.",
+            ])
+        else:  # repeat
+            rejected = prompt  # Повторение вопроса — плохой ответ
+        
+        pairs.append({"prompt": prompt, "chosen": chosen, "rejected": rejected})
+    
+    with open(output_path, 'w', encoding='utf-8') as f:
+        for p in pairs:
+            f.write(_json.dumps(p, ensure_ascii=False) + "\n")
+    
+    logger.info(f"  ✅ Сгенерировано {len(pairs)} DPO-пар → {output_path}")
+    return len(pairs)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  ФАЗА 13: DPO — Direct Preference Optimization
+# ═════════════════════════════════════════════════════════════════════════
+
+def phase_13_dpo(device: str = "cuda", quick: bool = False):
+    """DPO alignment: учит предпочитать хорошие ответы плохим."""
+    banner(13, "DPO — Direct Preference Optimization")
+    
+    model_path = TARS_V3 / "mamba2.pt"
+    if not model_path.exists():
+        logger.warning("  ⚠ mamba2.pt не найден — пропуск DPO")
+        return False
+    
+    import torch
+    ckpt = torch.load(str(model_path), map_location="cpu", weights_only=False)
+    cfg = ckpt.get("config", {})
+    d_model = cfg.get("d_model", 768)
+    n_layers = cfg.get("n_layers", 12)
+    del ckpt
+    
+    # Генерация DPO данных если нет
+    dpo_data = DATA / "dpo_pairs.jsonl"
+    if not dpo_data.exists() or dpo_data.stat().st_size < 100:
+        n_pairs = 200 if quick else 500
+        logger.info(f"  📝 Генерация {n_pairs} DPO-пар из instruction dataset...")
+        generate_dpo_pairs(dpo_data, n_pairs)
+    
+    # DPO требует 2x VRAM (policy + ref_model)
+    _, vram = gpu_info()
+    if vram > 0:
+        logger.info(f"  💾 VRAM: {vram:.1f} GB (DPO нужно ~2x модели)")
+    
+    args_list = [
+        PYTHON, TRAINING / "train_dpo.py", "--resume",
+        "--d_model", str(d_model), "--n_layers", str(n_layers),
+        "--save_dir", str(TARS_V3),
+        "--data", str(dpo_data),
+        "--device", device,
+    ]
+    if quick:
+        args_list += ["--epochs", "1", "--batch", "2", "--seq_len", "128"]
+    else:
+        args_list += ["--epochs", "1", "--batch", "2", "--seq_len", "256", "--bf16"]
+    
+    return run(args_list)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  ФАЗА 14: RLVR — RL from Verifiable Rewards
+# ═════════════════════════════════════════════════════════════════════════
+
+def phase_14_rlvr(device: str = "cuda", quick: bool = False):
+    """RLVR: обучение через задачи с проверяемыми ответами."""
+    banner(14, "RLVR — Reinforcement Learning from Verifiable Rewards")
+    
+    model_path = TARS_V3 / "mamba2.pt"
+    if not model_path.exists():
+        logger.warning("  ⚠ mamba2.pt не найден — пропуск RLVR")
+        return False
+    
+    import torch
+    ckpt = torch.load(str(model_path), map_location="cpu", weights_only=False)
+    cfg = ckpt.get("config", {})
+    d_model = cfg.get("d_model", 768)
+    n_layers = cfg.get("n_layers", 12)
+    del ckpt
+    
+    args_list = [
+        PYTHON, TRAINING / "train_rlvr.py", "--resume",
+        "--d_model", str(d_model), "--n_layers", str(n_layers),
+        "--save_dir", str(TARS_V3),
+        "--device", device,
+    ]
+    if quick:
+        args_list += ["--epochs", "1", "--tasks_per_epoch", "100",
+                      "--batch", "8", "--seq_len", "64"]
+    else:
+        args_list += ["--epochs", "3", "--tasks_per_epoch", "1000",
+                      "--batch", "8", "--seq_len", "128", "--bf16"]
+    
+    return run(args_list)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  ФАЗА 15: DISTILLATION — Knowledge Distillation (опционально)
+# ═════════════════════════════════════════════════════════════════════════
+
+def phase_15_distill(device: str = "cuda", quick: bool = False):
+    """Knowledge distillation от Qwen2.5-1.5B → TARS. Требует --distill флаг."""
+    banner(15, "Knowledge Distillation (Qwen2.5 → TARS)")
+    
+    model_path = TARS_V3 / "mamba2.pt"
+    if not model_path.exists():
+        logger.warning("  ⚠ mamba2.pt не найден — пропуск Distillation")
+        return False
+    
+    _, vram = gpu_info()
+    if vram > 0 and vram < 12:
+        logger.warning(f"  ⚠ VRAM={vram:.0f}GB — для distillation рекомендуется ≥12GB")
+        logger.warning(f"  ⚠ teacher (Qwen2.5-1.5B) + student — могут не поместиться")
+    
+    import torch
+    ckpt = torch.load(str(model_path), map_location="cpu", weights_only=False)
+    cfg = ckpt.get("config", {})
+    d_model = cfg.get("d_model", 768)
+    n_layers = cfg.get("n_layers", 12)
+    del ckpt
+    
+    args_list = [
+        PYTHON, TRAINING / "train_distill.py", "--resume",
+        "--d_model", str(d_model), "--n_layers", str(n_layers),
+        "--save_dir", str(TARS_V3),
+        "--teacher_model", "Qwen/Qwen2.5-1.5B",
+        "--device", device,
+    ]
+    if quick:
+        args_list += ["--epochs", "1", "--batch", "2", "--seq_len", "128"]
+    else:
+        args_list += ["--epochs", "2", "--batch", "4", "--seq_len", "256", "--bf16"]
+    
+    return run(args_list)
+
+
+# ═════════════════════════════════════════════════════════════════════════
 #  MAIN
 # ═════════════════════════════════════════════════════════════════════════
 
@@ -1231,11 +1483,14 @@ def main():
   python mega_train.py                        # Полный пайплайн (~15 часов)
   python mega_train.py --skip-download        # Данные уже скачаны
   python mega_train.py --phase 4              # Только Mamba-2
-  python mega_train.py --phase 8              # Только Whisper
-  python mega_train.py --phase 9              # Только Piper
+  python mega_train.py --phase 12             # Только CoT
+  python mega_train.py --phase 13             # Только DPO
+  python mega_train.py --phase 14             # Только RLVR
   python mega_train.py --quick                # Быстрый тест (256d, 4 слоя)
   python mega_train.py --skip-quantize        # Без квантизации
   python mega_train.py --skip-voice           # Без голосовых фаз (8-10)
+  python mega_train.py --skip-posttrain       # Без post-training (CoT/DPO/RLVR)
+  python mega_train.py --distill              # Включить Knowledge Distillation
         """
     )
     
@@ -1245,7 +1500,11 @@ def main():
                         help="Пропустить квантизацию 1.58-bit")
     parser.add_argument("--skip-voice", action="store_true",
                         help="Пропустить голосовые фазы (Whisper, Piper, квант.)")
-    parser.add_argument("--phase", type=int, choices=[0,1,2,3,4,5,6,7,8,9,10],
+    parser.add_argument("--skip-posttrain", action="store_true",
+                        help="Пропустить post-training (CoT, DPO, RLVR)")
+    parser.add_argument("--distill", action="store_true",
+                        help="Включить Knowledge Distillation (фаза 15, нужно ≥12GB VRAM)")
+    parser.add_argument("--phase", type=int, choices=[0,1,2,3,4,5,6,7,8,9,10,12,13,14,15],
                         help="Запустить только конкретную фазу")
     parser.add_argument("--quick", action="store_true",
                         help="Быстрый тест (маленькая модель, 1 эпоха)")
@@ -1314,6 +1573,10 @@ def main():
         8: ("whisper", lambda: phase_8_whisper(device, quick=args.quick)),
         9: ("piper", lambda: phase_9_piper(quick=args.quick)),
         10: ("voice_quant", lambda: phase_10_quantize_voice()),
+        12: ("cot", lambda: phase_12_cot(device, quick=args.quick)),
+        13: ("dpo", lambda: phase_13_dpo(device, quick=args.quick)),
+        14: ("rlvr", lambda: phase_14_rlvr(device, quick=args.quick)),
+        15: ("distill", lambda: phase_15_distill(device, quick=args.quick)),
     }
     
     # Если задана конкретная фаза
@@ -1453,6 +1716,29 @@ def main():
         logger.error(f"❌ Instruction tuning failed: {e}")
         import traceback; traceback.print_exc()
         results["instruct"] = False
+    
+    # ═══ POST-TRAINING: CoT → DPO → RLVR (Фазы 12-14) ═══
+    if not getattr(args, 'skip_posttrain', False) and results.get("mamba2"):
+        # Фаза 12: Chain-of-Thought
+        results["cot"] = phase_12_cot(device, quick=args.quick)
+        
+        # Фаза 13: DPO (preference alignment)
+        results["dpo"] = phase_13_dpo(device, quick=args.quick)
+        
+        # Фаза 14: RLVR (verifiable rewards)
+        results["rlvr"] = phase_14_rlvr(device, quick=args.quick)
+        
+        # Фаза 15: Distillation (только при --distill)
+        if getattr(args, 'distill', False):
+            results["distill"] = phase_15_distill(device, quick=args.quick)
+    else:
+        if getattr(args, 'skip_posttrain', False):
+            logger.info("⏭ Пропуск post-training (--skip-posttrain)")
+        else:
+            logger.info("⏭ Пропуск post-training (mamba2 не обучена)")
+        results["cot"] = True
+        results["dpo"] = True
+        results["rlvr"] = True
     
     # ═══ ИТОГИ ═══
     total_time = time.time() - t0

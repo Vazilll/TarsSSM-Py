@@ -250,7 +250,7 @@ def _find_max_batch(model, device, seq_len):
             torch.cuda.empty_cache()
             best = mid
             lo = mid + 1
-        except (torch.cuda.OutOfMemoryError, RuntimeError):
+        except (torch.cuda.OutOfMemoryError, RuntimeError, AssertionError):
             torch.cuda.empty_cache()
             hi = mid - 1
     # 75% от максимума (запас для градиентов и optimizer states)
@@ -366,19 +366,16 @@ def train(args):
           f"params={param_count:,} ({param_mb:.0f} MB)")
     
     # ═══ torch.compile (PyTorch 2.0+, ~20% speedup) ═══
+    # NOTE: "reduce-overhead" mode uses CUDA graphs which crash on T4/small GPUs
+    # (AssertionError in cudagraph_trees.py). Use "default" mode instead.
     compiled = False
     if device.type == 'cuda':
         try:
-            model = torch.compile(model, mode="reduce-overhead")
+            model = torch.compile(model, mode="default")
             compiled = True
-            print("[Model] torch.compile: ON (reduce-overhead)")
+            print("[Model] torch.compile: ON (default)")
         except Exception:
-            try:
-                model = torch.compile(model)
-                compiled = True
-                print("[Model] torch.compile: ON (default)")
-            except Exception:
-                print("[Model] torch.compile: недоступен, пропуск")
+            print("[Model] torch.compile: недоступен, пропуск")
     
     # ═══ Автоопределение max batch ═══
     if device.type == 'cuda':
