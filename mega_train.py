@@ -107,7 +107,7 @@ def run(cmd: list, cwd=None, retries=3, check=True) -> bool:
             result = subprocess.run(
                 cmd,
                 cwd=str(cwd or ROOT),
-                timeout=43200,  # 12 часов макс
+                # Без таймаута — обучение может длиться сколько нужно
                 env=env,
             )
             if result.returncode == 0:

@@ -316,22 +316,35 @@ def is_done(state, phase_key):
 
 def run(cmd, timeout=None, label=""):
     """Запустить команду с логированием."""
-    cmd_str = " ".join(str(c) for c in cmd)
+    cmd = [str(c) for c in cmd]
+    
+    # Вставляем -u после python для unbuffered output
+    if len(cmd) >= 2 and ('python' in cmd[0].lower() or cmd[0] == PYTHON):
+        if '-u' not in cmd:
+            cmd.insert(1, '-u')
+    
+    cmd_str = " ".join(cmd)
     if label:
         print(f"  → [{label}] {cmd_str[:120]}...")
     else:
         print(f"  → {cmd_str[:120]}...")
+    sys.stdout.flush()
     
     with open(LOG_FILE, 'a', encoding='utf-8') as log:
         log.write(f"\n{'='*60}\n")
         log.write(f"[{datetime.now()}] {cmd_str}\n")
         log.write(f"{'='*60}\n")
     
+    # PYTHONUNBUFFERED=1 → вывод подпроцесса виден в реальном времени
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    
     try:
         result = subprocess.run(
-            [str(c) for c in cmd],
+            cmd,
             cwd=str(ROOT),
             timeout=timeout,
+            env=env,
         )
         return result.returncode == 0
     except subprocess.TimeoutExpired:

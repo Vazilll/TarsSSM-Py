@@ -80,26 +80,29 @@ def _get_gpu_data_limits():
     """
     Возвращает (max_augment_mb, max_samples) по GPU.
     
-    T4  (15 GB VRAM, ~12 GB RAM) → 50 MB augment, 200K samples
-    L4  (24 GB VRAM, ~53 GB RAM) → 300 MB augment, 1M samples
-    A100 (40+ GB,    ~80 GB RAM) → 400 MB augment, без лимита
-    CPU / unknown                → 30 MB augment, 100K samples
+    MinGRU = System 1 (быстрый мозг). Ему НЕ нужен полный корпус.
+    Полный корпус обрабатывает Mamba-2 (System 2).
+    
+    T4  (15 GB VRAM) → 30 MB augment, 200K samples
+    L4  (24 GB VRAM) → 50 MB augment, 500K samples
+    A100 (40+ GB)    → 100 MB augment, 1M samples
+    CPU / unknown    → 20 MB augment, 100K samples
     """
     try:
         import torch
         if torch.cuda.is_available():
             vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
             if vram_gb >= 35:   # A100 / H100
-                return 400, 0  # 0 = без лимита samples
-            elif vram_gb >= 20: # L4 / RTX 4090 (53 GB RAM на Colab)
-                return 400, 0  # 0 = без лимита (RAM позволяет)
+                return 100, 1_000_000
+            elif vram_gb >= 20: # L4 / RTX 4090
+                return 50, 500_000   # 50 MB — достаточно для System 1
             elif vram_gb >= 14: # T4
-                return 50, 200_000
+                return 30, 200_000
             else:               # маленький GPU
-                return 30, 100_000
+                return 20, 100_000
     except Exception:
         pass
-    return 30, 100_000  # CPU fallback
+    return 20, 100_000  # CPU fallback
 
 
 # ═══════════════════════════════════════════
@@ -484,6 +487,10 @@ def train(args):
         n_batches = 0
         optimizer.zero_grad()
         
+        total_batches = len(train_loader)
+        log_every = max(1, total_batches // 10)  # ~10 логов на эпоху
+        batch_t0 = time.time()
+        
         for step_idx, (batch_in, batch_tgt) in enumerate(train_loader):
             batch_in = batch_in.to(device, non_blocking=True)
             batch_tgt = batch_tgt.to(device, non_blocking=True)
@@ -509,6 +516,21 @@ def train(args):
             
             total_train_loss += loss.item() * accum_steps
             n_batches += 1
+            
+            # ═══ Прогресс внутри эпохи ═══
+            if (step_idx + 1) % log_every == 0 or step_idx == 0:
+                elapsed_b = time.time() - batch_t0
+                avg_loss = total_train_loss / n_batches
+                speed = (step_idx + 1) / max(elapsed_b, 0.1)
+                pct = (step_idx + 1) / total_batches * 100
+                gpu_str = ""
+                if device.type == 'cuda':
+                    gpu_gb = torch.cuda.memory_allocated() / 1024**3
+                    gpu_str = f" | VRAM: {gpu_gb:.1f}GB"
+                eta_min = (total_batches - step_idx - 1) / max(speed, 0.1) / 60
+                print(f"  [{epoch+1:2d}] {step_idx+1:6d}/{total_batches} ({pct:4.1f}%) "
+                      f"| Loss: {avg_loss:.4f} | {speed:.0f} batch/s "
+                      f"| ETA: {eta_min:.1f}min{gpu_str}", flush=True)
         
         # Flush remaining gradients
         if n_batches % accum_steps != 0:
@@ -534,26 +556,41 @@ def train(args):
         
         epoch_time = time.time() - epoch_start
         
-        # ═══ Логирование ═══
-        if (epoch + 1) % 5 == 0 or epoch == start_epoch:
-            perplexity = np.exp(min(eval_loss, 20))
-            lr_now = optimizer.param_groups[0]['lr']
-            
-            gpu_info = ""
-            if device.type == 'cuda':
-                gpu_mb = torch.cuda.max_memory_allocated() / 1024**2
-                gpu_info = f" | VRAM: {gpu_mb:.0f}MB"
-            
-            print(f"Эпоха {epoch+1:4d} | Train: {avg_train_loss:.4f} | Eval: {eval_loss:.4f} | "
-                  f"PPL: {perplexity:.1f} | LR: {lr_now:.2e} | {epoch_time:.1f}s{gpu_info}")
-            
-            prompts = ["Вопрос: Привет\nОтвет:", "Вопрос: Кто ты?\nОтвет:"]
-            for prompt in prompts:
-                sample = generate_text(model, start_text=prompt, max_length=80, 
-                                       temperature=0.7, device=device)
-                answer = sample.split("Ответ:")[-1].strip() if "Ответ:" in sample else sample
-                print(f"  → {prompt.split(chr(10))[0].replace('Вопрос: ', 'Q: ')} → {answer[:80]}")
-            print()
+        # ═══ Логирование — КАЖДУЮ эпоху ═══
+        perplexity = np.exp(min(eval_loss, 20))
+        lr_now = optimizer.param_groups[0]['lr']
+        total_elapsed = time.time() - training_start
+        
+        gpu_info = ""
+        if device.type == 'cuda':
+            gpu_mb = torch.cuda.max_memory_allocated() / 1024**2
+            gpu_info = f" | VRAM: {gpu_mb:.0f}MB"
+        
+        marker = " ★ BEST" if eval_loss < best_loss else ""
+        remaining = (args.epochs - (epoch - start_epoch + 1)) * epoch_time
+        
+        print(f"\n{'─'*70}")
+        print(f"Эпоха {epoch+1:3d}/{start_epoch + args.epochs} | "
+              f"Train: {avg_train_loss:.4f} | Eval: {eval_loss:.4f} | "
+              f"PPL: {perplexity:.1f} | LR: {lr_now:.2e} | "
+              f"{epoch_time:.0f}s{gpu_info}{marker}")
+        print(f"  ⏱ Прошло: {total_elapsed/60:.0f} мин | Осталось: ~{remaining/60:.0f} мин")
+        
+        # Демонстрация: показать как модель отвечает
+        prompts = [
+            "Вопрос: Привет\nОтвет:",
+            "Вопрос: Кто ты?\nОтвет:",
+            "Вопрос: Что ты умеешь?\nОтвет:",
+        ]
+        print(f"  📝 Генерация (temperature=0.7):")
+        for prompt in prompts:
+            sample = generate_text(model, start_text=prompt, max_length=80, 
+                                   temperature=0.7, device=device)
+            answer = sample.split("Ответ:")[-1].strip() if "Ответ:" in sample else sample
+            q = prompt.split(chr(10))[0].replace('Вопрос: ', '')
+            print(f"    Q: {q}")
+            print(f"    A: {answer[:100]}")
+        print(f"{'─'*70}\n", flush=True)
         
         # ═══ Сохранение ═══
         if eval_loss < best_loss:
