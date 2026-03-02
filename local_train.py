@@ -503,45 +503,130 @@ def download_all_data(config):
 
 
 # ═══════════════════════════════════════════
-# 7. Google Drive Integration
+# 7. Google Drive Integration (AUTO)
 # ═══════════════════════════════════════════
 
-def gdrive_sync():
-    """Синхронизировать данные с Google Drive → data/."""
-    print("\n  ☁️  Google Drive: синхронизация данных...")
+# Глобальный флаг — подключён ли GDrive в этом сеансе
+gdrive_connected = False
+
+
+def gdrive_check_and_prompt():
+    """Проверить подключение к GDrive.
+    
+    Если не подключён — спросить пользователя, хочет ли подключить.
+    Вызывается АВТОМАТИЧЕСКИ при старте обучения.
+    """
+    global gdrive_connected
     
     setup_script = ROOT / "setup_gdrive.py"
     if not setup_script.exists():
-        print("  ❌ setup_gdrive.py не найден")
+        print("  ⚠ setup_gdrive.py не найден — GDrive пропущен")
         return False
     
-    # Check connection first
-    ok = run([PYTHON, str(setup_script), "status"], label="GDrive")
-    if not ok:
-        print("  ⚠ Google Drive не подключён.")
-        print("  Запустите: python setup_gdrive.py setup")
+    # Проверить, есть ли rclone и настроен ли remote
+    import subprocess as sp
+    try:
+        r = sp.run(
+            [PYTHON, str(setup_script), "status"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode == 0:
+            print("  ☁️  Google Drive: подключён ✅")
+            gdrive_connected = True
+            return True
+    except Exception:
+        pass
+    
+    # GDrive не подключён — спросить пользователя
+    print()
+    print("  ┌─────────────────────────────────────────────────────┐")
+    print("  │  ☁️  Google Drive НЕ подключён                      │")
+    print("  │                                                     │")
+    print("  │  Подключение позволит:                              │")
+    print("  │  • Скачать данные для обучения с Drive              │")
+    print("  │  • Автоматически выгружать модели после обучения    │")
+    print("  │  • Видеть прогресс обучения на Drive в реальном     │")
+    print("  │    времени                                          │")
+    print("  └─────────────────────────────────────────────────────┘")
+    print()
+    
+    try:
+        answer = input("  Подключить Google Drive? [Y/n]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = "n"
+    
+    if answer in ("", "y", "yes", "д", "да"):
+        print()
+        print("  🔧 Запускаю настройку Google Drive...")
+        print("     (Следуйте инструкциям в терминале)")
+        print()
+        ok = run([PYTHON, str(setup_script), "setup"], label="GDrive Setup")
+        if ok:
+            gdrive_connected = True
+            print("  ✅ Google Drive подключён!")
+            return True
+        else:
+            print("  ⚠ Не удалось подключить Drive — продолжаю без него")
+            return False
+    else:
+        print("  ⏭ Пропускаю Google Drive (можно подключить позже)")
+        print("     python setup_gdrive.py setup")
+        return False
+
+
+def gdrive_sync():
+    """Синхронизировать данные с Google Drive → data/."""
+    if not gdrive_connected:
         return False
     
-    # Sync data
+    print("\n  ☁️  Google Drive: синхронизация данных...")
+    
+    setup_script = ROOT / "setup_gdrive.py"
     ok = run([PYTHON, str(setup_script), "sync"], label="GDrive Sync")
     if ok:
-        print("  ✅ Данные синхронизированы")
+        print("  ✅ Данные с Drive синхронизированы → data/")
     return ok
 
 
 def gdrive_backup():
-    """Выгрузить модели на Google Drive."""
-    print("\n  ☁️  Google Drive: бэкап моделей...")
+    """Выгрузить модели на Google Drive (rclone copy, неразрушающий)."""
+    if not gdrive_connected:
+        return False
+    
+    print("\n  ☁️  Google Drive: выгрузка моделей...")
     
     setup_script = ROOT / "setup_gdrive.py"
     if not setup_script.exists():
-        print("  ❌ setup_gdrive.py не найден")
         return False
     
     ok = run([PYTHON, str(setup_script), "sync-models"], label="GDrive Backup")
     if ok:
         print("  ✅ Модели выгружены на Google Drive")
+        print("     Проверьте: Google Drive → TarsLocalModels/")
     return ok
+
+
+def gdrive_sync_memory():
+    """Синхронизировать LEANN память + embeddings с Google Drive."""
+    if not gdrive_connected:
+        return False
+    
+    setup_script = ROOT / "setup_gdrive.py"
+    if not setup_script.exists():
+        return False
+    
+    ok = run([PYTHON, str(setup_script), "sync-memory"], label="GDrive Memory")
+    if ok:
+        print("  ✅ Память синхронизирована с Google Drive")
+        print("     Проверьте: Google Drive → TarsMemory/")
+    return ok
+
+
+def gdrive_backup_if_enabled():
+    """Промежуточный бэкап — вызывается АВТОМАТИЧЕСКИ после ключевых фаз."""
+    if gdrive_connected:
+        gdrive_backup()
+        gdrive_sync_memory()
 
 
 # ═══════════════════════════════════════════
@@ -555,6 +640,13 @@ def main():
     
     config = get_config(vram_gb, ram_gb, force_1b=args.one_billion)
     state = load_state()
+    
+    # ── Google Drive: авто-проверка и подключение ──
+    # Запрашивает подключение ПЕРЕД началом обучения
+    if not args.phase:  # Не спрашиваем если запуск конкретной фазы
+        gdrive_check_and_prompt()
+    elif args.gdrive:
+        gdrive_check_and_prompt()
     
     # Banner
     print()
@@ -574,10 +666,10 @@ def main():
     if config.get("use_wsd"):
         print(f"  📈 WSD:    Yes (Warmup-Stable-Decay scheduler)")
     print(f"  📁 Data:   {args.data_dir or str(DATA)}")
-    if args.gdrive:
-        print(f"  ☁️  GDrive: ON (sync before training)")
-    if args.gdrive_backup:
-        print(f"  ☁️  Backup: ON (upload models after training)")
+    if gdrive_connected:
+        print(f"  ☁️  GDrive: ON (авто-синхронизация + авто-бэкап)")
+    else:
+        print(f"  ☁️  GDrive: OFF")
     if args.resume:
         print(f"  🔄 Resume: from checkpoint")
         if state.get("completed_phases"):
@@ -597,12 +689,12 @@ def main():
     t0 = time.time()
     results = {}
     
-    # ── Google Drive sync (before everything) ──
-    if args.gdrive:
+    # ── Google Drive: синхронизация данных (ДО обучения) ──
+    if gdrive_connected:
         ok = gdrive_sync()
         results["gdrive_sync"] = ok
         if not ok:
-            print("  ⚠ Продолжаю без данных с Drive...")
+            print("  ⚠ Не удалось синхронизировать — продолжаю с локальными данными")
     
     def should_run(phase_num):
         """Проверить, нужно ли запускать фазу."""
@@ -708,6 +800,9 @@ def main():
             print(f"  ⚠️ Phase 4.{mamba_phase} failed → run with --resume to retry")
             break
     
+    # ── Промежуточный бэкап после Mamba-2 ──
+    gdrive_backup_if_enabled()
+    
     # ── Phase 4.5: PersonalityAdapter ──
     if should_run(4) and not is_done(state, "personality"):
         print(f"\n  🎭 Phase 4.5: PersonalityAdapter ({config['epochs_p5']} epochs)...")
@@ -761,6 +856,7 @@ def main():
         results["quantize"] = ok
         if ok:
             mark_done(state, "quantize")
+            gdrive_backup_if_enabled()
     
     # ══════════════════════════════════════════════════
     # Phase 6: Consolidate → models/tars_v3/
@@ -803,6 +899,9 @@ def main():
             if ok:
                 mark_done(state, "voice_quant")
             results["voice_quant"] = ok
+        
+        # ── Промежуточный бэкап после Voice ──
+        gdrive_backup_if_enabled()
     
     # ══════════════════════════════════════════════════
     # Phase 11: Instruction Tuning
@@ -917,11 +1016,14 @@ def main():
             print(f"  ⚠️ Ошибки: {', '.join(failed)}")
         print(f"  🔄 Продолжить: python local_train.py --resume")
     
-    # ── Google Drive backup (after all phases) ──
-    if args.gdrive_backup and all_ok:
+    # ── Google Drive: финальный бэкап (АВТО) ──
+    if gdrive_connected:
         print()
+        print("  ☁️  Финальная выгрузка моделей на Google Drive...")
         gdrive_ok = gdrive_backup()
         results["gdrive_backup"] = gdrive_ok
+        if gdrive_ok:
+            print("  ✅ Все модели на Drive — проверьте Google Drive → tars_training/models/")
     
     print()
     print("═" * 65)

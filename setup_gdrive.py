@@ -29,10 +29,15 @@ ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 MODELS = ROOT / "models"
 
-# Google Drive paths (настраиваемые)
+# Google Drive paths
+# ДАННЫЕ — общие с Colab (TarsData/)
+# МОДЕЛИ — отдельная папка для локально обученных (TarsLocalModels/)
+#   Colab модели → TarsModels/ (создаёт colab_train.py)
+#   Локальные модели → TarsLocalModels/ (создаёт этот скрипт)
 GDRIVE_REMOTE = "gdrive"                    # Имя rclone remote
-GDRIVE_DATA = "tars_training/data"           # Папка с данными на Drive
-GDRIVE_MODELS = "tars_training/models"       # Папка с моделями на Drive
+GDRIVE_DATA = "TarsData"                    # Общая папка данных (= Colab)
+GDRIVE_MODELS = "TarsLocalModels"           # Модели, обученные локально
+GDRIVE_MEMORY = "TarsMemory"                # LEANN память + embeddings (= Colab)
 GDRIVE_MOUNT = ROOT / "gdrive_mount"         # Куда монтировать
 
 IS_LINUX = platform.system() == "Linux"
@@ -216,7 +221,7 @@ def verify_connection():
         return False
     
     # Check/create folders
-    for folder in [GDRIVE_DATA, GDRIVE_MODELS]:
+    for folder in [GDRIVE_DATA, GDRIVE_MODELS, GDRIVE_MEMORY]:
         try:
             run_cmd(["rclone", "mkdir", f"{GDRIVE_REMOTE}:{folder}"], check=True)
             print(f"  ✅ Папка: {folder}")
@@ -304,37 +309,138 @@ def sync_data():
 # ═══════════════════════════════════════════
 
 def sync_models():
-    """Выгрузить модели на Google Drive (бэкап)."""
+    """Выгрузить модели на Google Drive (бэкап).
+    
+    Использует rclone copy (НЕ sync!) — не удаляет старые файлы на Drive.
+    Выгружает ВСЕ .pt файлы из models/ (включая подпапки).
+    """
     
     print_banner()
     print("  📤 Выгрузка моделей: локально → Google Drive\n")
     
-    tars_v3 = MODELS / "tars_v3"
-    if not tars_v3.exists():
-        print("  ⚠ models/tars_v3/ не найдена — сначала обучите модель")
+    if not MODELS.exists() or not any(MODELS.rglob("*.pt")):
+        print("  ⚠ Нет обученных моделей (.pt) — сначала обучите")
         return False
     
-    print(f"  Источник:  {tars_v3}")
+    # Показать что будем выгружать
+    pt_files = list(MODELS.rglob("*.pt"))
+    total_mb = sum(f.stat().st_size for f in pt_files) / (1024*1024)
+    print(f"  Источник:  {MODELS}")
     print(f"  Цель:      {GDRIVE_REMOTE}:{GDRIVE_MODELS}")
+    print(f"  Файлов:    {len(pt_files)} ({total_mb:.0f} MB)")
+    print()
+    
+    for f in pt_files:
+        rel = f.relative_to(MODELS)
+        mb = f.stat().st_size / (1024*1024)
+        print(f"    📦 {rel}: {mb:.1f} MB")
     print()
     
     try:
+        # rclone copy = НЕ удаляет файлы на Drive (безопасно)
         subprocess.run([
-            "rclone", "sync",
-            str(tars_v3),
+            "rclone", "copy",
+            str(MODELS),
             f"{GDRIVE_REMOTE}:{GDRIVE_MODELS}",
             "--progress",
             "--transfers", "2",
             "--drive-chunk-size", "128M",
+            "--include", "*.pt",
         ], check=True)
         
-        total_mb = sum(f.stat().st_size for f in tars_v3.rglob("*") if f.is_file()) / (1024*1024)
-        print(f"\n  ✅ Модели выгружены: {total_mb:.0f} MB")
+        print(f"\n  ✅ Модели выгружены на Drive: {total_mb:.0f} MB")
+        print(f"     Путь: {GDRIVE_REMOTE}:{GDRIVE_MODELS}")
         return True
         
     except Exception as e:
         print(f"\n  ❌ Ошибка: {e}")
         return False
+
+# ═══════════════════════════════════════════
+# 5b. Sync memory (LEANN + embeddings)
+# ═══════════════════════════════════════════
+
+MEMORY = ROOT / "memory"
+EMBEDDINGS = MODELS / "embeddings"
+
+def sync_memory():
+    """Синхронизировать LEANN память и embeddings с Google Drive.
+    
+    Двунаправленная синхронизация:
+    - Скачивает с Drive → local (если на Drive есть, а локально нет)
+    - Выгружает local → Drive (если локально есть новее)
+    """
+    
+    print_banner()
+    print("  🧠 Синхронизация памяти: LEANN + Embeddings\n")
+    print(f"  Drive:  {GDRIVE_REMOTE}:{GDRIVE_MEMORY}")
+    print(f"  Local:  {MEMORY}")
+    print(f"  Embed:  {EMBEDDINGS}")
+    print()
+    
+    ok = True
+    
+    # 1. LEANN memory (memory/*.npz, *.json, *.index)
+    MEMORY.mkdir(parents=True, exist_ok=True)
+    try:
+        # Скачать с Drive → local (то что есть на Drive, но нет локально)
+        subprocess.run([
+            "rclone", "copy",
+            f"{GDRIVE_REMOTE}:{GDRIVE_MEMORY}",
+            str(MEMORY),
+            "--progress",
+            "--include", "*.npz",
+            "--include", "*.json",
+            "--include", "*.index",
+        ], check=True)
+        
+        # Выгрузить local → Drive (то что есть локально)
+        subprocess.run([
+            "rclone", "copy",
+            str(MEMORY),
+            f"{GDRIVE_REMOTE}:{GDRIVE_MEMORY}",
+            "--progress",
+            "--include", "*.npz",
+            "--include", "*.json",
+            "--include", "*.index",
+        ], check=True)
+        
+        print("  ✅ LEANN память синхронизирована")
+    except Exception as e:
+        print(f"  ⚠ LEANN: {e}")
+        ok = False
+    
+    # 2. Embeddings (models/embeddings/)
+    if EMBEDDINGS.exists() and any(EMBEDDINGS.rglob("*")):
+        try:
+            subprocess.run([
+                "rclone", "copy",
+                str(EMBEDDINGS),
+                f"{GDRIVE_REMOTE}:{GDRIVE_MEMORY}/embeddings",
+                "--progress",
+            ], check=True)
+            print("  ✅ Embeddings выгружены на Drive")
+        except Exception as e:
+            print(f"  ⚠ Embeddings: {e}")
+    else:
+        # Скачать с Drive если есть
+        try:
+            EMBEDDINGS.mkdir(parents=True, exist_ok=True)
+            subprocess.run([
+                "rclone", "copy",
+                f"{GDRIVE_REMOTE}:{GDRIVE_MEMORY}/embeddings",
+                str(EMBEDDINGS),
+                "--progress",
+            ], check=True)
+            if any(EMBEDDINGS.rglob("*")):
+                print("  ✅ Embeddings скачаны с Drive")
+            else:
+                print("  ℹ Embeddings на Drive нет — скачаются при обучении")
+        except Exception:
+            pass
+    
+    print(f"\n  📁 На Drive: {GDRIVE_REMOTE}:{GDRIVE_MEMORY}")
+    return ok
 
 
 # ═══════════════════════════════════════════
@@ -403,14 +509,14 @@ def print_help():
     print("    python setup_gdrive.py status        Проверить подключение")
     print("    python setup_gdrive.py sync          Скачать данные с Drive")
     print("    python setup_gdrive.py sync-models   Выгрузить модели на Drive")
+    print("    python setup_gdrive.py sync-memory   Синхронизировать LEANN + embeddings")
     print("    python setup_gdrive.py mount         Смонтировать Drive (Linux)")
     print()
-    print("  Полный сценарий:")
-    print("    1. python setup_gdrive.py setup      ← авторизация (1 раз)")
-    print("    2. Загрузите данные в Google Drive → tars_training/data/")
-    print("    3. python setup_gdrive.py sync        ← скачать на сервер")
-    print("    4. python local_train.py              ← обучение")
-    print("    5. python setup_gdrive.py sync-models ← бэкап моделей")
+    print("  Папки на Google Drive:")
+    print(f"    TarsData/         ← данные (общие с Colab)")
+    print(f"    TarsModels/       ← модели обученные на Colab")
+    print(f"    TarsLocalModels/  ← модели обученные локально")
+    print(f"    TarsMemory/       ← LEANN память + embeddings")
     print()
     print("  Или через монтирование (Linux):")
     print("    1. python setup_gdrive.py setup")
@@ -437,6 +543,9 @@ if __name__ == "__main__":
         sys.exit(0 if ok else 1)
     elif cmd in ("sync-models", "backup"):
         ok = sync_models()
+        sys.exit(0 if ok else 1)
+    elif cmd == "sync-memory":
+        ok = sync_memory()
         sys.exit(0 if ok else 1)
     elif cmd == "mount":
         ok = mount_drive()

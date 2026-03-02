@@ -513,12 +513,22 @@ def drive_save():
             shutil.copy2(str(local_f), str(drive_f))
             saved += 1
     
-    # НЕ сохраняем обученные модели (tars_v3) — обучение всегда с нуля
+    # Сохранить обученные модели на Drive (бэкап)
+    tars_v3 = MODELS / "tars_v3"
+    drive_tars_v3 = DRIVE_BASE / "models"
+    if tars_v3.exists():
+        drive_tars_v3.mkdir(parents=True, exist_ok=True)
+        for f in tars_v3.glob("*.pt"):
+            dst = drive_tars_v3 / f.name
+            if not dst.exists() or dst.stat().st_size < f.stat().st_size:
+                shutil.copy2(str(f), str(dst))
+                saved += 1
+        if saved:
+            logger.info(f"  💾 → Drive: обученные модели (tars_v3)")
     
     if saved:
         logger.info(f"  ✅ Сохранено {saved} элементов на Drive")
         logger.info(f"  📂 Путь: {DRIVE_BASE}")
-        logger.info(f"  ℹ Обученные модели НЕ кешируются — обучение всегда с нуля")
 
 
 # ═════════════════════════════════════════════════════════════════════════
