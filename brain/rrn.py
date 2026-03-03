@@ -367,19 +367,20 @@ class RrnCore:
     # Порог для действия (Mode 2) vs глубокое мышление (Mode 3)
     ACTION_THRESHOLD = 0.50
     
-    def __init__(self, model_path="models/llm/rrn_small.gguf", dim=256):
+    def __init__(self, model_path="models/llm/rrn_small.gguf", dim=256, brain_dim=2048):
         self.model_path = model_path
         self.logger = logging.getLogger("Tars.RRN")
         self.llm = None
         self.working_memory = []
+        self.brain_dim = brain_dim
         
         # Нейронное ядро RRN
         self.neural_core = TarsRRN(dim=dim, mem_slots=4, num_heads=4, max_steps=8)
-        self.input_proj = nn.Linear(1024, dim)   # Проекция из SSM-пространства
-        self.output_proj = nn.Linear(dim, 1024)  # Обратная проекция (обученная, не repeat!)
+        self.input_proj = nn.Linear(brain_dim, dim)   # Проекция из Mamba-2 пространства (2048→256)
+        self.output_proj = nn.Linear(dim, brain_dim)   # Обратная проекция (256→2048)
         
         param_count = sum(p.numel() for p in self.neural_core.parameters())
-        self.logger.info(f"Spine: Нейронное ядро ({param_count:,} params)")
+        self.logger.info(f"Spine: Нейронное ядро ({param_count:,} params, brain_dim={brain_dim})")
         
         # MinGRU для рефлексов
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -408,6 +409,40 @@ class RrnCore:
         
         # Synapse Pool (lazy-load)
         self._synapse_pool = None
+        
+         # ═══ Spiking Synapses (SNN) — нейроморфный апгрейд ═══
+        self.has_spiking = False
+        self._spiking_states = None
+        try:
+            from brain.spiking import SpikingSynapsePool
+            self.spiking_pool = SpikingSynapsePool(dim=dim, n_synapses=5, beta=0.9)
+            
+            # Load trained weights if available
+            snn_weights = Path(__file__).parent.parent / "models" / "spiking" / "spiking_best.pt"
+            if snn_weights.exists():
+                ckpt = torch.load(str(snn_weights), map_location='cpu', weights_only=False)
+                snn_state = ckpt.get('model_state_dict', {})
+                # Extract only the snn_block weights (skip embedding/head)
+                block_state = {}
+                for k, v in snn_state.items():
+                    if k.startswith('snn_block.'):
+                        # Map snn_block.X → synapses.0.X (first synapse gets trained weights)
+                        new_key = k.replace('snn_block.', '')
+                        block_state[new_key] = v
+                if block_state:
+                    # Load into all 5 synapses (shared initialization, specialize during use)
+                    for i, synapse in enumerate(self.spiking_pool.synapses):
+                        synapse.load_state_dict(block_state, strict=False)
+                    self.logger.info(f"Spine: SNN weights loaded ({len(block_state)} tensors, "
+                                    f"epoch {ckpt.get('epoch', '?')})")
+            
+            self.spiking_pool.to(self.device)
+            self.spiking_pool.eval()
+            self.has_spiking = True
+            snn_params = sum(p.numel() for p in self.spiking_pool.parameters())
+            self.logger.info(f"Spine: SNN SpikingSynapsePool active ({snn_params:,} params)")
+        except Exception as e:
+            self.logger.info(f"Spine: SNN not available, using MinGRU fallback: {e}")
     
     @property
     def leann(self):
@@ -466,7 +501,7 @@ class RrnCore:
                 "response": str or None,       # Mode 1: ответ, Mode 2-3: None
                 "context": str or None,         # Mode 3: context для Brain
                 "synapse_results": list or None, # Mode 2-3: результаты синапсов
-                "rrn_vector": Tensor or None,    # Mode 3: context_vector [1, 1024]
+                "rrn_vector": Tensor or None,    # Mode 3: context_vector [1, brain_dim]
             }
         """
         # 1. RRN classification
@@ -493,8 +528,30 @@ class RrnCore:
         
         # ═══ Mode 2: Действие (синапсы) ═══
         if mode == 2:
+            # SNN spike processing (нейроморфный быстрый путь)
+            snn_context = None
+            if self.has_spiking:
+                try:
+                    with torch.no_grad():
+                        # x_proj: [1, dim=256], добавляем seq dim → [1, 1, 256]
+                        spike_input = x_proj.unsqueeze(1)
+                        spike_out, self._spiking_states = self.spiking_pool(
+                            spike_input,
+                            prev_states=self._spiking_states,
+                            task_type="action",
+                        )
+                        # Проецируем назад в brain space
+                        snn_vec = self.output_proj(spike_out.squeeze(1))
+                        snn_context = f"[SNN spike context: {spike_out.abs().sum():.0f} active spikes]"
+                        self.logger.debug(f"Spine SNN: sparsity={self.spiking_pool.synapses[0].sparsity:.1%}")
+                except Exception as e:
+                    self.logger.warning(f"Spine SNN error: {e}")
+            
+            # Standard synapse pool (web/shell/memory tools)
             results = await self.synapse_pool.fire_for_query(query)
             summary = self.synapse_pool.summarize_results(results)
+            if snn_context and summary:
+                summary = snn_context + "\n" + summary
             return {
                 "mode": 2, "confidence": confidence,
                 "response": summary if summary else None,
@@ -665,20 +722,42 @@ class RrnCore:
 
     def _text_to_vec(self, text: str) -> torch.Tensor:
         """
-        Продвинутая Фурье-векторизация текста (Positional Encoding).
-        Обеспечивает строгое выравнивание семантического базиса с AUSSM.
-        """
-        vec = torch.zeros(1, 1024) # [1, 1024]
-        if not text: return vec
+        Семантическая векторизация текста.
         
+        Приоритет:
+          1. MinGRU trained embedding → mean pooling (семантический вектор)
+          2. Fallback: Фурье-хеширование (если MinGRU не загружен)
+        
+        Returns: [1, brain_dim] — вектор в пространстве мозга
+        """
+        if not text:
+            return torch.zeros(1, self.brain_dim)
+        
+        # ═══ Способ 1: Семантический (через обученный MinGRU embedding) ═══
+        if self.has_mingru:
+            try:
+                text_bytes = list(text.encode('cp1251', errors='replace'))[:256]
+                tokens = torch.tensor([text_bytes], dtype=torch.long).to(self.device)
+                with torch.no_grad():
+                    # Используем обученную таблицу embedding MinGRU
+                    emb = self.mingru_lm.embedding(tokens)  # [1, L, 256]
+                    # Mean pooling → семантический вектор
+                    vec_256 = emb.mean(dim=1)  # [1, 256]
+                    # Проекция в brain-пространство через output_proj
+                    vec = self.output_proj(vec_256)  # [1, brain_dim]
+                return vec.cpu()
+            except Exception:
+                pass
+        
+        # ═══ Способ 2: Fallback — Фурье-хеширование ═══
+        vec = torch.zeros(1, self.brain_dim)
         chars = [ord(c) for c in text[:256]]
         for i in range(len(chars) - 1):
-            val = (chars[i] * 31 + chars[i+1]) % 1024
-            # Фурье базис
-            freq = 1.0 / (10000 ** ((2 * (val % 512)) / 1024))
+            val = (chars[i] * 31 + chars[i+1]) % self.brain_dim
+            freq = 1.0 / (10000 ** ((2 * (val % (self.brain_dim // 2))) / self.brain_dim))
             vec[0, val] += math.sin(i * freq)
-            vec[0, (val + 1) % 1024] += math.cos(i * freq)
-            
+            vec[0, (val + 1) % self.brain_dim] += math.cos(i * freq)
+        
         norm = vec.norm()
         return vec / norm if norm > 1e-8 else vec
 

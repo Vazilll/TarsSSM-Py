@@ -164,8 +164,9 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        rms = x.float().pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
-        return (x.float() * rms).to(x.dtype) * self.weight
+        x_fp32 = x.float()
+        rms = torch.rsqrt(x_fp32.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (x_fp32 * rms).type_as(x) * self.weight
 
 
 # ═══════════════════════════════════════════════════════════════

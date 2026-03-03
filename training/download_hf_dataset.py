@@ -6,12 +6,16 @@
 Скачивает только ПРОВЕРЕННЫЕ быстрые датасеты из HuggingFace.
 
 Категории:
-  --preset code     → Код (Magicoder, CodeAlpaca, commitpackft)
-  --preset math     → Математика и логика
-  --preset thinking → Reasoning / Chain-of-Thought
-  --preset chat     → Русские диалоги, харизма
-  --preset instruct → Instruction tuning
-  --preset all      → Все вышеперечисленное
+  --preset code     → Код (Magicoder, CodeAlpaca, StarCoder, commitpackft)
+  --preset math     → Математика и логика (MathInstruct-ru, orca-math-ru, GSM8K)
+  --preset thinking → Reasoning / Chain-of-Thought (OpenThoughts)
+  --preset chat     → Русские диалоги (russian_instructions, GrandMaster)
+  --preset instruct → Instruction tuning (OpenOrca-ru, OpenHermes-ru, ru-instruct)
+  --preset russian  → Русский reasoning (R1-Distill, ROMB)
+  --preset science  → Наука (OpenAssistant, школьные QA)
+  --preset quality  → Обратная связь (Feedback-Collection-ru)
+  --preset dpo      → DPO/RLHF (orca_dpo, full-hh-rlhf-ru)
+  --preset all      → Все вышеперечисленное (~580K+ примеров)
 
 Требования:
   pip install datasets
@@ -38,32 +42,32 @@ PRESETS = {
     "code": [
         {
             "name": "ise-uiuc/Magicoder-Evol-Instruct-110K",
-            "desc": "110K задач по коду",
-            "count": 15000,
+            "desc": "110K задач по коду (лучший code-instruct)",
+            "count": 25000,
             "format": "instruct",
         },
         {
             "name": "sahil2801/CodeAlpaca-20k",
             "desc": "20K instruction-tuning для кода",
-            "count": 5000,
+            "count": 10000,
             "format": "instruct",
         },
         {
             "name": "codeparrot/self-instruct-starcoder",
             "desc": "StarCoder self-instruct",
-            "count": 5000,
+            "count": 10000,
             "format": "instruct",
         },
         {
             "name": "d0rj/conala-mined-ru",
             "desc": "Код + комментарии на русском",
-            "count": 5000,
+            "count": 8000,
             "format": "instruct",
         },
         {
             "name": "bigcode/commitpackft",
             "desc": "Коммиты как инструкции",
-            "count": 10000,
+            "count": 15000,
             "format": "instruct",
         },
     ],
@@ -73,25 +77,31 @@ PRESETS = {
         {
             "name": "d0rj/MathInstruct-ru",
             "desc": "Мат. задачи с решениями (русский)",
-            "count": 10000,
+            "count": 15000,
+            "format": "instruct",
+        },
+        {
+            "name": "d0rj/orca-math-word-problems-200k-ru",
+            "desc": "200K текстовых мат. задач (русский) ★",
+            "count": 30000,
             "format": "instruct",
         },
         {
             "name": "d0rj/muInstruct-ru",
             "desc": "Авто-сгенерированные мат. задачи (русский)",
-            "count": 5000,
+            "count": 10000,
             "format": "instruct",
         },
         {
             "name": "TIGER-Lab/MathInstruct",
             "desc": "Мат. задачи с CoT решениями",
-            "count": 5000,
+            "count": 10000,
             "format": "instruct",
         },
         {
             "name": "meta-math/MetaMathQA",
             "desc": "MetaMath: переформулированные GSM8K+MATH",
-            "count": 5000,
+            "count": 10000,
             "format": "instruct",
         },
         {
@@ -106,8 +116,8 @@ PRESETS = {
     "thinking": [
         {
             "name": "open-thoughts/OpenThoughts-114k",
-            "desc": "114K задач с цепочками рассуждений",
-            "count": 10000,
+            "desc": "114K задач с цепочками рассуждений ★",
+            "count": 20000,
             "format": "sharegpt",
         },
     ],
@@ -116,14 +126,14 @@ PRESETS = {
     "chat": [
         {
             "name": "Den4ikAI/russian_instructions_2",
-            "desc": "Русские инструкции — основной чат",
-            "count": 30000,
+            "desc": "Русские инструкции — основной чат ★",
+            "count": 50000,
             "format": "instruct",
         },
         {
             "name": "IlyaGusev/ru_turbo_alpaca",
             "desc": "GPT-4 русские инструкции",
-            "count": 10000,
+            "count": 15000,
             "format": "instruct",
         },
         {
@@ -134,51 +144,37 @@ PRESETS = {
         },
         {
             "name": "Vikhrmodels/GrandMaster-PRO-MAX",
-            "desc": "Сложный русский reasoning",
-            "count": 10000,
-            "format": "chat",
-        },
-    ],
-
-    # ─── Самосознание ТАРС ───
-    "selfaware": [
-        {
-            "name": "ai-forever/school_notebooks_QA",
-            "desc": "Школьные вопросы-ответы (образование)",
-            "count": 10000,
-            "format": "instruct",
-        },
-    ],
-
-    # ─── Наука ───
-    "science": [
-        {
-            "name": "OpenAssistant/oasst1",
-            "desc": "Мультиязычные диалоги",
+            "desc": "Сложный русский reasoning ★",
             "count": 15000,
             "format": "chat",
         },
-        {
-            "name": "OpenAssistant/oasst2",
-            "desc": "OpenAssistant v2",
-            "count": 10000,
-            "format": "chat",
-        },
     ],
 
-    # ─── Instruction tuning ───
+    # ─── Instruction tuning (основа интеллекта) ───
     "instruct": [
         {
             "name": "d0rj/OpenOrca-ru",
-            "desc": "Русские инструкции (перевод OpenOrca)",
-            "count": 30000,
+            "desc": "Русские инструкции (перевод OpenOrca) ★",
+            "count": 50000,
             "format": "instruct",
         },
         {
             "name": "d0rj/OpenHermes-2.5-ru",
-            "desc": "Русские инструкции GPT-4 качества",
-            "count": 20000,
+            "desc": "Русские инструкции GPT-4 качества ★",
+            "count": 40000,
             "format": "sharegpt",
+        },
+        {
+            "name": "d0rj/ru-instruct",
+            "desc": "Обширные русские инструкции (2024) ★",
+            "count": 30000,
+            "format": "instruct",
+        },
+        {
+            "name": "lksy/ru_instruct_gpt4",
+            "desc": "GPT-4 инструкции на русском ★",
+            "count": 20000,
+            "format": "instruct",
         },
     ],
 
@@ -186,28 +182,146 @@ PRESETS = {
     "russian": [
         {
             "name": "d0rj/R1-Distill-SFT_v1-ru",
-            "desc": "DeepSeek R1 reasoning (русский)",
-            "count": 5000,
+            "desc": "DeepSeek R1 reasoning (русский) ★",
+            "count": 10000,
             "format": "instruct",
         },
         {
             "name": "d0rj/ROMB-1.0",
             "desc": "Олимпиадные задачи (русский)",
-            "count": 3000,
-            "format": "instruct",
-        },
-    ],
-
-    # ─── DPO (preference) ───
-    "dpo": [
-        {
-            "name": "Intel/orca_dpo_pairs",
-            "desc": "DPO пары (chosen vs rejected)",
             "count": 5000,
             "format": "instruct",
         },
     ],
+
+    # ─── Наука и общие знания ───
+    "science": [
+        {
+            "name": "OpenAssistant/oasst1",
+            "desc": "Мультиязычные диалоги (качество)",
+            "count": 15000,
+            "format": "chat",
+        },
+        {
+            "name": "OpenAssistant/oasst2",
+            "desc": "OpenAssistant v2 — улучшенные диалоги",
+            "count": 15000,
+            "format": "chat",
+        },
+        {
+            "name": "ai-forever/school_notebooks_QA",
+            "desc": "Школьные вопросы-ответы (образование)",
+            "count": 15000,
+            "format": "instruct",
+        },
+    ],
+
+    # ─── Качество ответов и обратная связь ───
+    "quality": [
+        {
+            "name": "d0rj/Feedback-Collection-ru",
+            "desc": "Обратная связь + оценки качества (рус) ★",
+            "count": 10000,
+            "format": "instruct",
+        },
+    ],
+
+    # ─── DPO / RLHF (preference learning) ───
+    "dpo": [
+        {
+            "name": "Intel/orca_dpo_pairs",
+            "desc": "DPO пары (chosen vs rejected)",
+            "count": 10000,
+            "format": "instruct",
+        },
+        {
+            "name": "d0rj/full-hh-rlhf-ru",
+            "desc": "RLHF пары на русском (harmless+helpful) ★",
+            "count": 15000,
+            "format": "instruct",
+        },
+    ],
 }
+
+
+import re as _re
+
+# ═══════════════════════════════════════════════════════════════
+# QUALITY PIPELINE — Фильтрация и очистка данных
+# ═══════════════════════════════════════════════════════════════
+
+def clean_text(text: str) -> str:
+    """Очистка текста от мусора."""
+    if not text:
+        return ""
+    # HTML теги
+    text = _re.sub(r'<[^>]+>', '', text)
+    # URLs
+    text = _re.sub(r'https?://\S+', '', text)
+    # Email
+    text = _re.sub(r'\S+@\S+\.\S+', '', text)
+    # Повторяющиеся пробелы
+    text = _re.sub(r'[ \t]{3,}', '  ', text)
+    # Повторяющиеся переносы (>3 → 2)
+    text = _re.sub(r'\n{4,}', '\n\n\n', text)
+    # Повторяющиеся знаки препинания (... → ..., !!! → !)
+    text = _re.sub(r'([!?.])\1{3,}', r'\1\1\1', text)
+    # Non-printable (кроме \n\r\t)
+    text = _re.sub(r'[^\S\n\r\t]+', ' ', text)
+    return text.strip()
+
+
+def is_quality_text(text: str, min_len: int = 50, max_len: int = 15000) -> bool:
+    """Проверка качества текста. Returns True если текст достаточно хороший."""
+    if not text:
+        return False
+    
+    length = len(text)
+    
+    # Длина
+    if length < min_len or length > max_len:
+        return False
+    
+    # Соотношение букв к общему количеству символов (>40%)
+    alpha_count = sum(1 for c in text if c.isalpha())
+    if alpha_count / max(length, 1) < 0.4:
+        return False
+    
+    # Детекция повторений — строки
+    lines = text.split('\n')
+    if len(lines) > 3:
+        unique_lines = set(line.strip().lower() for line in lines if line.strip())
+        if len(unique_lines) < len(lines) * 0.5:  # >50% дублей
+            return False
+    
+    # Детекция повторений — триграммы символов
+    if length > 200:
+        trigrams = [text[i:i+3] for i in range(0, min(length, 1000) - 2)]
+        unique_tri = set(trigrams)
+        if len(unique_tri) < len(trigrams) * 0.15:  # слишком мало уникальных
+            return False
+    
+    # Слишком много спецсимволов (>30% не-буквы-цифры-пробелы)
+    normal_chars = sum(1 for c in text if c.isalnum() or c.isspace() or c in '.,!?;:-()"\'/«»')
+    if normal_chars / max(length, 1) < 0.7:
+        return False
+    
+    return True
+
+
+def deduplicate_texts(texts: list, max_hash_len: int = 200) -> list:
+    """Дедупликация по хешу первых N символов (нормализованных)."""
+    import hashlib
+    seen = set()
+    unique = []
+    for text in texts:
+        # Нормализуем: lowercase, убираем пробелы
+        norm = text[:max_hash_len].lower().replace(' ', '').replace('\n', '')
+        h = hashlib.md5(norm.encode('utf-8', errors='ignore')).hexdigest()
+        if h not in seen:
+            seen.add(h)
+            unique.append(text)
+    return unique
 
 
 def format_row(row: dict, fmt: str) -> str:
@@ -288,7 +402,7 @@ def format_row(row: dict, fmt: str) -> str:
 
 
 def download_one_dataset(ds_config: dict, output_dir: str) -> str:
-    """Скачивает один датасет и возвращает текст."""
+    """Скачивает один датасет с фильтрацией качества."""
     try:
         from datasets import load_dataset
     except ImportError:
@@ -313,28 +427,48 @@ def download_one_dataset(ds_config: dict, output_dir: str) -> str:
     print(f"  ↓ {name}: {ds_config.get('desc', '')}...")
     
     try:
-        # Загрузка (берём только count строк — быстрее!)
-        split_str = f"train[:{count}]"
+        # Скачиваем с запасом (+30%) чтобы после фильтрации осталось count
+        fetch_count = int(count * 1.3)
+        split_str = f"train[:{fetch_count}]"
         try:
             if subsets:
                 ds = load_dataset(name, subsets[0], split=split_str, streaming=False)
             else:
                 ds = load_dataset(name, split=split_str, streaming=False)
         except Exception:
-            # Fallback — грузим всё и обрезаем
             if subsets:
                 ds = load_dataset(name, subsets[0], split="train", streaming=False)
             else:
                 ds = load_dataset(name, split="train", streaming=False)
-            if len(ds) > count:
-                ds = ds.select(range(count))
+            if len(ds) > fetch_count:
+                ds = ds.select(range(fetch_count))
         
-        # Форматирование
+        # ═══ Quality Pipeline ═══
+        raw_count = len(ds)
+        
+        # 1. Format
         texts = []
         for row in ds:
             text = format_row(row, fmt)
-            if text and len(text) > 20:
+            if text:
                 texts.append(text)
+        
+        after_format = len(texts)
+        
+        # 2. Clean
+        texts = [clean_text(t) for t in texts]
+        
+        # 3. Quality filter
+        texts = [t for t in texts if is_quality_text(t)]
+        after_quality = len(texts)
+        
+        # 4. Deduplicate
+        texts = deduplicate_texts(texts)
+        after_dedup = len(texts)
+        
+        # 5. Trim to count
+        if len(texts) > count:
+            texts = texts[:count]
         
         corpus = "\n\n".join(texts)
         
@@ -343,7 +477,10 @@ def download_one_dataset(ds_config: dict, output_dir: str) -> str:
             f.write(corpus)
         
         size_mb = len(corpus.encode('utf-8')) / (1024 * 1024)
-        print(f"  ✓ {name}: {len(texts)} примеров, {size_mb:.1f} MB")
+        dropped = raw_count - len(texts)
+        drop_pct = (dropped / max(raw_count, 1)) * 100
+        print(f"  ✓ {name}: {len(texts)} примеров ({size_mb:.1f} MB) "
+              f"[quality: -{dropped} ({drop_pct:.0f}%) | dedup: {after_quality - after_dedup}]")
         return corpus
         
     except Exception as e:

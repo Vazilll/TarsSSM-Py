@@ -31,7 +31,10 @@ from typing import Optional, Tuple, Any
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from brain.mamba2.tars_block import TarsBlock, MemoryInjector
-from brain.mamba2.integral_auditor import IntegralAuditor, MetaAuditor
+from brain.mamba2.integral_auditor import (
+    IntegralAuditor, MetaAuditor, TDValueEstimator,
+    TemporalEmbedding, MetaCortex, DreamEngine,
+)
 from brain.mamba2.critic import CriticHead, WaveCritic, TaskSpec
 from brain.mamba2.matrix_pool import MatrixPool
 from brain.mamba2.novelty import NoveltyGate, HankelDetector
@@ -263,10 +266,9 @@ class GlobalWorkspace(nn.Module):
         # Competition gate: who gets the workspace?
         gates = F.softmax(self.competition(h_cat), dim=-1)  # [B, n_blocks]
         
-        # Winner-take-most broadcast
-        broadcast = torch.zeros_like(h_means[0])  # [B, d_model]
-        for i, h in enumerate(h_means):
-            broadcast = broadcast + gates[:, i:i+1] * h
+        # Winner-take-most broadcast (vectorized)
+        h_stack = torch.stack(h_means, dim=1)  # [B, n_blocks, d_model]
+        broadcast = torch.einsum('bn,bnd->bd', gates, h_stack)  # [B, d_model]
         
         # Project and mix
         broadcast = self.broadcast_proj(broadcast)  # [B, d_model]
@@ -404,6 +406,17 @@ class TarsMamba2LM(nn.Module):
         self.integral_auditor = IntegralAuditor(window=8, default_threshold=1.1)
         self.meta_auditor = MetaAuditor()
         
+        # ═══ Temporal Embedding (нейронные часы) ═══
+        # Мульти-частотные осцилляции: fast (100ms), medium (1s), slow (1h), circadian (24h)
+        self.temporal_embedding = TemporalEmbedding(d_model, n_frequencies=4)
+        
+        # ═══ MetaCortex (метакогниция — думать о думании) ═══
+        # Предсказывает P(error) и адаптирует глубину мышления
+        self.meta_cortex = MetaCortex(d_model=d_model, history_size=100)
+        
+        # ═══ DreamEngine (нейронное сновидение) ═══
+        self.dream_engine = DreamEngine(noise_scale=0.1, recombine_k=20)
+        
         # ═══ Hankel SVD (глобальный анти-цикл) ═══
         self.hankel = HankelDetector(window=6)
         
@@ -472,6 +485,30 @@ class TarsMamba2LM(nn.Module):
         
         # MoLE auxiliary loss (accumulated during forward)
         self.mole_aux_loss = torch.tensor(0.0)
+        
+        # ═══ Performance: CPU Threading + torch.compile ═══
+        import os as _os
+        n_threads = int(_os.environ.get('TARS_THREADS', _os.cpu_count() or 4))
+        torch.set_num_threads(n_threads)
+        torch.set_num_interop_threads(max(1, n_threads // 2))
+        self.logger.info(f"CPU threads: {n_threads} intra, {max(1, n_threads // 2)} inter")
+        
+        # torch.compile для 1.5-2x ускорения (PyTorch 2.0+)
+        self._compiled = False
+        if hasattr(torch, 'compile') and not _os.environ.get('TARS_NO_COMPILE'):
+            try:
+                import platform
+                # torch.compile работает стабильно на Linux; на Windows — экспериментально
+                if platform.system() != 'Windows' or _os.environ.get('TARS_FORCE_COMPILE'):
+                    self.forward = torch.compile(
+                        self.forward,
+                        mode="reduce-overhead",
+                        fullgraph=False,
+                    )
+                    self._compiled = True
+                    self.logger.info("torch.compile activated (reduce-overhead)")
+            except Exception as e:
+                self.logger.debug(f"torch.compile failed: {e}")
         
         # ═══ Speculative Decoding (Granite 4.0) ═══
         self.spec_draft_head = nn.Sequential(
@@ -602,28 +639,22 @@ class TarsMamba2LM(nn.Module):
             x, _ = self.wave_consolidations[wave_idx](x_left, x_right)
             
             # Lazy Spine: обновление только при новизне > 5%
-            if wave_idx < n_waves - 1 and hasattr(self, 'to_memory_space'):
-                try:
-                    h_curr = x.mean(dim=1)
-                    h_for_mem = self.to_memory_space(h_curr)
-                    if c["memory_vec"] is None:
-                        c["memory_vec"] = h_for_mem
-                    else:
-                        novelty = 1.0 - F.cosine_similarity(
-                            c["memory_vec"], h_for_mem, dim=-1
-                        ).mean()
-                        if novelty > 0.05:
-                            c["memory_vec"] = 0.7 * c["memory_vec"] + 0.3 * h_for_mem
-                except Exception:
-                    pass
+            if wave_idx < n_waves - 1:
+                h_curr = x.mean(dim=1)
+                h_for_mem = self.to_memory_space(h_curr)
+                if c["memory_vec"] is None:
+                    c["memory_vec"] = h_for_mem
+                else:
+                    novelty = 1.0 - F.cosine_similarity(
+                        c["memory_vec"], h_for_mem, dim=-1
+                    ).mean()
+                    if novelty > 0.05:
+                        c["memory_vec"] = 0.7 * c["memory_vec"] + 0.3 * h_for_mem
         
         # Final memory injection + output
-        if c["memory_vec"] is not None and hasattr(self, 'from_memory_space'):
-            try:
-                mem_signal = self.from_memory_space(c["memory_vec"])
-                x = x + 0.1 * mem_signal.unsqueeze(1)
-            except Exception:
-                pass
+        if c["memory_vec"] is not None:
+            mem_signal = self.from_memory_space(c["memory_vec"])
+            x = x + 0.1 * mem_signal.unsqueeze(1)
         
         x = self.norm_f(x)
         return self.lm_head(x)
@@ -746,6 +777,9 @@ class TarsMamba2LM(nn.Module):
         Returns: logits [B, L, vocab_size]
         """
         x = self.embedding(input_ids)  # [B, L, d_model]
+        
+        # ═══ Temporal Embedding: inject time sense ═══
+        x = self.temporal_embedding(x)
         
         wkv_states = [None] * self.n_layers
         x_prevs = [None] * self.n_layers
@@ -891,6 +925,20 @@ class TarsMamba2LM(nn.Module):
         
         # Meta-Auditor: тип задачи и порог
         task_type, p_threshold = self.meta_auditor.classify_task(query_text)
+        
+        # MetaCortex: метакогнитивная адаптация порога
+        # (если модель часто ошибалась на этом типе → повысить порог)
+        try:
+            with torch.no_grad():
+                # Используем текущий embedding запроса для предсказания ошибки
+                query_bytes = list(query_text.encode('cp1251', errors='replace'))[:256]
+                query_ids = torch.tensor([query_bytes], dtype=torch.long).to(input_ids.device)
+                query_emb = self.embedding(query_ids).mean(dim=1)  # [1, d_model]
+                error_pred = self.meta_cortex.predict_error(query_emb).item()
+                p_threshold = self.meta_cortex.adapt_threshold(p_threshold, task_type, error_pred)
+        except Exception:
+            error_pred = 0.5
+        
         self.integral_auditor.threshold = p_threshold
         
         # Start session AFTER task classification
@@ -1030,6 +1078,14 @@ class TarsMamba2LM(nn.Module):
             # Записываем merge данные в wave_experts
             wave_experts["merge_alpha"] = merge_alpha
             
+            # ═══ NaN/Inf Guard: protect hidden state ═══
+            if torch.isnan(x).any() or torch.isinf(x).any():
+                self.logger.warning(
+                    f"NaN/Inf detected at wave {wave_count}! Reverting to previous state."
+                )
+                x = wave_outputs.get(wave_count - 1, self.embedding(input_ids))
+                # Не считаем это конвергенцией — продолжаем
+            
             # Собираем surprise
             for stats in [stats_l, stats_r]:
                 if stats.get("surprise", 0.0) > 0.3:
@@ -1056,13 +1112,27 @@ class TarsMamba2LM(nn.Module):
                 f"p={ia_result['p']:.3f} | converged={ia_result['converged']}"
             )
             
-            # ── Сошлось? (два критерия: IA convergence ИЛИ ThinkingChain confidence) ──
-            ia_converged = ia_result["converged"] and wave_count >= 2
+            # ── Сошлось? (КОНСЕНСУС: максимальная защита от ложного выхода) ──
+            ia_converged = ia_result["converged"] and wave_count >= 3  # минимум 3 волны (6 блоков)
             tc_skip = hasattr(self, 'thinking_chain') and self.thinking_chain.should_skip_remaining()
             
-            if ia_converged or tc_skip:
+            # Для code/math/deep: КОНСЕНСУС (IA + TC/R² + Critic)
+            # Для chat/action: любой достаточен (OR) — скорость важнее
+            strict_tasks = {"code", "math", "deep"}
+            if task_type in strict_tasks:
+                ia_quality = ia_converged and ia_result["r_squared"] > 0.92
+                tc_quality = tc_skip
+                # Critic голос (если есть предыдущий результат)
+                critic_ok = critic_result is not None and critic_result.get("score", 0) > 0.6
+                # Нужно минимум 2 из 3: (IA_quality, TC_quality, Critic_ok)
+                votes = sum([ia_quality, tc_quality, critic_ok])
+                should_stop = ia_converged and votes >= 2
+            else:
+                should_stop = ia_converged or tc_skip
+            
+            if should_stop:
                 converged_early = True
-                skip_reason = "IA" if ia_converged else "ThinkingChain_confidence"
+                skip_reason = f"CONSENSUS({sum([ia_converged, tc_skip, critic_result is not None and critic_result.get('score',0)>0.6])}/3)"
                 self.logger.debug(
                     f"Converged at wave {wave_count} (depth={blocks_executed}, reason={skip_reason})"
                 )
@@ -1092,12 +1162,14 @@ class TarsMamba2LM(nn.Module):
                         if fb.shape == memory_vec.shape:
                             memory_vec = memory_vec + 0.3 * fb  # additive correction
                     
-                    # If critic says "all good" and IA also converging → early stop
-                    if critic_result["should_stop"] and ia_result["p"] > 0.5:
+                    # If critic says "all good" AND IA is well-converging → early stop
+                    # Ужесточённый критерий: p > 0.8 (was 0.5) + R² > 0.7 + wave >= 3
+                    ia_strong = ia_result["p"] > 0.8 and ia_result["r_squared"] > 0.7
+                    if critic_result["should_stop"] and ia_strong and wave_count >= 3:
                         converged_early = True
                         self.logger.debug(
-                            f"Critic approved at wave {wave_count} "
-                            f"(score={critic_result['score']:.0%})"
+                            f"Critic+IA approved at wave {wave_count} "
+                            f"(score={critic_result['score']:.0%}, p={ia_result['p']:.2f})"
                         )
                         break
                 except Exception as e:
@@ -1254,7 +1326,7 @@ class TarsMamba2LM(nn.Module):
                     f"p={ia_result['p']:.3f}"
                 )
                 
-                if ia_result["converged"]:
+                if ia_result["converged"] and ia_result["r_squared"] > 0.88:
                     converged_early = True
                     break
         
@@ -1339,6 +1411,11 @@ class TarsMamba2LM(nn.Module):
                     best_idx = idx
             
             if best_x is not None and best_p > prev_p:
+                # NaN guard на IDME результат
+                if torch.isnan(best_x).any() or torch.isinf(best_x).any():
+                    self.logger.warning(f"IDME round {expansion_round}: NaN in matrix output, skipping")
+                    no_improve_count += 1
+                    continue
                 x = x + 0.1 * (best_x - h_state).unsqueeze(1)
                 h_curr = x.mean(dim=1).detach()
                 ia_result = self.integral_auditor.observe(h_curr, h_prev)
@@ -1386,6 +1463,18 @@ class TarsMamba2LM(nn.Module):
                     self.thinking_chain.update_session_memory(memory_vec)
             except Exception:
                 pass
+        
+        # ═══ Output Sanity Check (Zero-Glitch Guard) ═══
+        # Проверяем что logits не содержат NaN/Inf и не дегенерированы
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+            self.logger.warning("CRITICAL: NaN/Inf in output logits! Replacing with uniform.")
+            logits = torch.zeros_like(logits)  # uniform → безопасный fallback
+        else:
+            # Проверка дегенерации: все logits одинаковые (мёртвая модель)
+            logit_std = logits.float().std().item()
+            if logit_std < 1e-6:
+                self.logger.warning(f"WARNING: Degenerate logits (std={logit_std:.8f}). Adding noise.")
+                logits = logits + torch.randn_like(logits) * 0.01
         
         total_time = (time.time() - start_time) * 1000
         

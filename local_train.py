@@ -14,7 +14,9 @@
   0. Dependencies
   1. Download (Wiki 100K + HF all presets + personality corpus)
   2. Reflex classifier (100 epochs)
+  2.5 RRN Spine routing (50 epochs, mode 1/2/3 classification)
   3. MinGRU LM (25 epochs)
+  3.5 SNN Spiking Synapses (30 epochs, SI-LIF + surrogate gradient)
   4. Mamba-2 Brain (4 sub-phases + personality + second pass)
   5. Quantize 1.58-bit
   6. Consolidate → models/tars_v3/
@@ -757,6 +759,29 @@ def main():
         results["mingru"] = ok
         if ok:
             mark_done(state, "mingru")
+    
+    # ══════════════════════════════════════════════════
+    # Phase 3.5: SNN Spiking Synapses
+    # ══════════════════════════════════════════════════
+    if should_run(3) and not is_done(state, "spiking"):
+        print("\n  ⚡ Phase 3.5: SNN Spiking Synapses (30 epochs)...")
+        snn_cmd = [
+            PYTHON, str(TRAINING / "train_spiking.py"),
+            "--dim", "256", "--heads", "4",
+            "--beta", "0.9", "--epochs", "30",
+            "--batch", "32", "--seq_len", "128",
+            "--lr", "3e-4",
+            "--device", device,
+        ]
+        if args.data_dir:
+            snn_cmd += ["--data_dir", args.data_dir]
+        if args.resume:
+            snn_cmd += ["--resume"]
+        
+        ok = run(snn_cmd, label="SNN")
+        results["spiking"] = ok
+        if ok:
+            mark_done(state, "spiking")
     
     # ══════════════════════════════════════════════════
     # Phase 4: Mamba-2 Brain — THE MAIN EVENT

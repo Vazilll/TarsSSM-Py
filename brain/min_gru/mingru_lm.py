@@ -12,20 +12,32 @@ try:
 except ImportError:
     from torch.nn import Linear as _Linear
 
-class FeedForward(nn.Module):
+class SwiGLUFeedForward(nn.Module):
+    """SwiGLU FFN — стандарт в LLaMA/Mistral/PaLM.
+    
+    Вместо Linear→GELU→Linear используем:
+    gate = SiLU(Linear(x))
+    value = Linear(x)  
+    out = Linear(gate ⊙ value)
+    
+    Hidden dim = 2/3 * mult * dim (чтобы 3 матрицы ≈ тот же param count).
+    """
     def __init__(self, dim, mult=4, dropout=0.0):
         super().__init__()
-        self.dim_inner = int(dim * mult)
-        self.net = nn.Sequential(
-            _Linear(dim, self.dim_inner),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            _Linear(self.dim_inner, dim),
-            nn.Dropout(dropout),
-        )
+        # 2/3 scaling чтобы 3 матрицы ≈ param count of 2 матрицы с GELU
+        self.dim_inner = int(dim * mult * 2 / 3)
+        self.w_gate = _Linear(dim, self.dim_inner, bias=False)
+        self.w_value = _Linear(dim, self.dim_inner, bias=False)
+        self.w_out = _Linear(self.dim_inner, dim, bias=False)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        return self.net(x)
+        gate = F.silu(self.w_gate(x))  # SiLU = x * sigmoid(x) = Swish
+        value = self.w_value(x)
+        return self.dropout(self.w_out(gate * value))
+
+# Alias для обратной совместимости
+FeedForward = SwiGLUFeedForward
 
 class CausalDepthWiseConv1d(nn.Module):
     def __init__(self, dim, kernel_size):
@@ -55,14 +67,20 @@ class MinGRUBlock(nn.Module):
     
     Works on hidden representations directly — no per-layer embedding/logits.
     """
-    def __init__(self, dim, num_layers=1, dropout=0.1):
+    def __init__(self, dim, num_layers=1, dropout=0.1, expansion_factor=1.5, num_heads=4):
         super().__init__()
-        self.conv = CausalDepthWiseConv1d(dim=dim, kernel_size=3)
+        self.conv = CausalDepthWiseConv1d(dim=dim, kernel_size=4)  # 4 = лучше для UTF-8 (рус. буквы = 2 байта)
         self.conv_norm = RMSNorm(dim)
         self.gru_norm = RMSNorm(dim)
-        self.gru = MinGRU(dim)
+        # Multi-Head MinGRU: разбиваем dim на num_heads голов
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.gru_heads = nn.ModuleList([
+            MinGRU(head_dim, expansion_factor=expansion_factor)
+            for _ in range(num_heads)
+        ])
         self.gru_dropout = nn.Dropout(dropout)
-        self.ff = FeedForward(dim, dropout=dropout)
+        self.ff = SwiGLUFeedForward(dim, dropout=dropout)
         self.ff_norm = RMSNorm(dim)
         
         # Residual scaling: 1/√num_layers (GPT-2 style, stabilizes deep nets)
@@ -80,10 +98,29 @@ class MinGRUBlock(nn.Module):
         # Always applied (causal padding handles L=1 correctly)
         x = self.conv(self.conv_norm(x)) * self.res_scale + x
         
-        # MinGRU recurrence
-        gru_out, next_hidden = self.gru(
-            self.gru_norm(x), prev_hidden, return_next_prev_hidden=True
-        )
+        # Multi-Head MinGRU recurrence
+        normed = self.gru_norm(x)
+        B, L, D = normed.shape
+        head_dim = D // self.num_heads
+        
+        # Split into heads: [B, L, D] → list of [B, L, head_dim]
+        head_inputs = normed.split(head_dim, dim=-1)
+        
+        # Split prev_hidden per head
+        if prev_hidden is not None:
+            prev_per_head = prev_hidden.split(head_dim, dim=-1)
+        else:
+            prev_per_head = [None] * self.num_heads
+        
+        head_outputs = []
+        head_hiddens = []
+        for i, (head, h_in, h_prev) in enumerate(zip(self.gru_heads, head_inputs, prev_per_head)):
+            h_out, h_next = head(h_in, h_prev, return_next_prev_hidden=True)
+            head_outputs.append(h_out)
+            head_hiddens.append(h_next)
+        
+        gru_out = torch.cat(head_outputs, dim=-1)  # [B, L, D]
+        next_hidden = torch.cat(head_hiddens, dim=-1)  # [B, 1, D]
         x = self.gru_dropout(gru_out) * self.res_scale + x
         
         # Feedforward
@@ -93,10 +130,11 @@ class MinGRUBlock(nn.Module):
 
 
 class MinGRU_LM(nn.Module):
-    def __init__(self, dim, num_tokens, num_layers, context_dim=1024, dropout=0.1):
+    def __init__(self, dim, num_tokens, num_layers, context_dim=1024, dropout=0.1, expansion_factor=1.5):
         super().__init__()
         self.dim = dim
         self.num_layers = num_layers
+        self.expansion_factor = expansion_factor
         
         # ═══ Единый эмбеддинг (shared with LM head via weight tying) ═══
         self.embedding = nn.Embedding(num_tokens, dim)
@@ -104,7 +142,7 @@ class MinGRU_LM(nn.Module):
         
         # ═══ MinGRU blocks (operate on hidden dim, no per-layer logits) ═══
         self.blocks = nn.ModuleList([
-            MinGRUBlock(dim, num_layers=num_layers, dropout=dropout)
+            MinGRUBlock(dim, num_layers=num_layers, dropout=dropout, expansion_factor=expansion_factor)
             for _ in range(num_layers)
         ])
         

@@ -155,6 +155,18 @@ def augment_with_huggingface():
                 with open(hf_file, 'r', encoding='utf-8') as f:
                     text = f.read()
                 if len(text) > 1000:
+                    # ═══ Quality clean at load time ═══
+                    import re as _re
+                    text = _re.sub(r'<[^>]+>', '', text)         # HTML tags
+                    text = _re.sub(r'https?://\S+', '', text)    # URLs
+                    text = _re.sub(r'[ \t]{4,}', '  ', text)    # excess spaces
+                    text = _re.sub(r'\n{5,}', '\n\n\n', text)   # excess newlines
+                    text = _re.sub(r'([!?.])\1{4,}', r'\1\1\1', text)  # repeated punct
+                    # Remove very short paragraphs (< 30 chars)
+                    paragraphs = text.split('\n\n')
+                    paragraphs = [p for p in paragraphs if len(p.strip()) >= 30]
+                    text = '\n\n'.join(paragraphs)
+                    
                     text_bytes = len(text.encode('cp1251', errors='replace'))
                     # Проверяем лимит — MinGRU не нужно 455MB
                     if total_bytes + text_bytes > MAX_AUGMENT_BYTES:

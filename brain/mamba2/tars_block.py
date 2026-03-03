@@ -179,11 +179,9 @@ class TarsBlock(nn.Module):
         )
         x = residual + self.drop(core_out)
         
-        # ═══ Cache h_mean once (used by RAG, NoveltyGate) ═══
-        h_mean = x.mean(dim=1)  # [B, d_model]
-        
-        # ═══ RAG injection ═══
+        # ═══ RAG injection (lazy h_mean — only compute when needed) ═══
         if rag_state is not None:
+            h_mean = x.mean(dim=1)  # [B, d_model]
             q = self.rag_query(h_mean)
             info = torch.bmm(rag_state, q.unsqueeze(-1)).squeeze(-1)
             x = x + 0.1 * self.rag_out(info).unsqueeze(1)

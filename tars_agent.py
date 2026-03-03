@@ -345,31 +345,44 @@ class TarsAgent:
     
     async def _gather_context(self, query: str, intent: str,
                                steps: List[Step]) -> List[str]:
-        """Собрать контекст из всех источников параллельно."""
+        """Собрать контекст из всех источников ПАРАЛЛЕЛЬНО."""
         t = time.time()
         context = []
         
-        # LEANN память
-        try:
-            docs = self.memory.search(query, top_k=5)
-            if docs:
-                context.extend(docs)
-        except Exception:
-            pass
+        # ═══ Parallel context gathering (asyncio) ═══
+        async def _search_leann():
+            try:
+                return self.memory.search(query, top_k=5) or []
+            except Exception:
+                return []
         
-        # Навыки
-        matching_skill = self.skill_registry.get(query)
-        if matching_skill:
-            context.append(f"[Skill:{matching_skill.name}] {matching_skill.description}")
+        async def _search_skills():
+            skill = self.skill_registry.get(query)
+            if skill:
+                return [f"[Skill:{skill.name}] {skill.description}"]
+            return []
         
-        # Предыдущий контекст из истории
-        for h in self.history[-4:]:
-            if any(w in h.get("content", "").lower() for w in query.lower().split() if len(w) > 3):
-                context.append(f"[History] {h['content'][:200]}")
-                break
+        async def _search_history():
+            results = []
+            for h in self.history[-4:]:
+                if any(w in h.get("content", "").lower() for w in query.lower().split() if len(w) > 3):
+                    results.append(f"[History] {h['content'][:200]}")
+                    break
+            return results
+        
+        # Запускаем ВСЁ параллельно
+        leann_res, skill_res, hist_res = await asyncio.gather(
+            _search_leann(),
+            _search_skills(),
+            _search_history(),
+        )
+        
+        context.extend(leann_res)
+        context.extend(skill_res)
+        context.extend(hist_res)
         
         dur = time.time() - t
-        steps.append(Step("search", f"Контекст: {len(context)} источников", duration=dur))
+        steps.append(Step("search", f"Контекст: {len(context)} источников (parallel)", duration=dur))
         return context
     
     def _get_handler(self, intent: str):

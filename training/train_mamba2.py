@@ -144,12 +144,24 @@ def load_corpus(data_path=None, download_wiki=True):
     # 4. HuggingFace датасеты (data/hf_*.txt)
     hf_dir = ROOT / "data"
     if hf_dir.exists():
+        import re as _re
         hf_files = sorted(hf_dir.glob("hf_*.txt"))
         for hf_file in hf_files:
             try:
                 with open(hf_file, 'r', encoding='utf-8') as f:
                     hf_text = f.read()
                 if len(hf_text) > 1000:
+                    # ═══ Quality clean at load time ═══
+                    hf_text = _re.sub(r'<[^>]+>', '', hf_text)          # HTML
+                    hf_text = _re.sub(r'https?://\S+', '', hf_text)     # URLs
+                    hf_text = _re.sub(r'[ \t]{4,}', '  ', hf_text)     # spaces
+                    hf_text = _re.sub(r'\n{5,}', '\n\n\n', hf_text)    # newlines
+                    hf_text = _re.sub(r'([!?.])\1{4,}', r'\1\1\1', hf_text)  # punct
+                    # Remove very short paragraphs
+                    paras = hf_text.split('\n\n')
+                    paras = [p for p in paras if len(p.strip()) >= 30]
+                    hf_text = '\n\n'.join(paras)
+                    
                     parts.append(hf_text)
                     hf_mb = len(hf_text.encode('utf-8')) / (1024 * 1024)
                     print(f"[Data] HF {hf_file.stem}: {len(hf_text):,} символов ({hf_mb:.1f} MB)")
@@ -645,11 +657,11 @@ def train(args):
         train_in_s = c_train_in[perm]
         train_tgt_s = c_train_tgt[perm]
         
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         
         for i in range(0, len(train_in_s), args.batch):
-            batch_in = train_in_s[i:i+args.batch].to(device)
-            batch_tgt = train_tgt_s[i:i+args.batch].to(device)
+            batch_in = train_in_s[i:i+args.batch].to(device, non_blocking=True)
+            batch_tgt = train_tgt_s[i:i+args.batch].to(device, non_blocking=True)
             
             if use_amp:
                 with torch.amp.autocast('cuda', dtype=amp_dtype):
@@ -696,7 +708,7 @@ def train(args):
                     scaler.update()
                 else:
                     optimizer.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
         
         # Eval
@@ -704,8 +716,8 @@ def train(args):
         with torch.no_grad():
             eval_losses = []
             for j in range(0, len(c_test_in), args.batch):
-                test_batch = c_test_in[j:j+args.batch].to(device)
-                test_tgt_batch = c_test_tgt[j:j+args.batch].to(device)
+                test_batch = c_test_in[j:j+args.batch].to(device, non_blocking=True)
+                test_tgt_batch = c_test_tgt[j:j+args.batch].to(device, non_blocking=True)
                 logits = forward_model(test_batch)
                 el = F.cross_entropy(
                     logits.view(-1, actual_vocab),
@@ -811,8 +823,8 @@ def train(args):
             perm = torch.randperm(len(p_train_in))
             for pi in range(0, len(p_train_in), args.batch):
                 idx = perm[pi:pi+args.batch]
-                b_in = p_train_in[idx].to(device)
-                b_tgt = p_train_tgt[idx].to(device)
+                b_in = p_train_in[idx].to(device, non_blocking=True)
+                b_tgt = p_train_tgt[idx].to(device, non_blocking=True)
                 
                 if use_amp:
                     with torch.amp.autocast('cuda', dtype=amp_dtype):
@@ -835,7 +847,7 @@ def train(args):
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     p_optimizer.step()
                 
-                p_optimizer.zero_grad()
+                p_optimizer.zero_grad(set_to_none=True)
                 p_loss_sum += loss.item()
                 p_n += 1
             
@@ -844,8 +856,8 @@ def train(args):
             with torch.no_grad():
                 p_eval = []
                 for pj in range(0, len(p_test_in), args.batch):
-                    tb = p_test_in[pj:pj+args.batch].to(device)
-                    tt = p_test_tgt[pj:pj+args.batch].to(device)
+                    tb = p_test_in[pj:pj+args.batch].to(device, non_blocking=True)
+                    tt = p_test_tgt[pj:pj+args.batch].to(device, non_blocking=True)
                     logits = forward_model(tb)
                     p_eval.append(F.cross_entropy(logits.view(-1, actual_vocab), tt.view(-1)).item())
             

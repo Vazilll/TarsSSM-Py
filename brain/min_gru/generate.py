@@ -1,7 +1,7 @@
 import torch
 from .utils import decode_tokens, tokenize_text
 
-def generate_text(model, start_text="Привет", max_length=128, temperature=0.7, device='cuda', context_vec=None, top_k=20, repetition_penalty=1.3):
+def generate_text(model, start_text="Привет", max_length=128, temperature=0.7, device='cuda', context_vec=None, top_k=20, top_p=0.9, repetition_penalty=1.3):
     """
     Генерация текста через MinGRU_LM в full-context режиме.
     
@@ -16,6 +16,7 @@ def generate_text(model, start_text="Привет", max_length=128, temperature=
         device: устройство
         context_vec: [1, context_dim] вектор из Ω-SSM (опционально)
         top_k: кол-во лучших токенов для сэмплирования (0 = отключено)
+        top_p: nucleus sampling — кумулятивный порог вероятности (0 = отключено)
         repetition_penalty: штраф за повторение уже сгенерированных токенов
     """
     model.eval()
@@ -67,6 +68,17 @@ def generate_text(model, start_text="Привет", max_length=128, temperature=
             if top_k > 0 and top_k < next_logits.size(-1):
                 topk_vals, _ = torch.topk(next_logits, top_k)
                 next_logits[next_logits < topk_vals[-1]] = float('-inf')
+            
+            # Top-p (nucleus) filtering
+            if top_p > 0 and top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
+                cumulative_probs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+                # Remove tokens with cumulative probability above the threshold
+                sorted_indices_to_remove = cumulative_probs > top_p
+                # Keep at least one token
+                sorted_indices_to_remove[0] = False
+                indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                next_logits[indices_to_remove] = float('-inf')
             
             probs = torch.softmax(next_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1).item()

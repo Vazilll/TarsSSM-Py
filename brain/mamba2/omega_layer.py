@@ -71,6 +71,9 @@ class OmegaSSMLayer(nn.Module):
         self.omega_out = UniversalLinear(omega_dim, d_model, bias=True, mode=quant_mode)
         self.omega_mix = nn.Parameter(torch.tensor(0.1))
         
+        # ═══ Cached triu indices (constant, no need to recreate each forward) ═══
+        self.register_buffer('_triu_idx', torch.triu_indices(omega_dim, omega_dim, offset=1), persistent=False)
+        
         # ═══ Дискретная часть: VQ Codebook ═══
         self.vq_codebook = nn.Embedding(vq_codes, vq_dim)
         self.vq_proj_in = UniversalLinear(d_model, vq_dim, bias=True, mode=quant_mode)
@@ -86,11 +89,9 @@ class OmegaSSMLayer(nn.Module):
         Ω = -Ωᵀ (это гарантирует exp(Ω) ∈ SO(n))
         """
         batch = params.shape[0]
-        omega = torch.zeros(batch, self.omega_dim, self.omega_dim, 
-                          device=params.device, dtype=params.dtype)
-        # Заполняем верхний треугольник
-        idx = torch.triu_indices(self.omega_dim, self.omega_dim, offset=1)
-        omega[:, idx[0], idx[1]] = params
+        omega = params.new_zeros(batch, self.omega_dim, self.omega_dim)
+        # Заполняем верхний треугольник (cached indices)
+        omega[:, self._triu_idx[0], self._triu_idx[1]] = params
         # Антисимметрия: нижний = -верхний
         omega = omega - omega.transpose(-1, -2)
         return omega
@@ -115,11 +116,7 @@ class OmegaSSMLayer(nn.Module):
         
         # Применяем G к первым omega_dim измерениям x
         x_head = x[:, :, :self.omega_dim]               # [B, L, omega_dim]
-        x_rotated = torch.bmm(
-            x_head.reshape(-1, x_head.shape[-1]).unsqueeze(1),  
-            G.unsqueeze(1).expand(-1, x.shape[1], -1, -1)
-                .reshape(-1, self.omega_dim, self.omega_dim)
-        ).squeeze(1).reshape(x.shape[0], x.shape[1], self.omega_dim)
+        x_rotated = torch.einsum('bld,bde->ble', x_head, G)  # [B, L, omega_dim]
         
         lie_out = self.omega_out(x_rotated)  # [B, L, d_model]
         

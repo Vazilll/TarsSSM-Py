@@ -129,7 +129,7 @@ def ssd_scan(X, A, B, C, chunk_size=64, initial_states=None):
     
     # 3. Inter-chunk recurrence
     if initial_states is None:
-        initial_states = torch.zeros_like(states[:, :1])
+        initial_states = states.new_zeros(states[:, :1].shape)
     states = torch.cat([initial_states, states], dim=1)
     
     decay_chunk = torch.exp(segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0))))
@@ -217,10 +217,10 @@ def wkv_scan(
     B, L, S = r.shape
     
     if state is None:
-        state = torch.zeros(B, S, S, device=r.device, dtype=r.dtype)
+        state = r.new_zeros(B, S, S)
     
     # Pre-allocate output tensor (zeros for determinism with gradient checkpointing)
-    output = torch.zeros(B, L, S, device=r.device, dtype=r.dtype)
+    output = r.new_zeros(B, L, S)
     
     # Single-token fast path (inference)
     if L == 1:
@@ -228,14 +228,21 @@ def wkv_scan(
         output[:, 0] = y_t
         return output, state
     
-    # Chunked processing (training): reduces Python loop overhead
+    # Chunked processing (training): pre-slice per chunk to reduce indexing overhead
     for chunk_start in range(0, L, chunk_size):
         chunk_end = min(chunk_start + chunk_size, L)
-        for t in range(chunk_start, chunk_end):
+        # Pre-slice chunk tensors — single slice op vs per-token indexing
+        k_c = k[:, chunk_start:chunk_end]
+        v_c = v[:, chunk_start:chunk_end]
+        r_c = r[:, chunk_start:chunk_end]
+        w_c = w[:, chunk_start:chunk_end]
+        b_c = bonus[:, chunk_start:chunk_end]
+        cs = chunk_end - chunk_start
+        for t in range(cs):
             y_t, state = _wkv_step(
-                state, k[:, t], v[:, t], r[:, t], w[:, t], bonus[:, t]
+                state, k_c[:, t], v_c[:, t], r_c[:, t], w_c[:, t], b_c[:, t]
             )
-            output[:, t] = y_t
+            output[:, chunk_start + t] = y_t
     
     return output, state
 
