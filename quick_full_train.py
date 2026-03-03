@@ -79,25 +79,49 @@ TIME_BUDGET = args.time  # minutes
 # GPU Detection
 # ═══════════════════════════════════════════
 
-def detect_gpu():
-    if args.cpu:
-        return "CPU", 0, 0, "cpu", False
+def _get_ram_gb():
+    """Get RAM without psutil (works on Linux + Windows)."""
     try:
-        import torch
-        if torch.cuda.is_available():
-            name = torch.cuda.get_device_name(0)
-            vram = torch.cuda.get_device_properties(0).total_mem / 1024**3
-            bf16 = torch.cuda.is_bf16_supported()
-            # Get RAM
-            try:
-                import psutil
-                ram_gb = psutil.virtual_memory().total / 1024**3
-            except ImportError:
-                ram_gb = 64  # Default assumption
-            return name, vram, ram_gb, "cuda", bf16
+        import psutil
+        return psutil.virtual_memory().total / 1024**3
+    except ImportError:
+        pass
+    # Linux fallback: /proc/meminfo
+    try:
+        with open('/proc/meminfo') as f:
+            for line in f:
+                if line.startswith('MemTotal:'):
+                    return int(line.split()[1]) / 1024 / 1024
     except Exception:
         pass
-    return "CPU", 0, 64, "cpu", False
+    # Windows fallback: wmic
+    try:
+        import subprocess
+        out = subprocess.check_output(['wmic', 'OS', 'get', 'TotalVisibleMemorySize'], text=True)
+        for line in out.strip().split('\n'):
+            line = line.strip()
+            if line.isdigit():
+                return int(line) / 1024 / 1024
+    except Exception:
+        pass
+    return 64  # Default
+
+def detect_gpu():
+    if args.cpu:
+        return "CPU", 0, _get_ram_gb(), "cpu", False
+    try:
+        import torch
+    except ImportError:
+        return "CPU", 0, _get_ram_gb(), "cpu", False
+    
+    if not torch.cuda.is_available():
+        return "CPU", 0, _get_ram_gb(), "cpu", False
+    
+    name = torch.cuda.get_device_name(0)
+    vram = torch.cuda.get_device_properties(0).total_mem / 1024**3
+    bf16 = torch.cuda.is_bf16_supported()
+    ram_gb = _get_ram_gb()
+    return name, vram, ram_gb, "cuda", bf16
 
 gpu_name, vram_gb, ram_gb, device, bf16 = detect_gpu()
 
@@ -391,22 +415,95 @@ def main():
     print("─" * 65)
     
     # ════════════════════════════════════════
-    # Phase 0: Data Check
+    # Phase 0: Download ALL Data (like local_train.py)
     # ════════════════════════════════════════
     data_path = Path(data_dir)
+    data_path.mkdir(parents=True, exist_ok=True)
+    
+    if not args.skip_download:
+        print(f"\n  📚 Phase 0: Data Download...")
+        print(f"     📂 Data dir: {data_path}")
+        
+        # 1. Wikipedia (5000 статей для quick)
+        wiki_path = data_path / "wiki_ru.txt"
+        if not wiki_path.exists() or wiki_path.stat().st_size < 100_000:
+            wiki_script = TRAINING / "download_wiki.py"
+            if wiki_script.exists():
+                wiki_count = 5000 if vram_gb >= 20 else 2000
+                print(f"\n     📖 Wikipedia: {wiki_count:,} статей...")
+                run([
+                    PYTHON, str(wiki_script),
+                    "--count", str(wiki_count),
+                    "--output", str(wiki_path),
+                ], label="Wiki", timeout=600)
+            else:
+                print(f"     ⏭ download_wiki.py не найден")
+        else:
+            wiki_mb = wiki_path.stat().st_size / (1024 * 1024)
+            print(f"\n     ✓ Wikipedia: {wiki_mb:.1f} MB (кеш)")
+        
+        # 2. HuggingFace datasets
+        hf_script = TRAINING / "download_hf_dataset.py"
+        if hf_script.exists():
+            max_docs = 10000 if vram_gb >= 20 else 5000
+            print(f"\n     📦 HuggingFace datasets (max_docs={max_docs:,})...")
+            run([
+                PYTHON, str(hf_script),
+                "--preset", "all",
+                "--output", str(data_path),
+                "--max_docs", str(max_docs),
+            ], label="HF", timeout=600)
+        
+        # 3. Personality corpus
+        personality = data_path / "tars_personality_mega.txt"
+        if not personality.exists() or personality.stat().st_size < 10_000:
+            gen_script = TRAINING / "generate_tars_corpus.py"
+            if gen_script.exists():
+                print(f"\n     🧠 Generating personality corpus...")
+                run([PYTHON, str(gen_script)], label="Personality", timeout=300)
+            else:
+                print(f"     ⏭ generate_tars_corpus.py не найден")
+        else:
+            print(f"     ✓ Personality: {personality.stat().st_size // 1024} KB (кеш)")
+        
+        # 4. Synthetic STEM data
+        stem_path = data_path / "synthetic_stem.jsonl"
+        if not stem_path.exists():
+            gen_synth = TRAINING / "generate_synthetic.py"
+            if gen_synth.exists():
+                print(f"\n     🔬 Generating synthetic STEM data...")
+                run([PYTHON, str(gen_synth)], label="STEM", timeout=300)
+        else:
+            print(f"     ✓ STEM: {stem_path.stat().st_size // 1024} KB (кеш)")
+    
+    # Data summary
     txt_files = list(data_path.glob("*.txt")) if data_path.exists() else []
+    jsonl_files = list(data_path.glob("*.jsonl")) if data_path.exists() else []
+    all_data_files = txt_files + jsonl_files
+    total_mb = sum(f.stat().st_size for f in all_data_files) / 1024 / 1024
     
-    if not txt_files and not args.skip_download:
-        print(f"\n  📚 Phase 0: Downloading data (max_docs=5000)...")
-        ok = run([
-            PYTHON, str(TRAINING / "download_hf_dataset.py"),
-            "--preset", "all", "--max_docs", "5000",
-        ], label="Download", timeout=600)
-        results["download"] = ok
-        txt_files = list(data_path.glob("*.txt")) if data_path.exists() else []
+    print(f"\n  {'─' * 50}")
+    print(f"  📁 Данные ({len(all_data_files)} файлов, {total_mb:.1f} MB):")
+    for f in sorted(all_data_files, key=lambda x: x.stat().st_size, reverse=True)[:10]:
+        mb = f.stat().st_size / (1024 * 1024)
+        if mb > 0.01:
+            print(f"     {f.name:35s} {mb:8.1f} MB")
     
-    total_mb = sum(f.stat().st_size for f in txt_files) / 1024 / 1024
-    print(f"\n  📁 Data: {len(txt_files)} files, {total_mb:.1f} MB")
+    # Check shards
+    for shard_dir in sorted(data_path.glob("shards_*")):
+        if shard_dir.is_dir():
+            shard_files = list(shard_dir.glob("shard_*.txt"))
+            shard_mb = sum(f.stat().st_size for f in shard_files) / 1024 / 1024
+            total_mb += shard_mb
+            print(f"     {shard_dir.name + '/':35s} {shard_mb:8.1f} MB ({len(shard_files)} shards)")
+    
+    print(f"  {'─' * 50}")
+    print(f"  Итого: {total_mb:.1f} MB ({total_mb / 1024:.2f} GB)")
+    
+    if total_mb < 1.0:
+        print(f"\n  ⚠️  МАЛО ДАННЫХ! Обучение будет слабым.")
+        print(f"     Скачайте данные: python local_train.py --download-only")
+        print(f"     Или укажите папку: python quick_full_train.py --data_dir /path/to/data")
     
     # ════════════════════════════════════════
     # Phase 1: Reflex Classifier
@@ -415,11 +512,13 @@ def main():
     
     reflex_script = TRAINING / "train_reflex.py"
     if reflex_script.exists():
-        ok = run([
+        reflex_cmd = [
             PYTHON, str(reflex_script),
             "--epochs", str(CFG["reflex_epochs"]),
-            "--device", device,
-        ], label="Reflex", timeout=300)
+        ]
+        if device == "cpu":
+            reflex_cmd += ["--cpu"]
+        ok = run(reflex_cmd, label="Reflex", timeout=300)
         results["reflex"] = ok
     else:
         print(f"     ⏭ Не найден — пропускаю")
@@ -432,11 +531,13 @@ def main():
     
     rrn_script = TRAINING / "train_rrn.py"
     if rrn_script.exists():
-        ok = run([
+        rrn_cmd = [
             PYTHON, str(rrn_script),
             "--epochs", str(CFG["rrn_epochs"]),
-            "--device", device,
-        ], label="RRN", timeout=300)
+        ]
+        if device == "cpu":
+            rrn_cmd += ["--cpu"]
+        ok = run(rrn_cmd, label="RRN", timeout=300)
         results["rrn"] = ok
     else:
         print(f"     ⏭ Не найден — пропускаю")
