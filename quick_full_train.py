@@ -118,8 +118,12 @@ def detect_gpu():
         return "CPU", 0, _get_ram_gb(), "cpu", False
     
     name = torch.cuda.get_device_name(0)
-    vram = torch.cuda.get_device_properties(0).total_mem / 1024**3
-    bf16 = torch.cuda.is_bf16_supported()
+    vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    bf16 = False
+    try:
+        bf16 = torch.cuda.is_bf16_supported()
+    except AttributeError:
+        bf16 = torch.cuda.get_device_capability(0) >= (8, 0)
     ram_gb = _get_ram_gb()
     return name, vram, ram_gb, "cuda", bf16
 
@@ -362,7 +366,7 @@ def vram_status():
         import torch
         if torch.cuda.is_available():
             used = torch.cuda.memory_allocated() / 1024**3
-            total = torch.cuda.get_device_properties(0).total_mem / 1024**3
+            total = torch.cuda.get_device_properties(0).total_memory / 1024**3
             return f"{used:.1f}/{total:.1f} GB"
     except Exception:
         pass
