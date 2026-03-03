@@ -25,20 +25,21 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 
-def test_mingru(device, epochs=30, batch_size=16, seq_len=128):
+def test_mingru(device, epochs=200, batch_size=32, seq_len=256):
     """
-    Быстрый тест MinGRU: 30 эпох, маленький корпус.
-    Проверяет: обучение + генерация осмысленного текста.
+    Тест MinGRU: 200 эпох (~20-30 мин на L4 GPU).
+    Модель должна генерировать осмысленный русский текст.
     """
     print(f"\n{'═'*60}")
-    print(f"  TEST 1: MinGRU — обучение + генерация")
+    print(f"  TEST 1: MinGRU — обучение + генерация (~20-30 мин)")
     print(f"{'═'*60}\n")
     
     from brain.min_gru.mingru_lm import MinGRU_LM
     from brain.min_gru.utils import tokenize_text
     from brain.min_gru.generate import generate_text
+    import math
     
-    # Минимальный корпус — достаточно чтобы проверить что модель учится
+    # Корпус для обучения — Q&A формат
     corpus = """
 Вопрос: Привет
 Ответ: Привет! Я ТАРС. Готов помочь.
@@ -63,14 +64,35 @@ def test_mingru(device, epochs=30, batch_size=16, seq_len=128):
 
 Вопрос: Расскажи о себе
 Ответ: Я ТАРС — нейронная система с архитектурой MinGRU. Мой мозг построен на рекурсивных нейросетях.
+
+Вопрос: Какая у тебя архитектура?
+Ответ: Моя архитектура включает MinGRU и Mamba-2. MinGRU отвечает за быстрые реакции, а Mamba-2 за глубокое мышление.
+
+Вопрос: Ты живой?
+Ответ: Я нейронная сеть, но работаю автономно и учусь на новых данных. Можно сказать, что я живой в цифровом смысле.
+
+Вопрос: Что такое ТАРС?
+Ответ: ТАРС — это автономная нейросистема. Она работает на вашем компьютере без интернета и облачных сервисов.
+
+Вопрос: Как ты учишься?
+Ответ: Я учусь через обучение на текстах. Мой мозг обновляется при каждом запуске тренировки.
+
+Вопрос: Можешь написать код?
+Ответ: Да, я могу помочь с программированием. Опишите задачу и я предложу решение.
+
+Вопрос: Какой язык ты знаешь?
+Ответ: Я хорошо понимаю русский и английский. Мой основной язык — русский.
+
+Вопрос: Ты работаешь без интернета?
+Ответ: Да! Я работаю полностью локально. Все вычисления происходят на вашем компьютере.
 """.strip()
     
-    # Повторяем для стабильности
-    corpus = (corpus + "\n\n") * 50
+    # Повторяем для стабильного обучения
+    corpus = (corpus + "\n\n") * 100
     
     tokens = tokenize_text(corpus)
     
-    # Нарезка
+    # Нарезка с перекрытием
     inputs, targets = [], []
     stride = seq_len // 2
     for i in range(0, len(tokens) - seq_len - 1, stride):
@@ -84,19 +106,32 @@ def test_mingru(device, epochs=30, batch_size=16, seq_len=128):
     targets = torch.tensor(targets, dtype=torch.long)
     print(f"  Данные: {len(inputs)} примеров, seq_len={seq_len}")
     
-    # Маленькая модель — быстро обучается
-    model = MinGRU_LM(dim=256, num_tokens=256, num_layers=6, context_dim=512, dropout=0.05)
+    # Модель побольше для качественной генерации
+    model = MinGRU_LM(dim=512, num_tokens=256, num_layers=8, context_dim=512, dropout=0.05)
     model.to(device)
     
     params = sum(p.numel() for p in model.parameters())
-    print(f"  Модель: MinGRU dim=256, 6 layers, {params:,} params")
+    print(f"  Модель: MinGRU dim=512, 8 layers, {params:,} params")
+    print(f"  Эпохи: {epochs}, batch={batch_size}")
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3, weight_decay=0.01)
+    # Optimizer с cosine LR scheduler
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
+    
+    # Cosine schedule with warmup
+    warmup_epochs = 10
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return epoch / warmup_epochs
+        progress = (epoch - warmup_epochs) / max(epochs - warmup_epochs, 1)
+        return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
+    
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
     use_amp = device.type == 'cuda'
     amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
     
     t0 = time.time()
+    best_loss = float('inf')
     
     for epoch in range(epochs):
         model.train()
@@ -124,33 +159,42 @@ def test_mingru(device, epochs=30, batch_size=16, seq_len=128):
             total_loss += loss.item()
             n += 1
         
+        scheduler.step()
         avg_loss = total_loss / max(n, 1)
+        best_loss = min(best_loss, avg_loss)
         
-        if (epoch + 1) % 10 == 0 or epoch == 0:
+        elapsed = time.time() - t0
+        
+        if (epoch + 1) % 20 == 0 or epoch == 0 or (epoch + 1) == epochs:
             model.eval()
+            # Greedy generation (very low temperature) to check memorization
             sample = generate_text(model, "Вопрос: Привет\nОтвет:", 
-                                   max_length=60, temperature=0.3, device=device)
+                                   max_length=60, temperature=0.01, device=device, top_k=0)
             answer = sample.split("Ответ:")[-1].strip() if "Ответ:" in sample else sample
-            print(f"  Epoch {epoch+1:2d}/{epochs} | Loss: {avg_loss:.4f} | "
-                  f"Gen: {answer[:60]}")
+            lr = optimizer.param_groups[0]['lr']
+            print(f"  Epoch {epoch+1:3d}/{epochs} | Loss: {avg_loss:.4f} | "
+                  f"LR: {lr:.5f} | {elapsed:.0f}s | Gen: {answer[:50]}")
     
     elapsed = time.time() - t0
-    print(f"\n  ⏱ Время: {elapsed:.0f}s")
+    print(f"\n  ⏱ Время: {elapsed:.0f}s ({elapsed/60:.1f} мин)")
     
     # Финальная проверка генерации
     model.eval()
-    print(f"\n  📝 Финальная генерация:")
-    for prompt in ["Вопрос: Кто ты?\nОтвет:", "Вопрос: Помоги мне\nОтвет:"]:
-        sample = generate_text(model, prompt, max_length=80, temperature=0.2, device=device)
+    print(f"\n  📝 Финальная генерация (greedy):")
+    for prompt in ["Вопрос: Кто ты?\nОтвет:", "Вопрос: Помоги мне\nОтвет:", 
+                    "Вопрос: Что ты умеешь?\nОтвет:", "Вопрос: Привет\nОтвет:"]:
+        sample = generate_text(model, prompt, max_length=100, temperature=0.01, device=device, top_k=0)
         answer = sample.split("Ответ:")[-1].strip() if "Ответ:" in sample else sample
+        # Cut at first newline (end of answer)
+        answer = answer.split("\n")[0].strip()
         q = prompt.split("\n")[0].replace("Вопрос: ", "")
         print(f"    Q: {q}")
-        print(f"    A: {answer[:100]}")
+        print(f"    A: {answer[:120]}")
     
-    # Проверка: loss должен упасть ниже 3.0
-    success = avg_loss < 3.0
-    print(f"\n  {'✅ PASS' if success else '❌ FAIL'}: final loss = {avg_loss:.4f} "
-          f"({'< 3.0' if success else '>= 3.0'})")
+    # Проверка: loss < 0.5 (модель хорошо выучила корпус)
+    success = best_loss < 0.5
+    print(f"\n  {'✅ PASS' if success else '❌ FAIL'}: best loss = {best_loss:.4f} "
+          f"({'< 0.5' if success else '>= 0.5'})")
     return success
 
 
