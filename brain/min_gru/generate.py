@@ -1,20 +1,22 @@
 import torch
 from .utils import decode_tokens, tokenize_text
 
-def generate_text(model, start_text="Привет", max_length=128, temperature=0.7, device='cuda', context_vec=None, top_k=20):
+def generate_text(model, start_text="Привет", max_length=128, temperature=0.7, device='cuda', context_vec=None, top_k=20, repetition_penalty=1.3):
     """
-    Генерация текста через MinGRU_LM с инкрементальным декодированием.
+    Генерация текста через MinGRU_LM в full-context режиме.
     
-    Phase 1: Prompt обрабатывается в FULL SEQUENCE mode (с Conv1d).
-    Phase 2: Инкрементальная генерация — по одному токену.
+    Каждый шаг обрабатывает ВСЮ последовательность (prompt + сгенерированные токены),
+    чтобы Conv1d видел полный контекст, как при обучении.
     
     Args:
         model: MinGRU_LM модель
         start_text: затравка (промпт)
         max_length: макс. количество генерируемых байтов
-        temperature: температура сэмплирования (0.1 = детерминированно, 1.0 = креативно)
+        temperature: температура сэмплирования
         device: устройство
-        context_vec: [1, context_dim] вектор из Ω-SSM/RRN для кондиционирования (опционально)
+        context_vec: [1, context_dim] вектор из Ω-SSM (опционально)
+        top_k: кол-во лучших токенов для сэмплирования (0 = отключено)
+        repetition_penalty: штраф за повторение уже сгенерированных токенов
     """
     model.eval()
     
@@ -25,7 +27,7 @@ def generate_text(model, start_text="Привет", max_length=128, temperature=
     if not isinstance(device, torch.device):
         device = next(model.parameters()).device
     
-    # Подготовка контекста (инжекция Ω-SSM вектора)
+    # Подготовка контекста
     ctx = None
     if context_vec is not None:
         if not isinstance(context_vec, torch.Tensor):
@@ -35,48 +37,44 @@ def generate_text(model, start_text="Привет", max_length=128, temperature=
     generated_tokens = tokens.copy()
     
     with torch.no_grad():
-        input_tensor = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(device)
-        
-        # Phase 1: Process prompt in FULL SEQUENCE mode (with Conv1d!)
-        # This matches training mode where prev_hiddens is not passed.
-        logits = model(input_tensor, context_vec=ctx)
-        
-        # Re-run to get hidden states for incremental continuation
-        _, prev_hiddens = model(
-            input_tensor, context_vec=ctx,
-            return_hiddens=True
-        )
-        
-        # Sample from last position with top-k filtering
-        last_logits = logits[0, -1, :] / max(temperature, 0.01)
-        if top_k > 0 and top_k < last_logits.size(-1):
-            topk_vals, _ = torch.topk(last_logits, top_k)
-            last_logits[last_logits < topk_vals[-1]] = float('-inf')
-        probs = torch.softmax(last_logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1).item()
-        
-        if next_token < 256:
-            generated_tokens.append(next_token)
-        
-        # Phase 2: Incremental decoding — only process last token each step
-        for step in range(1, max_length):
-            # Feed only the last generated token
-            input_single = torch.tensor([[next_token]], device=device, dtype=torch.long)
-            logits, prev_hiddens = model(
-                input_single, prev_hiddens=prev_hiddens
-            )
+        for step in range(max_length):
+            # Full-context: обработать ВСЮ последовательность каждый шаг
+            # Это гарантирует что Conv1d видит полный контекст
+            input_tensor = torch.tensor([generated_tokens], dtype=torch.long, device=device)
             
-            last_logits = logits[0, -1, :] / max(temperature, 0.01)
-            if top_k > 0 and top_k < last_logits.size(-1):
-                topk_vals, _ = torch.topk(last_logits, top_k)
-                last_logits[last_logits < topk_vals[-1]] = float('-inf')
-            probs = torch.softmax(last_logits, dim=-1)
+            # Ограничиваем длину входа чтобы не уйти в OOM
+            max_ctx = 1024
+            if input_tensor.shape[1] > max_ctx:
+                input_tensor = input_tensor[:, -max_ctx:]
+            
+            logits = model(input_tensor, context_vec=ctx if step == 0 else None)
+            
+            # Берём логиты последней позиции
+            next_logits = logits[0, -1, :].float()
+            
+            # Repetition penalty: снижаем вероятность уже сгенерированных токенов
+            if repetition_penalty > 1.0:
+                for prev_token in set(generated_tokens[-30:]):
+                    if next_logits[prev_token] > 0:
+                        next_logits[prev_token] /= repetition_penalty
+                    else:
+                        next_logits[prev_token] *= repetition_penalty
+            
+            # Temperature
+            next_logits = next_logits / max(temperature, 0.01)
+            
+            # Top-k filtering
+            if top_k > 0 and top_k < next_logits.size(-1):
+                topk_vals, _ = torch.topk(next_logits, top_k)
+                next_logits[next_logits < topk_vals[-1]] = float('-inf')
+            
+            probs = torch.softmax(next_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1).item()
             
             if next_token < 256:
                 generated_tokens.append(next_token)
             
-            # Стоп на двойном переводе строки (конец ответа в Q&A формате)
+            # Стоп на двойном переводе строки (конец ответа)
             if len(generated_tokens) > len(tokens) + 5 and next_token == 10:
                 break
 
