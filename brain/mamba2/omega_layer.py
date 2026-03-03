@@ -17,8 +17,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from brain.mamba2.bitnet import UniversalLinear
 
+# Compatibility: PyTorch 2.4+ uses (device_type, cast_to), older uses cast_inputs
+try:
+    _amp_fwd = torch.amp.custom_fwd(device_type='cuda', cast_to=torch.float32)
+except TypeError:
+    _amp_fwd = torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
 
-@torch.amp.custom_fwd(device_type='cuda', cast_to=torch.float32)
+
+
+@_amp_fwd
 def cayley_transform(omega: torch.Tensor) -> torch.Tensor:
     """
     Cayley Transform: антисимметричная Ω → ортогональная G ∈ SO(n).
