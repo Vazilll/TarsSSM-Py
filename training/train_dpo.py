@@ -199,6 +199,9 @@ def train(args):
     
     use_amp = device.type == 'cuda'
     amp_dtype = torch.bfloat16 if args.bf16 else torch.float16
+    # GradScaler needed for fp16 (not bf16) to prevent NaN gradients
+    use_scaler = use_amp and not args.bf16
+    scaler = torch.amp.GradScaler(device.type, enabled=use_scaler) if use_scaler else None
     
     print(f"\n{'═'*60}")
     print(f"  TARS DPO Alignment")
@@ -224,7 +227,7 @@ def train(args):
             
             # Policy log probs
             if use_amp:
-                with torch.amp.autocast('cuda', dtype=amp_dtype):
+                with torch.amp.autocast(device.type, dtype=amp_dtype):
                     pol_chosen = get_sequence_log_probs(policy, chosen_in, chosen_tgt, device)
                     pol_rejected = get_sequence_log_probs(policy, rejected_in, rejected_tgt, device)
             else:
@@ -243,9 +246,16 @@ def train(args):
                 args.beta
             )
             
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
-            optimizer.step()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+                optimizer.step()
             optimizer.zero_grad()
             
             total_loss += loss.item()

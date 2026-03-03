@@ -253,26 +253,47 @@ def load_tars_memories():
 # ═══════════════════════════════════════════
 
 def _find_max_batch(model, device, seq_len):
-    """Бинарный поиск максимального батча, влезающего в VRAM."""
-    model.eval()
-    lo, hi = 32, 8192
+    """Бинарный поиск максимального батча, влезающего в VRAM.
+    
+    Симулирует РЕАЛЬНЫЕ условия обучения (forward + backward + loss),
+    а не только inference, чтобы корректно учесть память под градиенты.
+    """
+    was_training = model.training
+    model.train()
+    lo, hi = 32, 4096
     best = 32
     while lo <= hi:
         mid = (lo + hi) // 2
         try:
             torch.cuda.empty_cache()
-            dummy = torch.randint(0, 256, (mid, seq_len), device=device)
-            with torch.amp.autocast('cuda'), torch.no_grad():
-                _ = model(dummy)
-            del dummy, _
+            dummy_in = torch.randint(0, 256, (mid, seq_len), device=device)
+            dummy_tgt = torch.randint(0, 256, (mid, seq_len), device=device)
+            with torch.amp.autocast(device.type):
+                logits = model(dummy_in)
+                loss = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)),
+                    dummy_tgt.reshape(-1),
+                )
+            loss.backward()
+            del dummy_in, dummy_tgt, logits, loss
+            # Zero grads to free gradient memory
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad = None
             torch.cuda.empty_cache()
             best = mid
             lo = mid + 1
         except (torch.cuda.OutOfMemoryError, RuntimeError, AssertionError):
+            # Zero grads on failure too
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad = None
             torch.cuda.empty_cache()
             hi = mid - 1
-    # 75% от максимума (запас для градиентов и optimizer states)
-    safe = max(32, int(best * 0.75))
+    if not was_training:
+        model.eval()
+    # 50% от максимума (запас для optimizer states: AdamW хранит 2 копии)
+    safe = max(32, int(best * 0.50))
     # Округляем до кратного 32
     safe = (safe // 32) * 32
     return safe
@@ -385,6 +406,13 @@ def train(args):
     print(f"[Model] MinGRU_LM: dim={args.dim}, layers={args.layers}, "
           f"params={param_count:,} ({param_mb:.0f} MB)")
     
+    # ═══ Автоопределение max batch (ДО compile — compiled model может крашить backward в bench) ═══
+    if device.type == 'cuda':
+        max_batch = _find_max_batch(model, device, args.seq_len)
+        if max_batch > args.batch:
+            print(f"[GPU] Max batch: {max_batch} (было {args.batch})")
+            args.batch = max_batch
+    
     # ═══ torch.compile (PyTorch 2.0+, ~20% speedup) ═══
     # NOTE: "reduce-overhead" mode uses CUDA graphs which crash on T4/small GPUs
     # (AssertionError in cudagraph_trees.py). Use "default" mode instead.
@@ -396,13 +424,6 @@ def train(args):
             print("[Model] torch.compile: ON (default)")
         except Exception:
             print("[Model] torch.compile: недоступен, пропуск")
-    
-    # ═══ Автоопределение max batch ═══
-    if device.type == 'cuda':
-        max_batch = _find_max_batch(model, device, args.seq_len)
-        if max_batch > args.batch:
-            print(f"[GPU] Max batch: {max_batch} (было {args.batch})")
-            args.batch = max_batch
     
     # ═══ Gradient Accumulation ═══
     accum_steps = 1
@@ -463,7 +484,8 @@ def train(args):
     ema_decay = 0.999
     # torch.compile wraps model — get original for clean state_dict keys
     _raw_model = getattr(model, '_orig_mod', model)
-    ema_state = {k: v.clone() for k, v in _raw_model.state_dict().items()}
+    # Клонировать state_dict НА УСТРОЙСТВО модели (иначе EMA остаётся на CPU)
+    ema_state = {k: v.clone().to(device) for k, v in _raw_model.state_dict().items()}
     
     def update_ema():
         with torch.no_grad():
@@ -473,9 +495,10 @@ def train(args):
                     ema_state[k].mul_(ema_decay).add_(v, alpha=1.0 - ema_decay)
     
     # ═══ Mixed Precision ═══
-    use_amp = device.type == 'cuda'
+    device_type = device.type  # 'cuda' или 'cpu'
+    use_amp = device_type == 'cuda'
     amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
-    scaler = torch.amp.GradScaler('cuda', enabled=(use_amp and amp_dtype == torch.float16))
+    scaler = torch.amp.GradScaler(device_type, enabled=(use_amp and amp_dtype == torch.float16))
     
     best_loss = float('inf')
     patience_counter = 0
@@ -510,10 +533,13 @@ def train(args):
             batch_in = batch_in.to(device, non_blocking=True)
             batch_tgt = batch_tgt.to(device, non_blocking=True)
             
-            with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
+            with torch.amp.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
                 logits = model(batch_in)
+                # reshape вместо transpose — экономит VRAM
+                # (B, T, V) → (B*T, V) vs transpose создаёт contiguous copy
                 loss = F.cross_entropy(
-                    logits.transpose(1, 2), batch_tgt,
+                    logits.reshape(-1, logits.size(-1)),
+                    batch_tgt.reshape(-1),
                     label_smoothing=args.label_smoothing,
                 )
                 loss = loss / accum_steps
@@ -563,9 +589,12 @@ def train(args):
             for test_in, test_tgt in test_loader:
                 test_in = test_in.to(device, non_blocking=True)
                 test_tgt = test_tgt.to(device, non_blocking=True)
-                with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
+                with torch.amp.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
                     logits = model(test_in)
-                    el = F.cross_entropy(logits.transpose(1, 2), test_tgt).item()
+                    el = F.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)),
+                        test_tgt.reshape(-1),
+                    ).item()
                 eval_losses.append(el)
             eval_loss = np.mean(eval_losses)
         
@@ -598,13 +627,14 @@ def train(args):
             "Вопрос: Что ты умеешь?\nОтвет:",
         ]
         print(f"  📝 Генерация (temperature=0.7):")
-        for prompt in prompts:
-            sample = generate_text(model, start_text=prompt, max_length=80, 
-                                   temperature=0.7, device=device)
-            answer = sample.split("Ответ:")[-1].strip() if "Ответ:" in sample else sample
-            q = prompt.split(chr(10))[0].replace('Вопрос: ', '')
-            print(f"    Q: {q}")
-            print(f"    A: {answer[:100]}")
+        with torch.no_grad():  # Защита от утечки VRAM при генерации
+            for prompt in prompts:
+                sample = generate_text(model, start_text=prompt, max_length=80, 
+                                       temperature=0.7, device=device)
+                answer = sample.split("Ответ:")[-1].strip() if "Ответ:" in sample else sample
+                q = prompt.split(chr(10))[0].replace('Вопрос: ', '')
+                print(f"    Q: {q}")
+                print(f"    A: {answer[:100]}")
         print(f"{'─'*70}\n", flush=True)
         
         # ═══ Сохранение ═══

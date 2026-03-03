@@ -832,6 +832,7 @@ def phase_4_mamba2(device: str, resume: bool = False, quick: bool = False, max_m
             "--label_smoothing", "0.1",
             "--bf16",
             "--grad_ckpt",
+            "--no_wiki",  # Wikipedia скачивается в Phase 1, не при обучении
         ]
     else:
         # ═══ MEDIUM MODE: 512d×8L = 103M params ═══
@@ -866,6 +867,7 @@ def phase_4_mamba2(device: str, resume: bool = False, quick: bool = False, max_m
             "--device", device,
             "--curriculum",
             "--label_smoothing", "0.1",
+            "--no_wiki",  # Wikipedia скачивается в Phase 1, не при обучении
         ]
         if bf16_capable:
             base += ["--bf16"]

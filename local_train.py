@@ -206,7 +206,10 @@ def get_config(vram_gb, ram_gb, force_1b=False):
         # 24GB VRAM: 1024d × 20L = ~768M params
         # batch=8 × accum=4 = 32 effective (больше batch → лучше GPU utilization)
         # seq_len до 4096 (grad_ckpt позволяет)
-        batch = 8 if vram_gb >= 22 else 4
+        if force_1b and vram_gb < 22:
+            print(f"  ⚠️ WARNING: --1b задан, но VRAM={vram_gb:.1f} GB < 22 GB!")
+            print(f"     Возможен OOM. Снижаю batch до 2.")
+        batch = 8 if vram_gb >= 22 else (4 if vram_gb >= 14 else 2)
         return {
             "name": "768M",
             "d_model": 1024,
@@ -317,7 +320,7 @@ def is_done(state, phase_key):
 # ═══════════════════════════════════════════
 
 def run(cmd, timeout=None, label=""):
-    """Запустить команду с логированием."""
+    """Запустить команду с логированием (tee: и в консоль, и в лог)."""
     cmd = [str(c) for c in cmd]
     
     # Вставляем -u после python для unbuffered output
@@ -342,17 +345,32 @@ def run(cmd, timeout=None, label=""):
     env["PYTHONUNBUFFERED"] = "1"
     
     try:
-        result = subprocess.run(
+        # Tee: вывод идёт И в консоль, И в лог-файл
+        proc = subprocess.Popen(
             cmd,
             cwd=str(ROOT),
-            timeout=timeout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             env=env,
+            bufsize=1,
         )
-        return result.returncode == 0
+        with open(LOG_FILE, 'a', encoding='utf-8', errors='replace') as log:
+            for raw_line in proc.stdout:
+                try:
+                    line = raw_line.decode('utf-8', errors='replace')
+                except Exception:
+                    line = str(raw_line)
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                log.write(line)
+        proc.wait(timeout=timeout)
+        return proc.returncode == 0
     except subprocess.TimeoutExpired:
+        proc.kill()
         print(f"  ⚠️ Таймаут ({timeout}s)")
         return False
     except KeyboardInterrupt:
+        proc.kill()
         print(f"\n  ⏸ Прервано пользователем. Чекпоинт сохранён.")
         return False
     except Exception as e:
@@ -388,6 +406,7 @@ def train_mamba_phase(phase_num, config, device, bf16, extra_args=None):
         "--curriculum",
         "--label_smoothing", "0.1",
         "--grad_ckpt",
+        "--no_wiki",  # Wikipedia скачивается в Phase 1, не при обучении
     ]
     
     if bf16:
@@ -438,7 +457,145 @@ def train_post_phase(script, config, device, bf16, epochs_key, extra_args=None):
 
 
 # ═══════════════════════════════════════════
-# 6. Data Download (from disk/network)
+# 6. DPO Data Auto-Generation
+# ═══════════════════════════════════════════
+
+def _generate_dpo_pairs(output_path, n_pairs=500):
+    """Генерирует DPO пары (chosen vs rejected) из instruction-подобных промптов.
+    
+    Формат: {"prompt": "...", "chosen": "хороший ответ", "rejected": "плохой ответ"}
+    """
+    import json, random
+    
+    pairs = [
+        # Формат: (prompt, chosen, rejected)
+        ("Привет!", "Привет! Я ТАРС, ваш ИИ-ассистент. Чем могу помочь?",
+         "ну привет"),
+        ("Кто ты?", "Я ТАРС — искусственный интеллект, созданный для помощи людям. Я могу отвечать на вопросы, помогать с кодом и вести диалог.",
+         "я бот"),
+        ("Что такое Python?", "Python — это высокоуровневый язык программирования, известный своей простотой и читаемостью. Он широко используется в веб-разработке, науке о данных, машинном обучении и автоматизации.",
+         "язык"),
+        ("Помоги с кодом", "Конечно! Опишите задачу, и я помогу написать код. Я работаю с Python, JavaScript и другими языками.",
+         "не могу"),
+        ("Сколько будет 2+2?", "2 + 2 = 4. Это базовая арифметическая операция сложения.",
+         "4"),
+        ("Объясни рекурсию", "Рекурсия — это когда функция вызывает саму себя. Каждый вызов решает меньшую подзадачу, пока не достигнет базового случая. Пример: факториал — n! = n × (n-1)!",
+         "это когда функция вызывает себя"),
+        ("Что лучше: Python или JavaScript?", "Оба языка отличные, но для разных задач. Python хорош для backend, ML и анализа данных. JavaScript — для веб-фронтенда и full-stack с Node.js. Выбор зависит от вашей задачи.",
+         "python лучше"),
+        ("Расскажи про нейросети", "Нейронные сети — это модели машинного обучения, вдохновлённые работой мозга. Они состоят из слоёв нейронов, которые обучаются на данных. Основные типы: CNN (изображения), RNN/LSTM/Mamba (последовательности), Transformer (NLP).",
+         "это типа мозг"),
+        ("Как работает git?", "Git — система контроля версий. Основные команды: git add (добавить файлы), git commit (зафиксировать), git push (отправить на сервер), git pull (получить обновления). Это позволяет отслеживать изменения и работать в команде.",
+         "не знаю"),
+        ("Спасибо!", "Рад помочь! Если будут ещё вопросы — обращайтесь.",
+         "ок"),
+    ]
+    
+    # Генерируем вариации
+    templates_q = [
+        "Объясни {topic}", "Что такое {topic}?", "Расскажи про {topic}",
+        "Как работает {topic}?", "Зачем нужен {topic}?",
+    ]
+    topics = [
+        ("machine learning", "машинное обучение — подраздел ИИ, где модели учатся на данных без явного программирования", "это ии"),
+        ("Docker", "Docker — платформа контейнеризации. Позволяет упаковать приложение с зависимостями в изолированный контейнер", "программа"),
+        ("API", "API (Application Programming Interface) — набор правил для взаимодействия программ. REST API использует HTTP-запросы: GET, POST, PUT, DELETE", "интерфейс"),
+        ("база данных", "база данных — организованное хранилище данных. SQL (PostgreSQL, MySQL) — реляционные, NoSQL (MongoDB, Redis) — гибкие", "хранилище"),
+        ("Linux", "Linux — свободная операционная система на ядре Linux. Используется на серверах, в разработке, встраиваемых системах и Android", "операционка"),
+    ]
+    
+    all_pairs = list(pairs)
+    for topic_name, good, bad in topics:
+        for tmpl in templates_q:
+            q = tmpl.format(topic=topic_name)
+            all_pairs.append((q, good, bad))
+    
+    # Дублируем с вариациями до n_pairs
+    output_data = []
+    for i in range(n_pairs):
+        p, c, r = random.choice(all_pairs)
+        output_data.append({"prompt": p, "chosen": c, "rejected": r})
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        for item in output_data:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+    
+    size_kb = output_path.stat().st_size / 1024
+    print(f"  ✅ Generated {len(output_data)} DPO pairs → {output_path} ({size_kb:.0f} KB)")
+
+
+def quick_validate(config, device):
+    """Быстрая валидация: 3 тестовых промпта через модель."""
+    print("\n  🔍 Quick validation (3 prompts)...")
+    try:
+        import torch
+        from brain.mamba2.model import TarsMamba2LM
+        
+        model_path = TARS_V3 / "mamba2_omega.pt"
+        alt_path = TARS_V3 / "mamba2.pt"
+        load_path = alt_path if alt_path.exists() else model_path
+        
+        if not load_path.exists():
+            print("     ⚠ No model checkpoint found, skipping validation")
+            return
+        
+        model = TarsMamba2LM(
+            d_model=config["d_model"],
+            n_layers=config["n_layers"],
+            vocab_size=256,
+            quant_mode="fp16",
+        )
+        ckpt = torch.load(str(load_path), map_location='cpu', weights_only=False)
+        model.load_state_dict(ckpt['model_state_dict'], strict=False)
+        model.eval()
+        dev = torch.device(device)
+        model.to(dev)
+        
+        prompts = ["Привет!", "Что такое Python?", "2+2="]
+        for prompt in prompts:
+            tokens = list(prompt.encode('cp1251', errors='replace'))
+            x = torch.tensor([tokens], dtype=torch.long, device=dev)
+            with torch.no_grad():
+                for _ in range(60):
+                    logits = model(x)
+                    probs = torch.softmax(logits[:, -1, :] / 0.7, dim=-1)
+                    next_tok = torch.multinomial(probs, 1)
+                    x = torch.cat([x, next_tok], dim=1)
+                    if next_tok.item() == 0 or x.shape[1] > 200:
+                        break
+            out = bytes(x[0].cpu().tolist()).decode('cp1251', errors='replace')
+            answer = out[len(prompt):].strip()[:80]
+            print(f"     Q: {prompt}")
+            print(f"     A: {answer}")
+        
+        del model
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        print("  ✅ Validation complete")
+    except Exception as e:
+        print(f"     ⚠ Validation error: {e}")
+
+
+def estimate_vram_needed(config, phase_name):
+    """Оценка необходимого VRAM для фазы."""
+    d_model = config["d_model"]
+    n_layers = config["n_layers"]
+    params = d_model ** 2 * n_layers * 12
+    
+    multipliers = {
+        "mamba2": 4.0,     # model + grads + optimizer + activations
+        "dpo": 8.5,        # 2x model (policy + ref) + grads + optimizer
+        "distill": 6.0,    # teacher + student + grads
+        "default": 4.0,
+    }
+    
+    mult = multipliers.get(phase_name, multipliers["default"])
+    vram_gb = (params * 2 * mult) / (1024 ** 3)  # fp16 base
+    return vram_gb
+
+
+# ═══════════════════════════════════════════
+# 7. Data Download (from disk/network)
 # ═══════════════════════════════════════════
 
 def download_all_data(config):
@@ -463,12 +620,18 @@ def download_all_data(config):
         print(f"  ✓ Wikipedia: {wiki_mb:.1f} MB (кеш)")
     
     # ── 2. HuggingFace datasets (ALL presets) ──
-    print(f"\n  📦 HuggingFace datasets (preset: {args.data_preset})...")
-    run([
-        PYTHON, str(TRAINING / "download_hf_dataset.py"),
-        "--preset", args.data_preset,
-        "--output", str(data_dir),
-    ], label="HF")
+    # Cache check: только если нет hf_*.txt файлов
+    existing_hf = list(data_dir.glob("hf_*.txt"))
+    total_hf_mb = sum(f.stat().st_size for f in existing_hf) / (1024 * 1024)
+    if not existing_hf or total_hf_mb < 1:
+        print(f"\n  📦 HuggingFace datasets (preset: {args.data_preset})...")
+        run([
+            PYTHON, str(TRAINING / "download_hf_dataset.py"),
+            "--preset", args.data_preset,
+            "--output", str(data_dir),
+        ], label="HF")
+    else:
+        print(f"  ✓ HuggingFace: {len(existing_hf)} файлов, {total_hf_mb:.1f} MB (кеш)")
     
     # ── 3. Personality corpus ──
     personality = data_dir / "tars_personality_mega.txt"
@@ -486,7 +649,25 @@ def download_all_data(config):
     else:
         print(f"  ✓ STEM data: {stem_path.stat().st_size // 1024} KB (кеш)")
     
-    # ── 5. Show data summary ──
+    # ── 5. HuggingFace Mamba-2 pretrained weights ──
+    pretrained_dir = MODELS / "pretrained" / "mamba2-130m"
+    if not pretrained_dir.exists() or not list(pretrained_dir.glob("*.safetensors")):
+        print("\n  🧠 Downloading pretrained Mamba-2 base weights (state-spaces/mamba2-130m)...")
+        try:
+            from huggingface_hub import snapshot_download
+            snapshot_download(
+                "state-spaces/mamba2-130m",
+                local_dir=str(pretrained_dir),
+                ignore_patterns=["*.bin", "*.msgpack"],
+            )
+            print(f"  ✅ Pretrained Mamba-2 saved: {pretrained_dir}")
+        except Exception as e:
+            print(f"  ⚠ HF Mamba-2 download failed (training from scratch): {e}")
+            print(f"    pip install huggingface_hub — для загрузки базовых весов")
+    else:
+        print(f"  ✓ Pretrained Mamba-2: {pretrained_dir} (кеш)")
+    
+    # ── 6. Show data summary ──
     total_mb = 0
     file_count = 0
     print(f"\n  {'─' * 50}")
@@ -746,6 +927,23 @@ def main():
             mark_done(state, "reflex")
     
     # ══════════════════════════════════════════════════
+    # Phase 2.5: RRN Spine routing
+    # ══════════════════════════════════════════════════
+    if should_run(2) and not is_done(state, "rrn"):
+        print("\n  🦴 Phase 2.5: RRN Spine routing (50 epochs)...")
+        rrn_cmd = [
+            PYTHON, str(TRAINING / "train_rrn.py"),
+            "--epochs", "50",
+            "--brain_dim", str(config["d_model"]),
+            "--lr", "0.002",
+            "--batch", "32",
+        ]
+        ok = run(rrn_cmd, label="RRN")
+        results["rrn"] = ok
+        if ok:
+            mark_done(state, "rrn")
+    
+    # ══════════════════════════════════════════════════
     # Phase 3: MinGRU LM
     # ══════════════════════════════════════════════════
     if should_run(3) and not is_done(state, "mingru"):
@@ -753,7 +951,7 @@ def main():
         cmd = [
             PYTHON, str(TRAINING / "train_mingru.py"),
             "--dim", "512", "--layers", "6",
-            "--epochs", "25", "--augment",
+            "--epochs", "25",
         ]
         ok = run(cmd, label="MinGRU")
         results["mingru"] = ok
@@ -763,7 +961,7 @@ def main():
     # ══════════════════════════════════════════════════
     # Phase 3.5: SNN Spiking Synapses
     # ══════════════════════════════════════════════════
-    if should_run(3) and not is_done(state, "spiking"):
+    if (should_run(3) or (args.phase is None)) and not is_done(state, "spiking"):
         print("\n  ⚡ Phase 3.5: SNN Spiking Synapses (30 epochs)...")
         snn_cmd = [
             PYTHON, str(TRAINING / "train_spiking.py"),
@@ -808,6 +1006,13 @@ def main():
         # Transfer embedding from MinGRU for Phase 1
         extra = []
         if mamba_phase == 1:
+            # ── HF pretrained base weights (SSM layers) ──
+            pretrained_dir = MODELS / "pretrained" / "mamba2-130m"
+            if pretrained_dir.exists() and list(pretrained_dir.glob("*.safetensors")):
+                print("     🧠 Loading HF Mamba-2 base weights for initialization...")
+                extra += ["--pretrained", str(pretrained_dir)]
+            
+            # ── MinGRU embedding transfer ──
             emb_path = ROOT / "models" / "tars_v3" / "_transfer_embedding.pt"
             mingru_path = ROOT / "models" / "mingru_weights.pt"
             if mingru_path.exists() and not emb_path.exists():
@@ -870,6 +1075,7 @@ def main():
             "--label_smoothing", "0.05",
             "--grad_ckpt",
             "--resume",
+            "--no_wiki",  # Wikipedia скачивается в Phase 1, не при обучении
         ]
         if bf16:
             cmd += ["--bf16"]
@@ -909,10 +1115,12 @@ def main():
     # ══════════════════════════════════════════════════
     # Phase 7: Validate
     # ══════════════════════════════════════════════════
-    if should_run(7):
+    if should_run(7) and not is_done(state, "validate"):
         print("\n  ✅ Phase 7: Validate...")
         ok = run([PYTHON, "mega_train.py", "--phase", "7"], label="Validate")
         results["validate"] = ok
+        if ok:
+            mark_done(state, "validate")
     
     # ══════════════════════════════════════════════════
     # Phase 8-10: Voice (Whisper + Piper + Quantize)
@@ -954,6 +1162,8 @@ def main():
         results["instruct"] = ok
         if ok:
             mark_done(state, "instruct")
+            gdrive_backup_if_enabled()  # Phase 11 — важная, бэкап сразу
+            quick_validate(config, device)  # Проверка после Instruction Tuning
     
     # ══════════════════════════════════════════════════
     # Phase 12-14: Post-Training (CoT → DPO → RLVR)
@@ -962,27 +1172,54 @@ def main():
         
         # Phase 12: Chain-of-Thought
         if (should_run(12) or args.phase is None) and not is_done(state, "cot"):
-            print(f"\n  🧩 Phase 12: CoT ({config.get('epochs_cot', 5)} epochs)...")
+            # Генерация CoT данных (если нет)
+            cot_data = Path(args.data_dir or str(DATA)) / "cot_reasoning.txt"
+            if not cot_data.exists() or cot_data.stat().st_size < 1000:
+                print(f"\n  📝 Phase 12a: Generating CoT training data...")
+                run([
+                    PYTHON, str(TRAINING / "train_cot.py"),
+                    "--generate", "--n_samples", "20000",
+                    "--cot_data", str(cot_data),
+                ], label="CoT-Gen")
+            
+            print(f"\n  🧩 Phase 12b: CoT Training ({config.get('epochs_cot', 5)} epochs)...")
             ok = train_post_phase(
                 "train_cot.py", config, device, bf16,
                 "epochs_cot",
-                extra_args=["--lr", "3e-5"],
+                extra_args=["--lr", "3e-5", "--train", "--cot_data", str(cot_data)],
             )
             results["cot"] = ok
             if ok:
                 mark_done(state, "cot")
+                quick_validate(config, device)  # Проверка после CoT
         
         # Phase 13: DPO (preference alignment)
         if (should_run(13) or args.phase is None) and not is_done(state, "dpo"):
-            print(f"\n  ⚖️ Phase 13: DPO ({config.get('epochs_dpo', 3)} epochs)...")
-            ok = train_post_phase(
-                "train_dpo.py", config, device, bf16,
-                "epochs_dpo",
-                extra_args=["--lr", "1e-5"],
-            )
-            results["dpo"] = ok
-            if ok:
-                mark_done(state, "dpo")
+            dpo_data = Path(args.data_dir or str(DATA)) / "dpo_pairs.jsonl"
+            # Авто-генерация DPO пар если файла нет
+            if not dpo_data.exists() or dpo_data.stat().st_size < 100:
+                print(f"\n  📝 Phase 13a: Generating DPO preference pairs...")
+                _generate_dpo_pairs(dpo_data)
+            
+            if dpo_data.exists() and dpo_data.stat().st_size > 100:
+                # VRAM check: DPO загружает 2x модель (policy + ref)
+                vram_needed = estimate_vram_needed(config, "dpo")
+                if vram_gb > 0 and vram_needed > vram_gb * 0.95:
+                    print(f"     ⚠ DPO требует ~{vram_needed:.1f} GB VRAM (есть {vram_gb:.1f} GB)")
+                    print(f"       Попробуйте уменьшить batch или добавить --grad_ckpt")
+                print(f"\n  ⚖️ Phase 13b: DPO ({config.get('epochs_dpo', 3)} epochs)...")
+                ok = train_post_phase(
+                    "train_dpo.py", config, device, bf16,
+                    "epochs_dpo",
+                    extra_args=["--lr", "1e-5", "--data", str(dpo_data)],
+                )
+                results["dpo"] = ok
+                if ok:
+                    mark_done(state, "dpo")
+                    quick_validate(config, device)  # Проверка после DPO
+            else:
+                print(f"\n  ⏭ Phase 13: DPO пропущен (не удалось создать dpo_pairs.jsonl)")
+                results["dpo"] = True  # не блокирует pipeline
         
         # Phase 14: RLVR (verifiable rewards)
         if (should_run(14) or args.phase is None) and not is_done(state, "rlvr"):
@@ -1006,7 +1243,12 @@ def main():
         ok = train_post_phase(
             "train_distill.py", config, device, bf16,
             "epochs_distill",
-            extra_args=["--lr", "1e-4", "--temperature", "3.0", "--alpha", "0.7"],
+            extra_args=[
+                "--lr", "1e-4",
+                "--temperature", "3.0",
+                "--alpha", "0.7",
+                "--teacher_model", "Qwen/Qwen2.5-1.5B",
+            ],
         )
         results["distill"] = ok
         if ok:

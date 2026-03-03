@@ -174,7 +174,7 @@ def train_instruct(model, tokenize_fn, texts: List[str],
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
-    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
     
     # Pre-tokenize (cp1251 → маленькие последовательности, быстро)
     logger.info(f"InstructTuning: Токенизация {len(texts)} примеров...")
@@ -218,7 +218,7 @@ def train_instruct(model, tokenize_fn, texts: List[str],
                 input_ids = tokens[:, :-1]
                 labels = tokens[:, 1:]
                 
-                with torch.amp.autocast('cuda', enabled=use_amp):
+                with torch.amp.autocast(device.type, enabled=use_amp):
                     logits = model(input_ids)
                     
                     # Маска: loss только на ответной части
@@ -311,12 +311,112 @@ def download_instruct_datasets():
         logger.info("Используем только встроенные примеры.")
 
 
+def parse_args():
+    """CLI arguments for subprocess invocation from local_train.py."""
+    import argparse
+    p = argparse.ArgumentParser(description="TARS Instruction Tuning")
+    p.add_argument('--d_model', type=int, default=2048)
+    p.add_argument('--n_layers', type=int, default=24)
+    p.add_argument('--epochs', type=int, default=3)
+    p.add_argument('--batch', type=int, default=4)
+    p.add_argument('--lr', type=float, default=5e-5)
+    p.add_argument('--seq_len', type=int, default=512)
+    p.add_argument('--device', type=str, default='auto')
+    p.add_argument('--save_dir', type=str, default='models/mamba2')
+    p.add_argument('--resume', action='store_true')
+    p.add_argument('--bf16', action='store_true')
+    p.add_argument('--grad_ckpt', action='store_true')
+    p.add_argument('--data', type=str, default=None,
+                   help="Path to instruction data JSON")
+    return p.parse_args()
+
+
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    import sys
+    import time
+    import argparse
     
-    # Загрузка данных
-    texts = load_instruction_dataset()
-    print(f"\nПример обучающих данных:")
-    for t in texts[:3]:
-        print(f"\n{'='*50}")
-        print(t)
+    logging.basicConfig(level=logging.INFO)
+    args = parse_args()
+    
+    # Device
+    import torch
+    if args.device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device = args.device
+    
+    # Load model
+    try:
+        from brain.mamba2.model import TarsMamba2LM
+    except ImportError:
+        sys.path.insert(0, str(_ROOT))
+        from brain.mamba2.model import TarsMamba2LM
+    
+    print(f"\n  📖 Instruction Tuning: {args.d_model}d × {args.n_layers}L")
+    print(f"     epochs={args.epochs}, batch={args.batch}, lr={args.lr}")
+    print(f"     device={device}")
+    
+    model = TarsMamba2LM(
+        vocab_size=256,
+        d_model=args.d_model,
+        n_layers=args.n_layers,
+    ).to(device)
+    
+    # Resume from checkpoint
+    save_dir = Path(args.save_dir)
+    save_path = save_dir / "mamba2_omega.pt"
+    alt_path = save_dir / "mamba2.pt"
+    load_path = alt_path if alt_path.exists() else save_path
+    if args.resume and load_path.exists():
+        print(f"  🔄 Resuming from {load_path}")
+        ckpt = torch.load(str(load_path), map_location=device, weights_only=False)
+        if 'model_state_dict' in ckpt:
+            model.load_state_dict(ckpt['model_state_dict'], strict=False)
+        else:
+            model.load_state_dict(ckpt, strict=False)
+    elif args.resume:
+        print("  ⚠ No checkpoint found, training from scratch")
+    
+    if args.grad_ckpt and hasattr(model, 'use_checkpointing'):
+        model.use_checkpointing = True
+    
+    # Tokenizer (cp1251 byte-level)
+    def tokenize_fn(text: str) -> torch.LongTensor:
+        try:
+            encoded = text.encode('cp1251', errors='replace')
+        except Exception:
+            encoded = text.encode('utf-8', errors='replace')
+        return torch.tensor([list(encoded)], dtype=torch.long)
+    
+    # Load instruction data
+    texts = load_instruction_dataset(path=args.data)
+    if not texts:
+        print("  ❌ No instruction data found!")
+        sys.exit(1)
+    
+    print(f"  📚 {len(texts)} instruction examples loaded")
+    
+    # Train
+    t0 = time.time()
+    model = train_instruct(
+        model, tokenize_fn, texts,
+        epochs=args.epochs,
+        lr=args.lr,
+        batch_size=args.batch,
+    )
+    elapsed = time.time() - t0
+    
+    # Save
+    save_dir.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'config': {
+            'd_model': args.d_model,
+            'n_layers': args.n_layers,
+            'vocab_size': 256,
+            'phase': 'instruct',
+        }
+    }, str(save_path))
+    print(f"\n  ✅ Instruction tuning done in {elapsed/60:.1f} min")
+    print(f"     Saved: {save_path}")

@@ -368,6 +368,9 @@ def train_cot(args):
     # AMP
     use_amp = device.type == 'cuda'
     amp_dtype = torch.bfloat16 if (use_amp and args.bf16) else torch.float16 if use_amp else torch.float32
+    # GradScaler needed for fp16 (not bf16) to prevent NaN gradients
+    use_scaler = use_amp and not args.bf16
+    scaler = torch.amp.GradScaler(device.type, enabled=use_scaler) if use_scaler else None
     
     print(f"\n{'═'*60}")
     print(f"  TARS Chain-of-Thought Fine-tuning")
@@ -402,9 +405,16 @@ def train_cot(args):
                 loss = compute_weighted_loss(logits_flat, targets_flat,
                                             None, args.think_weight)
             
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
             optimizer.zero_grad()
             
             total_loss += loss.item()

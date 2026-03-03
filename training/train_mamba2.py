@@ -595,7 +595,7 @@ def train(args):
         print("  ⚡ AMP: bfloat16 (no scaler needed, wider dynamic range)")
     elif use_amp:
         amp_dtype = torch.float16
-        scaler = torch.amp.GradScaler('cuda')
+        scaler = torch.amp.GradScaler(device.type)
         print("  ⚡ AMP: float16 + GradScaler")
     else:
         amp_dtype = torch.float32
@@ -664,7 +664,7 @@ def train(args):
             batch_tgt = train_tgt_s[i:i+args.batch].to(device, non_blocking=True)
             
             if use_amp:
-                with torch.amp.autocast('cuda', dtype=amp_dtype):
+                with torch.amp.autocast(device.type, dtype=amp_dtype):
                     logits = forward_model(batch_in)
                     lm_loss = F.cross_entropy(
                         logits.view(-1, actual_vocab),
@@ -827,7 +827,7 @@ def train(args):
                 b_tgt = p_train_tgt[idx].to(device, non_blocking=True)
                 
                 if use_amp:
-                    with torch.amp.autocast('cuda', dtype=amp_dtype):
+                    with torch.amp.autocast(device.type, dtype=amp_dtype):
                         logits = forward_model(b_in)
                         loss = F.cross_entropy(logits.view(-1, actual_vocab), b_tgt.view(-1))
                     if scaler is not None:

@@ -147,30 +147,23 @@ def parse_args():
 
 def generate_answer(model, prompt_ids, max_len, device):
     """Generate answer tokens from the model (with gradients for REINFORCE)."""
-    model.reset_cache()
-    
     generated = prompt_ids.clone()
-    
-    # Prefill prompt (no grad needed — prompt is fixed, not sampled)
-    with torch.no_grad():
-        logits = model.step(prompt_ids)
-    
     all_log_probs = []
     
     for _ in range(max_len):
-        # Sample next token
+        # Forward pass on full sequence (autoregressive)
+        logits = model(generated)  # [B, L, V]
+        
+        # Get logits for last position
         last_logits = logits[:, -1, :]
         probs = F.softmax(last_logits, dim=-1)
         token = torch.multinomial(probs, 1)  # [B, 1]
         
         log_prob = F.log_softmax(last_logits, dim=-1)
-        selected_log_prob = log_prob.gather(-1, token.detach())  # [B, 1]
+        selected_log_prob = log_prob.gather(-1, token)  # [B, 1]
         all_log_probs.append(selected_log_prob)
         
-        generated = torch.cat([generated, token], dim=1)
-        
-        # Next step WITH gradients (needed for REINFORCE policy gradient)
-        logits = model.step(token.detach())
+        generated = torch.cat([generated, token.detach()], dim=1)
         
         # Stop if newline or period
         if token.item() in [10, 46, 0]:  # \n, '.', \0
@@ -179,7 +172,7 @@ def generate_answer(model, prompt_ids, max_len, device):
     if all_log_probs:
         total_log_prob = torch.cat(all_log_probs, dim=1).sum(dim=1)  # [B]
     else:
-        total_log_prob = torch.zeros(1, device=device)
+        total_log_prob = torch.zeros(1, device=device, requires_grad=True)
     
     return generated, total_log_prob
 

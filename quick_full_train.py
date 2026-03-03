@@ -519,7 +519,7 @@ def main():
         ]
         if device == "cpu":
             reflex_cmd += ["--cpu"]
-        ok = run(reflex_cmd, label="Reflex", timeout=300)
+        ok = run(reflex_cmd, label="Reflex")
         results["reflex"] = ok
     else:
         print(f"     ⏭ Не найден — пропускаю")
@@ -538,7 +538,7 @@ def main():
         ]
         if device == "cpu":
             rrn_cmd += ["--cpu"]
-        ok = run(rrn_cmd, label="RRN", timeout=300)
+        ok = run(rrn_cmd, label="RRN")
         results["rrn"] = ok
     else:
         print(f"     ⏭ Не найден — пропускаю")
@@ -559,7 +559,7 @@ def main():
             "--epochs", str(CFG["mingru_epochs"]),
             "--augment",
         ]
-        ok = run(cmd, label="MinGRU", timeout=600)
+        ok = run(cmd, label="MinGRU")
         results["mingru"] = ok
     else:
         print(f"     ⏭ Не найден — пропускаю")
@@ -583,7 +583,7 @@ def main():
             "--seq_len", str(CFG["snn_seq"]),
             "--lr", "3e-4",
             "--device", device,
-        ], label="SNN", timeout=600)
+        ], label="SNN")
         results["snn"] = ok
     else:
         print(f"     ⏭ Не найден — пропускаю")
@@ -598,18 +598,18 @@ def main():
         if mamba_script.exists():
             phases = [
                 (1, "Full Pretrain (SSD+WKV+Ω-SSM+MoLE)", 
-                 CFG["brain_epochs_p1"], CFG["brain_lr_p1"], CFG["seq_len_start"], 2400),
+                 CFG["brain_epochs_p1"], CFG["brain_lr_p1"], CFG["seq_len_start"]),
                 (2, "WKV + Fusion Fine-tune", 
-                 CFG["brain_epochs_p2"], CFG["brain_lr_p2"], CFG["seq_len_mid"], 1200),
+                 CFG["brain_epochs_p2"], CFG["brain_lr_p2"], CFG["seq_len_mid"]),
             ]
             
             if CFG["brain_epochs_p3"] > 0:
                 phases.append(
                     (3, "MoLE + MatrixPool + WaveMerge",
-                     CFG["brain_epochs_p3"], CFG["brain_lr_p3"], CFG["seq_len_max"], 900)
+                     CFG["brain_epochs_p3"], CFG["brain_lr_p3"], CFG["seq_len_max"])
                 )
             
-            for phase_num, desc, epochs, lr, seq_len, timeout in phases:
+            for phase_num, desc, epochs, lr, seq_len in phases:
                 print(f"\n  🧠 Phase {4+phase_num}: Mamba-2 P{phase_num} — {desc}")
                 print(f"     ({CFG['d_model']}d×{CFG['n_layers']}L, {epochs}ep, "
                       f"seq={seq_len}, batch={CFG['batch']}×{CFG['accum']}={eff_batch})")
@@ -628,6 +628,7 @@ def main():
                     "--device", device,
                     "--curriculum",
                     "--label_smoothing", "0.1",
+                    "--no_wiki",  # Wikipedia скачивается в Phase 0, не при обучении
                 ]
                 
                 if CFG["grad_ckpt"]:
@@ -643,7 +644,7 @@ def main():
                 if args.data_dir:
                     cmd += ["--data_dir", args.data_dir]
                 
-                ok = run(cmd, label=f"Mamba P{phase_num}", timeout=timeout)
+                ok = run(cmd, label=f"Mamba P{phase_num}")
                 results[f"mamba_p{phase_num}"] = ok
                 
                 if not ok:

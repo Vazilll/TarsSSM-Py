@@ -201,7 +201,7 @@ def train(args):
     
     # Data
     from training.train_mamba2 import load_corpus, prepare_byte_data
-    corpus = load_corpus(data_path=args.data)
+    corpus = load_corpus(data_path=args.data, download_wiki=False)
     inputs, targets = prepare_byte_data(corpus, args.seq_len, actual_vocab)
     
     # Train
@@ -229,7 +229,7 @@ def train(args):
             
             # Student forward
             if use_amp:
-                with torch.amp.autocast('cuda', dtype=amp_dtype):
+                with torch.amp.autocast(device.type, dtype=amp_dtype):
                     student_logits = student(batch_in)
             else:
                 student_logits = student(batch_in)
@@ -242,12 +242,37 @@ def train(args):
                 if t_logits.size(-1) != student_logits.size(-1):
                     t_logits = t_logits[:, :, :actual_vocab]
             elif teacher is not None:
-                # On-the-fly: use teacher model
+                # On-the-fly: decode bytes → text → re-tokenize for teacher
+                # Student uses byte-level (vocab=256), teacher has its own tokenizer
                 with torch.no_grad():
-                    t_out = teacher(batch_in)
-                    t_logits = t_out.logits if hasattr(t_out, 'logits') else t_out
+                    # Decode byte tokens back to text
+                    batch_texts = []
+                    for row in batch_in:
+                        byte_list = row.cpu().tolist()
+                        try:
+                            text = bytes(byte_list).decode('cp1251', errors='replace')
+                        except Exception:
+                            text = ""
+                        batch_texts.append(text)
+                    
+                    # Generate teacher logits using proper tokenization
+                    t_logits = generate_teacher_logits_online(
+                        teacher, tokenizer, batch_texts, args.seq_len, device
+                    )
+                    # Teacher vocab → student vocab: truncate/pad to actual_vocab
                     if t_logits.size(-1) != actual_vocab:
-                        t_logits = t_logits[:, :, :actual_vocab]
+                        if t_logits.size(-1) > actual_vocab:
+                            t_logits = t_logits[:, :, :actual_vocab]
+                        else:
+                            # Pad with zeros if teacher vocab < 256
+                            pad_size = actual_vocab - t_logits.size(-1)
+                            t_logits = F.pad(t_logits, (0, pad_size), value=-100.0)
+                    # Match sequence length
+                    if t_logits.size(1) != student_logits.size(1):
+                        min_len = min(t_logits.size(1), student_logits.size(1))
+                        t_logits = t_logits[:, :min_len, :]
+                        student_logits = student_logits[:, :min_len, :]
+                        batch_tgt = batch_tgt[:, :min_len]
             else:
                 # Self-distillation: use student's own logits (detached)
                 t_logits = student_logits.detach()
