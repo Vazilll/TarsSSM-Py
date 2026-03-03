@@ -1,7 +1,7 @@
 import torch
 from .utils import decode_tokens, tokenize_text
 
-def generate_text(model, start_text="Привет", max_length=128, temperature=0.7, device='cuda', context_vec=None):
+def generate_text(model, start_text="Привет", max_length=128, temperature=0.7, device='cuda', context_vec=None, top_k=20):
     """
     Генерация текста через MinGRU_LM с инкрементальным декодированием.
     
@@ -47,8 +47,11 @@ def generate_text(model, start_text="Привет", max_length=128, temperature=
             return_hiddens=True
         )
         
-        # Sample from last position
-        last_logits = logits[0, -1, :] / temperature
+        # Sample from last position with top-k filtering
+        last_logits = logits[0, -1, :] / max(temperature, 0.01)
+        if top_k > 0 and top_k < last_logits.size(-1):
+            topk_vals, _ = torch.topk(last_logits, top_k)
+            last_logits[last_logits < topk_vals[-1]] = float('-inf')
         probs = torch.softmax(last_logits, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1).item()
         
@@ -63,7 +66,10 @@ def generate_text(model, start_text="Привет", max_length=128, temperature=
                 input_single, prev_hiddens=prev_hiddens
             )
             
-            last_logits = logits[0, -1, :] / temperature
+            last_logits = logits[0, -1, :] / max(temperature, 0.01)
+            if top_k > 0 and top_k < last_logits.size(-1):
+                topk_vals, _ = torch.topk(last_logits, top_k)
+                last_logits[last_logits < topk_vals[-1]] = float('-inf')
             probs = torch.softmax(last_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1).item()
             

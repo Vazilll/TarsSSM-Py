@@ -25,9 +25,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 
-def test_mingru(device, epochs=15, batch_size=16, seq_len=128):
+def test_mingru(device, epochs=30, batch_size=16, seq_len=128):
     """
-    Быстрый тест MinGRU: 15 эпох, маленький корпус.
+    Быстрый тест MinGRU: 30 эпох, маленький корпус.
     Проверяет: обучение + генерация осмысленного текста.
     """
     print(f"\n{'═'*60}")
@@ -66,7 +66,7 @@ def test_mingru(device, epochs=15, batch_size=16, seq_len=128):
 """.strip()
     
     # Повторяем для стабильности
-    corpus = (corpus + "\n\n") * 20
+    corpus = (corpus + "\n\n") * 50
     
     tokens = tokenize_text(corpus)
     
@@ -85,11 +85,11 @@ def test_mingru(device, epochs=15, batch_size=16, seq_len=128):
     print(f"  Данные: {len(inputs)} примеров, seq_len={seq_len}")
     
     # Маленькая модель — быстро обучается
-    model = MinGRU_LM(dim=256, num_tokens=256, num_layers=4, context_dim=512, dropout=0.1)
+    model = MinGRU_LM(dim=256, num_tokens=256, num_layers=6, context_dim=512, dropout=0.05)
     model.to(device)
     
     params = sum(p.numel() for p in model.parameters())
-    print(f"  Модель: MinGRU dim=256, 4 layers, {params:,} params")
+    print(f"  Модель: MinGRU dim=256, 6 layers, {params:,} params")
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3, weight_decay=0.01)
     
@@ -126,10 +126,10 @@ def test_mingru(device, epochs=15, batch_size=16, seq_len=128):
         
         avg_loss = total_loss / max(n, 1)
         
-        if (epoch + 1) % 5 == 0 or epoch == 0:
+        if (epoch + 1) % 10 == 0 or epoch == 0:
             model.eval()
             sample = generate_text(model, "Вопрос: Привет\nОтвет:", 
-                                   max_length=60, temperature=0.7, device=device)
+                                   max_length=60, temperature=0.3, device=device)
             answer = sample.split("Ответ:")[-1].strip() if "Ответ:" in sample else sample
             print(f"  Epoch {epoch+1:2d}/{epochs} | Loss: {avg_loss:.4f} | "
                   f"Gen: {answer[:60]}")
@@ -141,7 +141,7 @@ def test_mingru(device, epochs=15, batch_size=16, seq_len=128):
     model.eval()
     print(f"\n  📝 Финальная генерация:")
     for prompt in ["Вопрос: Кто ты?\nОтвет:", "Вопрос: Помоги мне\nОтвет:"]:
-        sample = generate_text(model, prompt, max_length=80, temperature=0.5, device=device)
+        sample = generate_text(model, prompt, max_length=80, temperature=0.2, device=device)
         answer = sample.split("Ответ:")[-1].strip() if "Ответ:" in sample else sample
         q = prompt.split("\n")[0].replace("Вопрос: ", "")
         print(f"    Q: {q}")
