@@ -428,37 +428,34 @@ def main():
         print(f"\n  📚 Phase 0: Data Download...")
         print(f"     📂 Data dir: {data_path}")
         
-        # 1. Wikipedia (5000 статей для quick)
-        wiki_path = data_path / "wiki_ru.txt"
-        if not wiki_path.exists() or wiki_path.stat().st_size < 100_000:
-            wiki_script = TRAINING / "download_wiki.py"
-            if wiki_script.exists():
-                wiki_count = 5000 if vram_gb >= 20 else 2000
-                print(f"\n     📖 Wikipedia: {wiki_count:,} статей...")
-                run([
-                    PYTHON, str(wiki_script),
-                    "--count", str(wiki_count),
-                    "--output", str(wiki_path),
-                ], label="Wiki", timeout=600)
-            else:
-                print(f"     ⏭ download_wiki.py не найден")
-        else:
-            wiki_mb = wiki_path.stat().st_size / (1024 * 1024)
-            print(f"\n     ✓ Wikipedia: {wiki_mb:.1f} MB (кеш)")
-        
-        # 2. HuggingFace datasets
+        # 1. HuggingFace datasets (быстрее чем Wikipedia API)
         hf_script = TRAINING / "download_hf_dataset.py"
         if hf_script.exists():
             max_docs = 10000 if vram_gb >= 20 else 5000
-            print(f"\n     📦 HuggingFace datasets (max_docs={max_docs:,})...")
-            run([
-                PYTHON, str(hf_script),
-                "--preset", "all",
-                "--output", str(data_path),
-                "--max_docs", str(max_docs),
-            ], label="HF", timeout=600)
+            
+            # Скачиваем каждый пресет отдельно для лучшего прогресса
+            hf_presets = [
+                ("instruct", "📝 Instruction tuning (OpenOrca, Alpaca, Saiga)"),
+                ("code",     "💻 Code (Magicoder, StarCoder, CommitPack)"),
+                ("math",     "🔢 Math & Logic (MathInstruct, GSM8K)"),
+                ("thinking", "🧠 Chain-of-Thought (OpenThoughts)"),
+                ("reasoning","💡 Reasoning (GigaChat, Vikhr)"),
+                ("science",  "🔬 Science & Knowledge (OASST, UltraFeedback)"),
+                ("dpo",      "⚖️ DPO/RLHF (Orca DPO, HH-RLHF-ru)"),
+            ]
+            
+            for preset, desc in hf_presets:
+                print(f"\n     {desc} (max {max_docs:,})...")
+                run([
+                    PYTHON, str(hf_script),
+                    "--preset", preset,
+                    "--output", str(data_path),
+                    "--max_docs", str(max_docs),
+                ], label=f"HF-{preset}", timeout=300)
+        else:
+            print(f"     ⏭ download_hf_dataset.py не найден")
         
-        # 3. Personality corpus
+        # 2. Personality corpus
         personality = data_path / "tars_personality_mega.txt"
         if not personality.exists() or personality.stat().st_size < 10_000:
             gen_script = TRAINING / "generate_tars_corpus.py"
@@ -470,7 +467,7 @@ def main():
         else:
             print(f"     ✓ Personality: {personality.stat().st_size // 1024} KB (кеш)")
         
-        # 4. Synthetic STEM data
+        # 3. Synthetic STEM data
         stem_path = data_path / "synthetic_stem.jsonl"
         if not stem_path.exists():
             gen_synth = TRAINING / "generate_synthetic.py"
