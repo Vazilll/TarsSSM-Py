@@ -25,13 +25,13 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 
-def test_mingru(device, epochs=200, batch_size=32, seq_len=256):
+def test_mingru(device, epochs=30, batch_size=32, seq_len=256):
     """
-    Тест MinGRU: 200 эпох (~20-30 мин на L4 GPU).
+    Тест MinGRU: 30 эпох (~2 мин на L4 GPU).
     Модель должна генерировать осмысленный русский текст.
     """
     print(f"\n{'═'*60}")
-    print(f"  TEST 1: MinGRU — обучение + генерация (~20-30 мин)")
+    print(f"  TEST 1: MinGRU — обучение + генерация (~2 мин)")
     print(f"{'═'*60}\n")
     
     from brain.min_gru.mingru_lm import MinGRU_LM
@@ -107,18 +107,18 @@ def test_mingru(device, epochs=200, batch_size=32, seq_len=256):
     print(f"  Данные: {len(inputs)} примеров, seq_len={seq_len}")
     
     # Модель побольше для качественной генерации
-    model = MinGRU_LM(dim=512, num_tokens=256, num_layers=8, context_dim=512, dropout=0.05)
+    model = MinGRU_LM(dim=256, num_tokens=256, num_layers=4, context_dim=512, dropout=0.05)
     model.to(device)
     
     params = sum(p.numel() for p in model.parameters())
-    print(f"  Модель: MinGRU dim=512, 8 layers, {params:,} params")
+    print(f"  Модель: MinGRU dim=256, 4 layers, {params:,} params")
     print(f"  Эпохи: {epochs}, batch={batch_size}")
     
     # Optimizer с cosine LR scheduler
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3, weight_decay=0.01)
     
     # Cosine schedule with warmup
-    warmup_epochs = 10
+    warmup_epochs = 3
     def lr_lambda(epoch):
         if epoch < warmup_epochs:
             return epoch / warmup_epochs
@@ -165,7 +165,7 @@ def test_mingru(device, epochs=200, batch_size=32, seq_len=256):
         
         elapsed = time.time() - t0
         
-        if (epoch + 1) % 20 == 0 or epoch == 0 or (epoch + 1) == epochs:
+        if (epoch + 1) % 5 == 0 or epoch == 0 or (epoch + 1) == epochs:
             model.eval()
             # Greedy generation (very low temperature) to check memorization
             sample = generate_text(model, "Вопрос: Привет\nОтвет:", 

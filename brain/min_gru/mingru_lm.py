@@ -76,9 +76,9 @@ class MinGRUBlock(nn.Module):
         Returns:
             (output, next_hidden)
         """
-        # Causal depthwise conv for local context (skip in incremental mode)
-        if prev_hidden is None:
-            x = self.conv(self.conv_norm(x)) * self.res_scale + x
+        # Causal depthwise conv for local context
+        # Always applied (causal padding handles L=1 correctly)
+        x = self.conv(self.conv_norm(x)) * self.res_scale + x
         
         # MinGRU recurrence
         gru_out, next_hidden = self.gru(
