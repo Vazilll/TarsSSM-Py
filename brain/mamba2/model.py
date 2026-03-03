@@ -773,19 +773,24 @@ class TarsMamba2LM(nn.Module):
             
             # 2 блока параллельно (получают готовый mem_signal вместо memory_vec)
             if self.use_checkpointing and self.training:
+                # use_reentrant=True is required here because:
+                # 1. SSM blocks have stateful operations (triu_indices cache, JIT-compiled WKV)
+                # 2. AMP autocast context must be preserved during recomputation
+                # 3. use_reentrant=False requires perfectly deterministic shapes/dtypes
+                #    which is violated by torch.empty, triu_indices cache, and AMP dtype casting
                 x_left, wkv_states[b_left], x_prevs[b_left], stats_l, \
                     ssd_states[b_left], conv_states[b_left] = grad_checkpoint(
                     self.blocks[b_left], x, wkv_states[b_left],
                     x_prevs[b_left], None, rag_state,
                     ssd_states[b_left], conv_states[b_left], None, mem_signal,
-                    use_reentrant=False
+                    use_reentrant=True
                 )
                 x_right, wkv_states[b_right], x_prevs[b_right], stats_r, \
                     ssd_states[b_right], conv_states[b_right] = grad_checkpoint(
                     self.blocks[b_right], x, wkv_states[b_right],
                     x_prevs[b_right], None, rag_state,
                     ssd_states[b_right], conv_states[b_right], None, mem_signal,
-                    use_reentrant=False
+                    use_reentrant=True
                 )
             else:
                 x_left, wkv_states[b_left], x_prevs[b_left], stats_l, \

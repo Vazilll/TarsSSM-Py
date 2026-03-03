@@ -219,8 +219,8 @@ def wkv_scan(
     if state is None:
         state = torch.zeros(B, S, S, device=r.device, dtype=r.dtype)
     
-    # Pre-allocate output tensor
-    output = torch.empty(B, L, S, device=r.device, dtype=r.dtype)
+    # Pre-allocate output tensor (zeros for determinism with gradient checkpointing)
+    output = torch.zeros(B, L, S, device=r.device, dtype=r.dtype)
     
     # Single-token fast path (inference)
     if L == 1:
