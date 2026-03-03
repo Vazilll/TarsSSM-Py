@@ -431,7 +431,7 @@ def main():
         # 1. HuggingFace datasets (быстрее чем Wikipedia API)
         hf_script = TRAINING / "download_hf_dataset.py"
         if hf_script.exists():
-            max_docs = 10000 if vram_gb >= 20 else 5000
+            max_count = 10000 if vram_gb >= 20 else 5000
             
             # Скачиваем каждый пресет отдельно для лучшего прогресса
             hf_presets = [
@@ -445,12 +445,12 @@ def main():
             ]
             
             for preset, desc in hf_presets:
-                print(f"\n     {desc} (max {max_docs:,})...")
+                print(f"\n     {desc} (max {max_count:,})...")
                 run([
                     PYTHON, str(hf_script),
                     "--preset", preset,
                     "--output", str(data_path),
-                    "--max_docs", str(max_docs),
+                    "--count", str(max_count),
                 ], label=f"HF-{preset}", timeout=300)
         else:
             print(f"     ⏭ download_hf_dataset.py не найден")

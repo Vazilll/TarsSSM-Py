@@ -106,9 +106,12 @@ class MinGRUBlock(nn.Module):
         # Split into heads: [B, L, D] → list of [B, L, head_dim]
         head_inputs = normed.split(head_dim, dim=-1)
         
-        # Split prev_hidden per head
+        # Split prev_hidden per head using actual inner dims (includes expansion_factor)
         if prev_hidden is not None:
-            prev_per_head = prev_hidden.split(head_dim, dim=-1)
+            # Each head's hidden dim_inner = int(head_dim * expansion_factor), not head_dim
+            inner_dims = [h.to_hidden.out_features if hasattr(h, 'to_hidden') else head_dim 
+                          for h in self.gru_heads]
+            prev_per_head = list(prev_hidden.split(inner_dims, dim=-1))
         else:
             prev_per_head = [None] * self.num_heads
         
@@ -120,7 +123,7 @@ class MinGRUBlock(nn.Module):
             head_hiddens.append(h_next)
         
         gru_out = torch.cat(head_outputs, dim=-1)  # [B, L, D]
-        next_hidden = torch.cat(head_hiddens, dim=-1)  # [B, 1, D]
+        next_hidden = torch.cat(head_hiddens, dim=-1)  # [B, 1, sum(inner_dims)]
         x = self.gru_dropout(gru_out) * self.res_scale + x
         
         # Feedforward
