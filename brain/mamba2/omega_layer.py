@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from brain.mamba2.bitnet import UniversalLinear
 
 
+@torch.amp.custom_fwd(device_type='cuda', cast_to=torch.float32)
 def cayley_transform(omega: torch.Tensor) -> torch.Tensor:
     """
     Cayley Transform: антисимметричная Ω → ортогональная G ∈ SO(n).
@@ -25,13 +26,8 @@ def cayley_transform(omega: torch.Tensor) -> torch.Tensor:
     G = (I + Ω/2)(I - Ω/2)⁻¹
     
     Быстрее matrix_exp, не требует eigenvalue decomposition.
-    Note: linalg.solve requires float32 (not supported in Half on CUDA).
+    Note: linalg.solve requires float32, guaranteed by @custom_fwd decorator.
     """
-    orig_dtype = omega.dtype
-    # linalg.solve не поддерживает Half — кастим в float32
-    if omega.dtype == torch.float16 or omega.dtype == torch.bfloat16:
-        omega = omega.float()
-    
     n = omega.shape[-1]
     I = torch.eye(n, device=omega.device, dtype=omega.dtype)
     if omega.dim() == 3:
@@ -39,7 +35,7 @@ def cayley_transform(omega: torch.Tensor) -> torch.Tensor:
     
     half_omega = omega * 0.5
     G = torch.linalg.solve(I - half_omega, I + half_omega)
-    return G.to(orig_dtype)
+    return G
 
 
 class OmegaSSMLayer(nn.Module):

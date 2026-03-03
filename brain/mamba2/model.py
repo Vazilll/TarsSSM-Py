@@ -199,7 +199,7 @@ class WaveConsolidation(nn.Module):
         x = x_gated + self.fusion_scale * fusion.unsqueeze(1) \
                      + self.reflex_scale * reflex_signal.unsqueeze(1)
         
-        return self.norm(x), alpha.mean().item()
+        return self.norm(x), alpha.mean().detach()
 
 
 class GlobalWorkspace(nn.Module):

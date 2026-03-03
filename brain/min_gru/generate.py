@@ -5,8 +5,8 @@ def generate_text(model, start_text="Привет", max_length=128, temperature=
     """
     Генерация текста через MinGRU_LM с инкрементальным декодированием.
     
-    Использует prev_hiddens для O(n) генерации вместо O(n²) —
-    каждый шаг обрабатывает только последний токен.
+    Phase 1: Prompt обрабатывается в FULL SEQUENCE mode (с Conv1d).
+    Phase 2: Инкрементальная генерация — по одному токену.
     
     Args:
         model: MinGRU_LM модель
@@ -35,11 +35,16 @@ def generate_text(model, start_text="Привет", max_length=128, temperature=
     generated_tokens = tokens.copy()
     
     with torch.no_grad():
-        # Phase 1: Process the full prompt to build hidden states
         input_tensor = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(device)
-        logits, prev_hiddens = model(
-            input_tensor, context_vec=ctx, 
-            prev_hiddens=[None] * model.num_layers
+        
+        # Phase 1: Process prompt in FULL SEQUENCE mode (with Conv1d!)
+        # This matches training mode where prev_hiddens is not passed.
+        logits = model(input_tensor, context_vec=ctx)
+        
+        # Re-run to get hidden states for incremental continuation
+        _, prev_hiddens = model(
+            input_tensor, context_vec=ctx,
+            return_hiddens=True
         )
         
         # Sample from last position

@@ -449,11 +449,14 @@ def train(args):
     
     # ═══ EMA (Exponential Moving Average) для стабильного inference ═══
     ema_decay = 0.999
-    ema_state = {k: v.clone() for k, v in model.state_dict().items()}
+    # torch.compile wraps model — get original for clean state_dict keys
+    _raw_model = getattr(model, '_orig_mod', model)
+    ema_state = {k: v.clone() for k, v in _raw_model.state_dict().items()}
     
     def update_ema():
         with torch.no_grad():
-            for k, v in model.state_dict().items():
+            _raw = getattr(model, '_orig_mod', model)
+            for k, v in _raw.state_dict().items():
                 if v.is_floating_point():
                     ema_state[k].mul_(ema_decay).add_(v, alpha=1.0 - ema_decay)
     
@@ -600,7 +603,7 @@ def train(args):
             # Сохраняем EMA веса (более стабильные для inference)
             torch.save({
                 'model_state_dict': ema_state,
-                'model_state_dict_raw': model.state_dict(),
+                'model_state_dict_raw': {k: v for k, v in getattr(model, '_orig_mod', model).state_dict().items()},
                 'dim': args.dim,
                 'num_tokens': 256,
                 'num_layers': args.layers,
@@ -621,7 +624,7 @@ def train(args):
         if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
             cp_path = weights_path.parent / f"mingru_checkpoint_epoch{epoch+1}.pt"
             torch.save({
-                'model_state_dict': model.state_dict(),
+                'model_state_dict': getattr(model, '_orig_mod', model).state_dict(),
                 'dim': args.dim,
                 'num_tokens': 256,
                 'num_layers': args.layers,

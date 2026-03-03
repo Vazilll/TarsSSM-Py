@@ -90,10 +90,9 @@ class TopicRouter(nn.Module):
         # Gate logits
         logits = self.gate(h)  # [B, n_experts]
         
-        # Jitter noise for exploration (training only)
-        if self.training:
-            noise = torch.empty_like(logits).uniform_(-0.01, 0.01)
-            logits = logits + noise
+        # NOTE: Jitter noise removed — it breaks gradient checkpointing
+        # (recomputation generates different noise → different routing → CheckpointError).
+        # Auxiliary load-balancing loss provides sufficient exploration.
         
         # Top-k selection
         weights, indices = logits.topk(self.top_k, dim=-1)

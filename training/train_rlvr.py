@@ -184,7 +184,6 @@ def generate_answer(model, prompt_ids, max_len, device):
     return generated, total_log_prob
 
 
-
 def train(args):
     """RLVR training loop."""
     if args.device == 'auto':

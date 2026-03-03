@@ -1563,6 +1563,8 @@ def main():
                         help="Включить Knowledge Distillation (фаза 15, нужно ≥12GB VRAM)")
     parser.add_argument("--phase", type=int, choices=[0,1,2,3,4,5,6,7,8,9,10,12,13,14,15],
                         help="Запустить только конкретную фазу")
+    parser.add_argument("--test", action="store_true",
+                        help="Быстрый тест MinGRU + Mamba-2 (5-15 мин, проверка перед обучением)")
     parser.add_argument("--quick", action="store_true",
                         help="Быстрый тест (маленькая модель, 1 эпоха)")
     parser.add_argument("--drive", action="store_true",
@@ -1653,6 +1655,19 @@ def main():
         return
     
     # ═══ Полный пайплайн ═══
+    
+    # ═══ Быстрый тест (--test) ═══
+    if args.test:
+        banner(0, "Quick Test — проверка MinGRU + Mamba-2", total=1)
+        test_result = run([PYTHON, str(TRAINING / "quick_test.py"), "--device", device], check=False)
+        results["quick_test"] = test_result
+        if not test_result:
+            logger.error("  ❌ Quick test провалился! Исправьте ошибки перед обучением.")
+        else:
+            logger.info("  ✅ Quick test пройден — можно обучать.")
+        total = time.time() - t0
+        logger.info(f"\n  Quick test завершён за {total:.0f}s")
+        return
     
     # Фаза 0: Зависимости
     results["install"] = phase_0_install()

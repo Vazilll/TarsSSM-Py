@@ -71,7 +71,7 @@ class MemoryInjector(nn.Module):
         if drop is not None:
             signal = drop(signal)
         x = x + signal.unsqueeze(1)
-        gate_val = signal.abs().mean().item()
+        gate_val = signal.abs().mean().detach()
         return x, gate_val
 
 
@@ -207,7 +207,7 @@ class TarsBlock(nn.Module):
         if mem_signal is not None:
             # Wave-parallel mode: сигнал уже вычислен model.py
             x = x + self.drop(mem_signal.unsqueeze(1))
-            mem_relevance = mem_signal.abs().mean().item()
+            mem_relevance = mem_signal.abs().mean().detach()
         elif memory_vec is not None:
             # Per-block mode: fallback
             x, self.last_surprise = self.mem_injector.inject(x, memory_vec, self.drop)
@@ -219,13 +219,13 @@ class TarsBlock(nn.Module):
         # Stats
         self.last_stats = {
             "layer_idx": self.layer_idx,
-            "novelty": novelty.mean().item() if isinstance(novelty, torch.Tensor) else novelty,
+            "novelty": novelty.mean().detach() if isinstance(novelty, torch.Tensor) else novelty,
             "has_rag": rag_state is not None,
             "mem_relevance": mem_relevance,
             "surprise": self.last_surprise,
             "mole_aux_loss": mole_aux_loss,
             "mole_experts": getattr(self.mole, '_last_expert_names', []),
-            "pred_error": pred_error.mean().item() if isinstance(pred_error, torch.Tensor) else 0.0,
+            "pred_error": pred_error.mean().detach() if isinstance(pred_error, torch.Tensor) else 0.0,
         }
         
         return x, wkv_state, x_prev, self.last_stats, ssd_state, conv_state
