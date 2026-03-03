@@ -53,6 +53,9 @@ if hasattr(sys.stdout, 'reconfigure'):
         pass
 
 ROOT = Path(__file__).resolve().parent
+os.chdir(ROOT)
+sys.path.insert(0, str(ROOT))
+
 TRAINING = ROOT / "training"
 PYTHON = sys.executable
 LOG_FILE = ROOT / "quick_train.log"
