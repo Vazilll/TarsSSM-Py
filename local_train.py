@@ -233,16 +233,20 @@ def benchmark_hardware():
     max_batch_for_d = {}
     for d_model in [256, 512, 768, 1024]:
         seq = 512
-        lo_b, hi_b = 1, 64
+        lo_b, hi_b = 1, 32  # макс 32 для стабильности
         best_b = 1
+        # Модель: weights + optimizer(Adam) + gradients
+        # nl_est: число слоёв по шкале d_model
+        nl_est = {256: 4, 512: 8, 768: 16, 1024: 20}.get(d_model, 12)
+        n_params = d_model * d_model * nl_est * 12
+        dtype_size = 2 if (bf16 or hw["fp16"]) else 4
+        # Model mem: params × dtype + optimizer(2×params×fp32) + grads(×dtype)
+        model_mem_gb = (n_params * dtype_size + n_params * 4 * 2 + n_params * dtype_size) / 1024**3
         while lo_b <= hi_b:
             mid_b = (lo_b + hi_b) // 2
-            # Прикидка: model + batch memory
-            model_mem_gb = (d_model ** 2 * 12 * 4) / 1024**3  # rough model size
-            dtype_size = 2 if (bf16 or hw["fp16"]) else 4
-            # fwd + bwd + grad + activations ≈ ×6
-            batch_mem_gb = (mid_b * seq * d_model * dtype_size * 6) / 1024**3
-            total_need = model_mem_gb + batch_mem_gb
+            # Activations: batch × seq × d × layers × dtype × 2 (fwd+bwd)
+            act_mem_gb = (mid_b * seq * d_model * nl_est * dtype_size * 2) / 1024**3
+            total_need = model_mem_gb + act_mem_gb
             if total_need <= hw["vram_usable_gb"]:
                 best_b = mid_b
                 lo_b = mid_b + 1
@@ -522,6 +526,17 @@ def setup_drive(mode):
 
     if mode == "colab":
         print("\n  ☁️  Google Drive: подключение через Colab...")
+        # Проверяем: уже смонтировано через ноутбук? (симлинки data/ и models/)
+        data_sym = (ROOT / "data").is_symlink()
+        models_sym = (ROOT / "models").is_symlink()
+        drive_path = Path("/content/drive/MyDrive")
+        if (data_sym or models_sym) and drive_path.exists():
+            print("  ✅ Drive уже смонтирован через ноутбук (симлинки активны)")
+            return True
+        if drive_path.exists():
+            print("  ✅ Drive уже смонтирован")
+            return True
+        # Попытка монтирования (только если ещё не смонтирован)
         try:
             from google.colab import drive
             drive.mount('/content/drive')
@@ -529,9 +544,12 @@ def setup_drive(mode):
             return True
         except ImportError:
             print("  ❌ google.colab недоступен (не запущен в Colab)")
-            print("     Используйте --drive rclone для локального подключения")
             return False
         except Exception as e:
+            # Если ошибка монтирования, но Drive уже доступен — продолжаем
+            if drive_path.exists():
+                print(f"  ⚠️  Ошибка mount ({e}), но Drive доступен")
+                return True
             print(f"  ❌ Ошибка монтирования: {e}")
             return False
 
