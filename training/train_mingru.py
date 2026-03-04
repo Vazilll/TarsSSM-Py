@@ -522,6 +522,11 @@ def train(args):
         
         model.train()
         total_train_loss = 0
+        total_correct = 0
+        total_top5_correct = 0
+        total_tokens = 0
+        total_grad_norm = 0
+        grad_norm_count = 0
         n_batches = 0
         optimizer.zero_grad()
         
@@ -548,12 +553,23 @@ def train(args):
             
             if (step_idx + 1) % accum_steps == 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                total_grad_norm += gn.item()
+                grad_norm_count += 1
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
                 scheduler.step()
                 update_ema()
+            
+            # Accuracy (top-1 и top-5)
+            with torch.no_grad():
+                preds = logits.reshape(-1, logits.size(-1))
+                tgts = batch_tgt.reshape(-1)
+                total_correct += (preds.argmax(-1) == tgts).sum().item()
+                _, top5_preds = preds.topk(5, dim=-1)
+                total_top5_correct += (top5_preds == tgts.unsqueeze(-1)).any(-1).sum().item()
+                total_tokens += tgts.numel()
             
             total_train_loss += loss.item() * accum_steps
             n_batches += 1
@@ -562,6 +578,7 @@ def train(args):
             if (step_idx + 1) % log_every == 0 or step_idx == 0:
                 elapsed_b = time.time() - batch_t0
                 avg_loss = total_train_loss / n_batches
+                acc = total_correct / max(total_tokens, 1) * 100
                 speed = (step_idx + 1) / max(elapsed_b, 0.1)
                 pct = (step_idx + 1) / total_batches * 100
                 gpu_str = ""
@@ -570,7 +587,8 @@ def train(args):
                     gpu_str = f" | VRAM: {gpu_gb:.1f}GB"
                 eta_min = (total_batches - step_idx - 1) / max(speed, 0.1) / 60
                 print(f"  [{epoch+1:2d}] {step_idx+1:6d}/{total_batches} ({pct:4.1f}%) "
-                      f"| Loss: {avg_loss:.4f} | {speed:.0f} batch/s "
+                      f"| Loss: {avg_loss:.4f} | Acc: {acc:.1f}% "
+                      f"| {speed:.0f} batch/s "
                       f"| ETA: {eta_min:.1f}min{gpu_str}", flush=True)
         
         # Flush remaining gradients
@@ -581,9 +599,15 @@ def train(args):
             optimizer.zero_grad()
         
         avg_train_loss = total_train_loss / max(n_batches, 1)
+        train_acc = total_correct / max(total_tokens, 1) * 100
+        train_top5 = total_top5_correct / max(total_tokens, 1) * 100
+        avg_grad_norm = total_grad_norm / max(grad_norm_count, 1)
         
         # ═══ Eval ═══
         model.eval()
+        eval_correct = 0
+        eval_top5_correct = 0
+        eval_tokens = 0
         with torch.no_grad():
             eval_losses = []
             for test_in, test_tgt in test_loader:
@@ -591,13 +615,18 @@ def train(args):
                 test_tgt = test_tgt.to(device, non_blocking=True)
                 with torch.amp.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
                     logits = model(test_in)
-                    el = F.cross_entropy(
-                        logits.reshape(-1, logits.size(-1)),
-                        test_tgt.reshape(-1),
-                    ).item()
+                    flat_logits = logits.reshape(-1, logits.size(-1))
+                    flat_tgt = test_tgt.reshape(-1)
+                    el = F.cross_entropy(flat_logits, flat_tgt).item()
+                    eval_correct += (flat_logits.argmax(-1) == flat_tgt).sum().item()
+                    _, top5 = flat_logits.topk(5, dim=-1)
+                    eval_top5_correct += (top5 == flat_tgt.unsqueeze(-1)).any(-1).sum().item()
+                    eval_tokens += flat_tgt.numel()
                 eval_losses.append(el)
             eval_loss = np.mean(eval_losses)
         
+        eval_acc = eval_correct / max(eval_tokens, 1) * 100
+        eval_top5 = eval_top5_correct / max(eval_tokens, 1) * 100
         epoch_time = time.time() - epoch_start
         
         # ═══ Логирование — КАЖДУЮ эпоху ═══
@@ -613,12 +642,34 @@ def train(args):
         marker = " ★ BEST" if eval_loss < best_loss else ""
         remaining = (args.epochs - (epoch - start_epoch + 1)) * epoch_time
         
+        # Легенда (один раз)
+        if epoch == start_epoch:
+            print(f"\n  ╔═══════════════════════════════════════════════════════════╗")
+            print(f"  ║  📊 МЕТРИКИ: что хорошо / что плохо                     ║")
+            print(f"  ╠═══════════════════════════════════════════════════════════╣")
+            print(f"  ║  Loss ↓      — ошибка, чем МЕНЬШЕ тем лучше              ║")
+            print(f"  ║  PPL ↓       — perplexity, <10 хорошо, <5 отлично        ║")
+            print(f"  ║  Acc ↑       — точность (top-1), чем БОЛЬШЕ тем лучше    ║")
+            print(f"  ║  Top5 ↑      — точность (top-5), должна быть >50%        ║")
+            print(f"  ║  GradNorm ≈  — норма градиента, 0.1-1.0 нормально        ║")
+            print(f"  ║  Overfit ⚠   — если Train Acc >> Eval Acc, модель зубрит ║")
+            print(f"  ╚═══════════════════════════════════════════════════════════╝")
+        
+        # Overfit check
+        overfit_flag = ""
+        if train_acc > eval_acc + 10:
+            overfit_flag = " ⚠ OVERFIT"
+        
         print(f"\n{'─'*70}")
         print(f"Эпоха {epoch+1:3d}/{start_epoch + args.epochs} | "
-              f"Train: {avg_train_loss:.4f} | Eval: {eval_loss:.4f} | "
-              f"PPL: {perplexity:.1f} | LR: {lr_now:.2e} | "
-              f"{epoch_time:.0f}s{gpu_info}{marker}")
-        print(f"  ⏱ Прошло: {total_elapsed/60:.0f} мин | Осталось: ~{remaining/60:.0f} мин")
+              f"{epoch_time:.0f}s | LR: {lr_now:.2e}{gpu_info}{marker}{overfit_flag}")
+        print(f"  ┌──────────┬──────────┬──────────┬──────────┬──────────┐")
+        print(f"  │          │ Loss ↓   │ Acc ↑    │ Top5 ↑   │ PPL ↓    │")
+        print(f"  ├──────────┼──────────┼──────────┼──────────┼──────────┤")
+        print(f"  │ Train    │ {avg_train_loss:8.4f} │ {train_acc:7.2f}% │ {train_top5:7.2f}% │          │")
+        print(f"  │ Eval     │ {eval_loss:8.4f} │ {eval_acc:7.2f}% │ {eval_top5:7.2f}% │ {perplexity:8.1f} │")
+        print(f"  └──────────┴──────────┴──────────┴──────────┴──────────┘")
+        print(f"  GradNorm: {avg_grad_norm:.4f} | ⏱ Прошло: {total_elapsed/60:.0f} мин | Осталось: ~{remaining/60:.0f} мин")
         
         # Демонстрация: показать как модель отвечает
         prompts = [
