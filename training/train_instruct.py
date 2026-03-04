@@ -242,6 +242,8 @@ def train_instruct(model, tokenize_fn, texts: List[str],
                 valid += 1
             
             if valid > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()

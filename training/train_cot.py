@@ -433,7 +433,10 @@ def train_cot(args):
         }, str(save_path))
         print(f"  ✓ Saved (CoT fine-tuned, epoch {epoch+1})")
     
-    print(f"\n✓ CoT training complete! Loss: {avg_loss:.4f}")
+    if args.epochs > 0:
+        print(f"\n✓ CoT training complete! Loss: {avg_loss:.4f}")
+    else:
+        print("\n✓ No epochs to train.")
 
 
 if __name__ == "__main__":

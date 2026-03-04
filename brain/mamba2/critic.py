@@ -301,3 +301,176 @@ class WaveCritic:
             lines.append(self.task_spec.summary())
         
         return "\n".join(lines)
+    
+    @torch.no_grad()
+    def verify_rag_completion(
+        self,
+        delivery_report: Dict,
+        memory_vec,
+        pmm,          # ProgressiveMemoryManager
+        matrix_pool,  # MatrixPool (IDME)
+        x: torch.Tensor,        # [B, L, d_model] — текущий hidden state
+        h_prev: torch.Tensor,   # [B, d_model]
+        integral_auditor,
+        novelty_gate,
+        from_memory_space,
+        to_memory_space,
+        max_rag_rounds: int = 6,
+    ) -> Dict:
+        """
+        Мозжечок: финальная проверка загрузки RAG.
+        
+        Если не все источники доставлены:
+          1. Рекрутирует СВЕЖИЕ IDME-матрицы (lazy_expand → новые, не повторяет)
+          2. Прогоняет hidden state через них + novelty_gate
+          3. Обновляет memory_vec через spine
+          4. На каждом раунде проверяет PMM — если RAG пришёл, инжектит
+          5. Проверяет сходимость через IntegralAuditor
+        
+        Returns:
+            {
+                "rag_complete": bool,
+                "missing_sources": [...],
+                "rounds_used": int,
+                "matrices_recruited": int,
+                "final_p": float,
+                "updated_memory_vec": Tensor or None,
+                "updated_x": Tensor or None,
+            }
+        """
+        # Если RAG не запрашивался или всё загружено — ничего не делаем
+        if delivery_report.get("no_rag_needed") or delivery_report.get("all_loaded"):
+            logger.info(
+                f"Cerebellum RAG check: ✅ "
+                f"{'no RAG needed' if delivery_report.get('no_rag_needed') else 'all loaded'}"
+            )
+            return {
+                "rag_complete": True,
+                "missing_sources": [],
+                "rounds_used": 0,
+                "matrices_recruited": 0,
+                "final_p": 0.0,
+                "updated_memory_vec": None,
+                "updated_x": None,
+            }
+        
+        missing = delivery_report.get("missing", [])
+        logger.warning(
+            f"Cerebellum RAG check: ⚠️ {len(missing)} sources pending: {missing}. "
+            f"Recruiting fresh IDME matrices to continue processing..."
+        )
+        
+        # ═══ Matrix Continuation Loop ═══
+        rounds_used = 0
+        matrices_recruited = 0
+        h_curr = x.mean(dim=1).detach()
+        final_p = 0.0
+        updated_x = x
+        updated_memory = memory_vec
+        
+        for round_idx in range(max_rag_rounds):
+            rounds_used += 1
+            
+            # 1. Проверяем PMM — может RAG уже пришёл?
+            if pmm.check_ready():
+                new_mem = pmm.get_memory_vec()
+                if new_mem is not None:
+                    updated_memory = new_mem
+                    logger.info(
+                        f"Cerebellum: RAG data arrived at continuation round {round_idx + 1}"
+                    )
+                    # Проверяем delivery report заново
+                    report = pmm.get_delivery_report()
+                    if report.get("all_loaded"):
+                        logger.info("Cerebellum: ✅ All RAG sources now loaded")
+                        break
+            
+            # 2. Рекрутировать СВЕЖИЕ матрицы (lazy_expand гарантирует новые)
+            try:
+                n_new = 2  # 2 свежие матрицы за раунд
+                matrix_pool._lazy_expand(n_new, h_curr.mean(0))
+                candidates, indices = matrix_pool.select(h_curr.mean(0), k=n_new)
+                matrices_recruited += len(candidates)
+            except Exception as e:
+                logger.debug(f"Cerebellum: matrix expand failed: {e}")
+                break
+            
+            if not candidates:
+                logger.debug("Cerebellum: no candidates available, stopping")
+                break
+            
+            # 3. Прогоняем через матрицы + novelty_gate
+            h_state = updated_x.mean(dim=1)
+            best_h = None
+            best_delta = 0.0
+            
+            for matrix, idx in zip(candidates, indices):
+                h_clone = h_state.clone()
+                h_refined = matrix(h_clone)
+                h_gated, _ = novelty_gate(h_clone, h_refined)
+                
+                delta = (h_gated - h_state).float().norm().item()
+                if delta > best_delta:
+                    best_delta = delta
+                    best_h = h_gated
+                    # Recirculate winning matrix
+                    if idx >= 0:
+                        matrix_pool.recirculate(idx, delta * 0.01)
+            
+            if best_h is None or best_delta < 1e-6:
+                logger.debug(
+                    f"Cerebellum round {round_idx + 1}: no improvement (delta={best_delta:.6f})"
+                )
+                break
+            
+            # 4. Обновляем x и spine
+            updated_x = updated_x + 0.1 * (best_h - h_state).unsqueeze(1)
+            h_curr = updated_x.mean(dim=1).detach()
+            
+            # Spine: обновляем memory_vec
+            if to_memory_space is not None and updated_memory is not None:
+                try:
+                    h_for_mem = to_memory_space(h_curr)
+                    updated_memory = 0.7 * updated_memory + 0.3 * h_for_mem.detach()
+                except Exception:
+                    pass
+            
+            # 5. IntegralAuditor: проверка сходимости
+            ia_result = integral_auditor.observe(h_curr, h_prev)
+            h_prev = h_curr
+            final_p = ia_result.get("p", 0.0)
+            
+            logger.info(
+                f"Cerebellum RAG round {round_idx + 1}/{max_rag_rounds}: "
+                f"+{len(candidates)} matrices, p={final_p:.3f}, "
+                f"delta={best_delta:.4f}"
+            )
+            
+            # Если сошлось — хватит, мозжечок удовлетворён
+            if ia_result.get("converged", False) and final_p > 0.8:
+                logger.info(
+                    f"Cerebellum: converged at round {round_idx + 1} (p={final_p:.3f})"
+                )
+                break
+        
+        # Финальный статус
+        final_report = pmm.get_delivery_report()
+        still_missing = final_report.get("missing", [])
+        rag_complete = len(still_missing) == 0
+        
+        status = "✅ complete" if rag_complete else f"⚠️ {len(still_missing)} still pending"
+        logger.info(
+            f"Cerebellum RAG verification: {status} | "
+            f"{rounds_used} rounds, {matrices_recruited} matrices recruited, "
+            f"final_p={final_p:.3f}"
+        )
+        
+        return {
+            "rag_complete": rag_complete,
+            "missing_sources": still_missing,
+            "rounds_used": rounds_used,
+            "matrices_recruited": matrices_recruited,
+            "final_p": final_p,
+            "updated_memory_vec": updated_memory,
+            "updated_x": updated_x if rounds_used > 0 else None,
+        }

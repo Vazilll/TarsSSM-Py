@@ -33,6 +33,7 @@ import time
 import json
 import gc
 import argparse
+import platform
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -46,6 +47,12 @@ from brain.min_gru.mingru_lm import MinGRU_LM
 from training.train_corpus import get_training_text
 from brain.min_gru.utils import tokenize_text, decode_tokens
 from brain.min_gru.generate import generate_text
+from training.train_utils import (
+    TrainLogger, GradientMonitor, ThroughputTracker,
+    CurriculumSchedule, make_optimizer, make_lr_schedule,
+)
+
+_IS_WINDOWS = platform.system() == 'Windows'
 
 
 # ═══════════════════════════════════════════
@@ -441,10 +448,12 @@ def train(args):
     gc.collect()
     
     use_pin = device.type == 'cuda'
+    _num_workers = 0 if _IS_WINDOWS else (2 if use_pin else 0)
+    _persist = use_pin and _num_workers > 0
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch, shuffle=True,
-        pin_memory=use_pin, num_workers=2 if use_pin else 0,
-        drop_last=True, persistent_workers=use_pin,
+        pin_memory=use_pin, num_workers=_num_workers,
+        drop_last=True, persistent_workers=_persist,
     )
     test_loader = DataLoader(
         test_dataset, batch_size=args.batch * 2, shuffle=False,
@@ -504,16 +513,34 @@ def train(args):
     patience_counter = 0
     training_start = time.time()
     
+    # ═══ Monitoring tools ═══
+    log_path = weights_path.parent / "mingru_train.jsonl"
+    train_log = TrainLogger(
+        path=str(log_path),
+        model_name=f"MinGRU-{args.dim}d-{args.layers}L",
+    )
+    train_log.log_config(
+        dim=args.dim, layers=args.layers, lr=args.lr, wd=args.wd,
+        batch=args.batch, effective_batch=effective_batch,
+        seq_len=args.seq_len, epochs=args.epochs,
+        label_smoothing=args.label_smoothing, dropout=args.dropout,
+        augment=args.augment, compiled=compiled,
+        total_steps=total_steps,
+    )
+    grad_monitor = GradientMonitor(model, check_every=max(1, total_steps // 20))
+    throughput = ThroughputTracker()
+    
     # ═══ Баннер ═══
     if device.type == 'cuda':
         gpu_used = torch.cuda.memory_allocated() / 1024**3
         print(f"[GPU] VRAM до обучения: {gpu_used:.2f} GB / {gpu_mem:.1f} GB")
     
     print(f"\n{'═'*70}")
-    print(f"  ТАРС MinGRU Training (MAX GPU)")
+    print(f"  ТАРС MinGRU Training (MAX GPU + Advanced)")
     print(f"  Epochs: {args.epochs} | Batch: {args.batch}×{accum_steps} = {effective_batch}")
     print(f"  Device: {device} | AMP: {amp_dtype if use_amp else 'off'} | Compiled: {compiled}")
     print(f"  Batches/epoch: {len(train_loader)} | Total steps: {total_steps}")
+    print(f"  Log: {log_path}")
     print(f"{'═'*70}\n")
     
     # ═══ Training Loop ═══
@@ -535,6 +562,7 @@ def train(args):
         batch_t0 = time.time()
         
         for step_idx, (batch_in, batch_tgt) in enumerate(train_loader):
+            throughput.start_step()
             batch_in = batch_in.to(device, non_blocking=True)
             batch_tgt = batch_tgt.to(device, non_blocking=True)
             
@@ -556,6 +584,12 @@ def train(args):
                 gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 total_grad_norm += gn.item()
                 grad_norm_count += 1
+                
+                # Gradient monitoring (periodic)
+                global_step = (epoch - start_epoch) * len(train_loader) + step_idx
+                if global_step % grad_monitor.check_every == 0:
+                    grad_monitor.log_to(train_log, global_step)
+                
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -573,6 +607,7 @@ def train(args):
             
             total_train_loss += loss.item() * accum_steps
             n_batches += 1
+            throughput.end_step(batch_in.numel())
             
             # ═══ Прогресс внутри эпохи ═══
             if (step_idx + 1) % log_every == 0 or step_idx == 0:
@@ -585,10 +620,11 @@ def train(args):
                 if device.type == 'cuda':
                     gpu_gb = torch.cuda.memory_allocated() / 1024**3
                     gpu_str = f" | VRAM: {gpu_gb:.1f}GB"
+                tps = throughput.format_status()
                 eta_min = (total_batches - step_idx - 1) / max(speed, 0.1) / 60
                 print(f"  [{epoch+1:2d}] {step_idx+1:6d}/{total_batches} ({pct:4.1f}%) "
                       f"| Loss: {avg_loss:.4f} | Acc: {acc:.1f}% "
-                      f"| {speed:.0f} batch/s "
+                      f"| {speed:.0f} batch/s | {tps} "
                       f"| ETA: {eta_min:.1f}min{gpu_str}", flush=True)
         
         # Flush remaining gradients
@@ -670,6 +706,18 @@ def train(args):
         print(f"  │ Eval     │ {eval_loss:8.4f} │ {eval_acc:7.2f}% │ {eval_top5:7.2f}% │ {perplexity:8.1f} │")
         print(f"  └──────────┴──────────┴──────────┴──────────┴──────────┘")
         print(f"  GradNorm: {avg_grad_norm:.4f} | ⏱ Прошло: {total_elapsed/60:.0f} мин | Осталось: ~{remaining/60:.0f} мин")
+        print(f"  📊 {throughput.format_status()} | Total: {throughput.report()['total_tokens']:,} tokens")
+        
+        # Log epoch to JSONL
+        train_log.log_epoch(
+            epoch+1, train_loss=round(avg_train_loss, 4),
+            eval_loss=round(eval_loss, 4), ppl=round(perplexity, 2),
+            train_acc=round(train_acc, 2), eval_acc=round(eval_acc, 2),
+            train_top5=round(train_top5, 2), eval_top5=round(eval_top5, 2),
+            grad_norm=round(avg_grad_norm, 4), lr=lr_now,
+            epoch_time=round(epoch_time, 1),
+            tokens_per_sec=round(throughput.tokens_per_sec),
+        )
         
         # Демонстрация: показать как модель отвечает
         prompts = [
@@ -696,7 +744,7 @@ def train(args):
             # Сохраняем EMA веса (более стабильные для inference)
             torch.save({
                 'model_state_dict': ema_state,
-                'model_state_dict_raw': {k: v for k, v in getattr(model, '_orig_mod', model).state_dict().items()},
+                'model_state_dict_raw': {k: v.clone() for k, v in getattr(model, '_orig_mod', model).state_dict().items()},
                 'dim': args.dim,
                 'num_tokens': 256,
                 'num_layers': args.layers,
@@ -737,6 +785,13 @@ def train(args):
     if device.type == 'cuda':
         peak = torch.cuda.max_memory_allocated() / 1024**3
         print(f"  Peak VRAM: {peak:.1f} GB / {gpu_mem:.1f} GB ({peak/gpu_mem*100:.0f}%)")
+    
+    # Final throughput report
+    tp = throughput.report()
+    print(f"  ⚡ Throughput: {tp['tokens_per_sec']:,} tok/s | {tp['avg_step_ms']:.1f} ms/step")
+    print(f"  📊 Total tokens: {tp['total_tokens']:,} | Time: {tp['total_time_min']:.1f} min")
+    
+    train_log.summary()
     print(f"{'═'*70}\n")
     
     # ═══ Квантизация 1.58-bit ═══
@@ -750,7 +805,9 @@ def train(args):
             dim=args.dim, num_tokens=256,
             num_layers=args.layers, context_dim=args.context_dim
         )
-        quant_model.load_state_dict(best_ckpt['model_state_dict'])
+        # Для квантизации используем raw (не-EMA) веса — ключи совпадают
+        raw_sd = best_ckpt.get('model_state_dict_raw', best_ckpt['model_state_dict'])
+        quant_model.load_state_dict(raw_sd, strict=False)
         
         fp32_mb = sum(p.numel() * p.element_size() for p in quant_model.parameters()) / 1048576
         
@@ -794,13 +851,14 @@ def train(args):
         "Вопрос: пупупу\nОтвет:",
         "Вопрос: Спасибо\nОтвет:",
     ]
-    for prompt in test_prompts:
-        result = generate_text(model, start_text=prompt, max_length=100, 
-                               temperature=0.7, device=device)
-        answer = result.split("Ответ:")[-1].strip() if "Ответ:" in result else result
-        q = prompt.split("\n")[0].replace("Вопрос: ", "")
-        print(f"  Q: {q}")
-        print(f"  A: {answer[:120]}\n")
+    with torch.no_grad():
+        for prompt in test_prompts:
+            result = generate_text(model, start_text=prompt, max_length=100, 
+                                   temperature=0.7, device=device)
+            answer = result.split("Ответ:")[-1].strip() if "Ответ:" in result else result
+            q = prompt.split("\n")[0].replace("Вопрос: ", "")
+            print(f"  Q: {q}")
+            print(f"  A: {answer[:120]}\n")
 
 
 if __name__ == "__main__":

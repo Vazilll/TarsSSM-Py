@@ -1,8 +1,10 @@
 import numpy as np
 import os
 import json
+import hashlib
 import logging
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import List, Optional
 
@@ -54,6 +56,12 @@ class LeannIndex:
         self._bm25: Optional[BM25Index] = None
         self._bm25_dirty = True
         
+        # ═══ CPU-OPT: LRU cache for query embeddings ═══
+        # SentenceTransformer.encode() is ~50-100ms per call on CPU
+        # Caching avoids re-encoding identical/repeated queries
+        self._emb_cache: OrderedDict = OrderedDict()  # key → (int8_vec, scale)
+        self._emb_cache_max = 256
+        
         # Настройки поиска (OpenClaw-inspired)
         self.mmr_lambda = 0.7       # MMR: 0=diversity, 1=relevance
         self.decay_half_life = 30.0 # Temporal decay: дни
@@ -74,6 +82,12 @@ class LeannIndex:
 
     def _get_embedding(self, text: str):
         """Превращение сырого текста в семантический вектор. Returns (int8_vec, scale)."""
+        # ═══ CPU-OPT: check LRU cache first ═══
+        cache_key = hashlib.md5(text.encode('utf-8', errors='replace')).hexdigest()
+        if cache_key in self._emb_cache:
+            self._emb_cache.move_to_end(cache_key)
+            return self._emb_cache[cache_key]
+        
         if self.model:
             emb = self.model.encode([text])[0].astype(np.float32)
         else:
@@ -92,7 +106,14 @@ class LeannIndex:
         if scale < 1e-8:
             scale = 1e-8
         emb_q = np.clip(np.round(emb / scale), -128, 127).astype(np.int8)
-        return emb_q, np.float32(scale)
+        result = (emb_q, np.float32(scale))
+        
+        # ═══ Store in LRU cache ═══
+        self._emb_cache[cache_key] = result
+        if len(self._emb_cache) > self._emb_cache_max:
+            self._emb_cache.popitem(last=False)  # evict oldest
+        
+        return result
 
     def _build_ivf(self):
         """Построить IVF индекс (k-means кластеризация)."""

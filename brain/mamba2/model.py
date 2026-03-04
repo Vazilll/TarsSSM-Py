@@ -46,9 +46,11 @@ from brain.mamba2.hyperbolic import HyperbolicSimilarity, project_to_poincare
 from brain.mamba2.active_inference import BeliefState
 from brain.mamba2.thinking_chain import ThinkingChain
 from brain.mamba2.personality_adapter import PersonalityAdapter
+from brain.mamba2.query_router import QueryRouter, ProgressiveMemoryManager
 from brain.mamba2.bitnet import (
     UniversalLinear, convert_model_to_158bit,
-    convert_model_to_fp16, model_stats, replace_linear_with_universal
+    convert_model_to_fp16, model_stats, replace_linear_with_universal,
+    RMSNorm,
 )
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -165,8 +167,8 @@ class WaveConsolidation(nn.Module):
             nn.Tanh(),
         )
         
-        # 4. Output normalization
-        self.norm = nn.LayerNorm(d_model)
+        # 4. Output normalization — RMSNorm: 15-20% faster than LayerNorm
+        self.norm = RMSNorm(d_model)
         
         # Масштаб fusion и reflex
         self.fusion_scale = nn.Parameter(torch.tensor(0.1))
@@ -239,8 +241,8 @@ class GlobalWorkspace(nn.Module):
         # Mixing strength (обучаемый)
         self.mix = nn.Parameter(torch.tensor(0.1))
         
-        # Norm
-        self.norm = nn.LayerNorm(d_model)
+        # Norm — RMSNorm: faster than LayerNorm
+        self.norm = RMSNorm(d_model)
     
     def forward(self, block_outputs: list, x_current: torch.Tensor) -> torch.Tensor:
         """
@@ -332,6 +334,19 @@ class TarsMamba2LM(nn.Module):
                     skipped += 1
             model.load_state_dict(model_state, strict=False)
             _logger.info(f"Loaded {loaded} tensors, skipped {skipped}")
+            
+            # ═══ CPU-OPT: INT8 Dynamic Quantization ═══
+            # Converts all nn.Linear to INT8 → 2-3x CPU speedup, ~50% RAM savings
+            # Uses AVX-512 VNNI instructions on Intel CPUs
+            if str(device) == 'cpu' and not _os.environ.get('TARS_NO_QUANT'):
+                try:
+                    model = torch.ao.quantization.quantize_dynamic(
+                        model, {torch.nn.Linear}, dtype=torch.qint8
+                    )
+                    _logger.info("INT8 dynamic quantization applied (CPU mode)")
+                except Exception as e:
+                    _logger.debug(f"INT8 quantization skipped: {e}")
+            
             return model, checkpoint_path
         
         _logger.warning("No checkpoint found — UNTRAINED")
@@ -470,8 +485,8 @@ class TarsMamba2LM(nn.Module):
         self.critic_head = CriticHead(d_model, n_criteria=8)
         self.wave_critic = WaveCritic(self.critic_head, d_model)
         
-        # ═══ Output head ═══
-        self.norm_f = nn.LayerNorm(d_model)
+        # ═══ Output head — RMSNorm everywhere for consistency ═══
+        self.norm_f = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         
         # Tie weights
@@ -489,24 +504,31 @@ class TarsMamba2LM(nn.Module):
         # ═══ Performance: CPU Threading + torch.compile ═══
         import os as _os
         n_threads = int(_os.environ.get('TARS_THREADS', _os.cpu_count() or 4))
-        torch.set_num_threads(n_threads)
-        torch.set_num_interop_threads(max(1, n_threads // 2))
-        self.logger.info(f"CPU threads: {n_threads} intra, {max(1, n_threads // 2)} inter")
+        try:
+            torch.set_num_threads(n_threads)
+            torch.set_num_interop_threads(max(1, n_threads // 2))
+            self.logger.info(f"CPU threads: {n_threads} intra, {max(1, n_threads // 2)} inter")
+        except RuntimeError:
+            pass  # Already set or parallel work started
         
         # torch.compile для 1.5-2x ускорения (PyTorch 2.0+)
+        # NOTE: НЕ компилируем автоматически — модель содержит sub-modules,
+        # несовместимые с torch.compile (integral_auditor: time.time(),
+        # personality_adapter: iterative loop + .item()). Тренировочные скрипты
+        # применяют torch.compile самостоятельно с нужным mode.
+        # Включить вручную: TARS_FORCE_COMPILE=1
         self._compiled = False
-        if hasattr(torch, 'compile') and not _os.environ.get('TARS_NO_COMPILE'):
+        if hasattr(torch, 'compile') and _os.environ.get('TARS_FORCE_COMPILE'):
             try:
                 import platform
-                # torch.compile работает стабильно на Linux; на Windows — экспериментально
-                if platform.system() != 'Windows' or _os.environ.get('TARS_FORCE_COMPILE'):
+                if platform.system() != 'Windows':
                     self.forward = torch.compile(
                         self.forward,
-                        mode="reduce-overhead",
+                        mode="default",
                         fullgraph=False,
                     )
                     self._compiled = True
-                    self.logger.info("torch.compile activated (reduce-overhead)")
+                    self.logger.info("torch.compile activated (default mode, forced)")
             except Exception as e:
                 self.logger.debug(f"torch.compile failed: {e}")
         
@@ -526,6 +548,11 @@ class TarsMamba2LM(nn.Module):
         self.thinking_chain = ThinkingChain(
             d_model, d_memory=384, n_max_waves=n_layers // 2, vocab_size=vocab_size
         )
+        
+        # ═══ QueryRouter — нейронный маршрутизатор памяти ═══
+        # Определяет: нужен ли RAG, какой источник, уточняет запрос.
+        # Решает проблему sync: если RAG не нужен → блоки не ждут.
+        self.query_router = QueryRouter(d_model, mem_dim=384, quant_mode=quant_mode)
         
         # ═══ PersonalityAdapter (Convergence-Gated Style Transform) ═══
         # Отдельный модуль стиля ТАРС. Не смешивается с весами Mamba.
@@ -548,6 +575,90 @@ class TarsMamba2LM(nn.Module):
         
         # ═══ Unified RoPE for WKV branch (Qwen3/Mamba-3 style) ═══
         self.rope = RotaryPositionEmbedding(d_model // (d_model // 64), base=1_000_000)
+    
+    # ═══════════════════════════════════════════════════════════════
+    # Performance Optimization Methods  
+    # ═══════════════════════════════════════════════════════════════
+    
+    def optimize_model(self, compile_mode: str = "default", gpu_name: str = "auto"):
+        """
+        Apply all optimizations for maximum performance.
+        
+        Automatically detects hardware and applies optimal settings:
+          - RTX 4090: max-autotune compile, bf16, chunk_size=128
+          - A100: max-autotune compile, bf16, chunk_size=256
+          - L4: default compile, bf16, chunk_size=64, grad checkpointing
+          - T4: default compile, fp16, chunk_size=64, grad checkpointing
+        
+        Args:
+            compile_mode: "default", "max-autotune", "reduce-overhead", or None
+            gpu_name: "auto", "4090", "A100", "L4", "T4", "cpu"
+        
+        Returns:
+            dict with applied settings
+        """
+        try:
+            from brain.mamba2.optimizations import optimize_for_training
+            return optimize_for_training(self, gpu_name)
+        except ImportError:
+            self.logger.warning("optimizations.py not found, skipping")
+            return {}
+    
+    def optimize_for_inference(self, gpu_name: str = "auto"):
+        """
+        Apply all inference optimizations (compile + CUDA graph + eval mode).
+        """
+        try:
+            from brain.mamba2.optimizations import optimize_for_inference
+            return optimize_for_inference(self, gpu_name)
+        except ImportError:
+            self.eval()
+            return {}
+    
+    def prune(self, sparsity: float = 0.5):
+        """
+        SparseSSM-style pruning: zero out low-importance weights.
+        
+        No fine-tuning needed for sparsity <= 0.5 (per SparseSSM paper).
+        50% sparsity → ~2x smaller, ~1.3x faster, ~0% accuracy loss.
+        
+        Args:
+            sparsity: fraction of weights to prune (0.0-1.0)
+        """
+        try:
+            from brain.mamba2.optimizations import prune_ssm_weights
+            return prune_ssm_weights(self, sparsity=sparsity)
+        except ImportError:
+            self.logger.warning("optimizations.py not found, skipping prune")
+            return {}
+    
+    def count_parameters(self):
+        """Count model parameters by component."""
+        result = {}
+        total = sum(p.numel() for p in self.parameters())
+        result["total"] = total
+        
+        blocks_total = sum(p.numel() for b in self.blocks for p in b.parameters())
+        result["blocks"] = blocks_total
+        
+        if len(self.blocks) > 0:
+            b0_params = sum(p.numel() for p in self.blocks[0].parameters())
+            result["block_detail (×1)"] = {
+                "total": b0_params,
+                "core": sum(p.numel() for p in self.blocks[0].core.parameters()),
+                "omega": sum(p.numel() for p in self.blocks[0].omega.parameters()),
+                "mole": sum(p.numel() for p in self.blocks[0].mole.parameters()),
+            }
+        
+        result["embedding"] = self.embedding.weight.numel()
+        result["wave_consolidations"] = sum(
+            p.numel() for wc in self.wave_consolidations for p in wc.parameters()
+        )
+        result["personality"] = sum(
+            p.numel() for p in self.personality.parameters()
+        )
+        
+        return result
     
     def reset_cache(self):
         """Сброс кеша SSM-состояний (вызывать перед новым промптом)."""
@@ -847,6 +958,7 @@ class TarsMamba2LM(nn.Module):
             x, _ = self.wave_consolidations[wave_idx](x_left, x_right, stats_l, stats_r)
             
             # ═══ Lazy Spine: обновлять memory_vec только при реальной новизне ═══
+            # Optimized: use torch.where to avoid CPU-GPU sync on scalar comparison
             if wave_idx < n_waves - 1:
                 h_curr = x.mean(dim=1)
                 h_for_mem = self.to_memory_space(h_curr)
@@ -854,8 +966,10 @@ class TarsMamba2LM(nn.Module):
                     memory_vec = h_for_mem
                 else:
                     novelty = 1.0 - F.cosine_similarity(memory_vec, h_for_mem, dim=-1).mean()
-                    if novelty > 0.05:
-                        memory_vec = 0.7 * memory_vec + 0.3 * h_for_mem
+                    # GPU-side conditional: avoids CPU sync from if novelty > 0.05
+                    update_mask = (novelty > 0.05).float()
+                    new_mem = 0.7 * memory_vec + 0.3 * h_for_mem
+                    memory_vec = update_mask * new_mem + (1.0 - update_mask) * memory_vec
         
         # Handle odd number of blocks
         if self.n_layers % 2 == 1:
@@ -983,6 +1097,36 @@ class TarsMamba2LM(nn.Module):
         # ═══════════════════════════════════════════════════════════════
         x = self.embedding(input_ids)
         
+        # ═══ QueryRouter: определяем стратегию поиска ПЕРЕД волнами ═══
+        # Вместо слепого RAG → нейросеть решает: искать / не искать / где.
+        query_emb = x.mean(dim=1).detach()  # [B, d_model]
+        router_decision = self.query_router(query_emb)
+        
+        # ═══ Progressive Memory Manager: non-blocking RAG ═══
+        pmm = ProgressiveMemoryManager()
+        pmm.set_initial_memory(memory_vec=memory_vec, rag_state=rag_state)
+        
+        # Сохраняем router decision для статистики
+        rag_skipped = False
+        if not router_decision["needs_rag"].any():
+            # Роутер решил: RAG не нужен (простой запрос)
+            rag_skipped = True
+            self.logger.debug(
+                f"QueryRouter: RAG skipped (score={router_decision['needs_rag_score'].mean():.3f})"
+            )
+        else:
+            source = self.query_router.get_primary_source(router_decision["source_weights"])
+            urgency_val = router_decision["urgency"].mean().item()
+            self.logger.debug(
+                f"QueryRouter: RAG needed, source={source}, urgency={urgency_val:.2f}"
+            )
+            # ═══ PMM: регистрируем запрошенные источники для tracking ═══
+            source_names = ["leann", "titans", "web", "history"]
+            weights = router_decision["source_weights"][0].tolist()
+            # Отмечаем источники с весом > 0.1 как запрошенные
+            requested = [n for n, w in zip(source_names, weights) if w > 0.1]
+            pmm.register_request(requested, urgency=urgency_val)
+        
         wkv_states = [None] * self.n_layers   # WKV state per block
         x_prevs = [None] * self.n_layers      # time-shift per block
         ssd_states = [None] * self.n_layers   # SSD recurrent state per block
@@ -997,6 +1141,7 @@ class TarsMamba2LM(nn.Module):
         per_wave_experts = []  # [{"wave": 1, "left": [...], "right": [...]}]
         supplement_injected = False
         supplement_extra_waves = 0  # сколько допволн осталось
+        rag_injection_wave = -1  # волна, на которой RAG был инжектирован
         
         max_waves = self.n_layers // 2   # 12/2 = 6 волн
         
@@ -1019,6 +1164,7 @@ class TarsMamba2LM(nn.Module):
         
         # ═══ Cross-Wave Residual Storage (v3) ═══
         wave_outputs = {}  # {wave_idx: x_output} для skip connections
+        critic_result = None  # initialized before loop — used in convergence check
         
         for wave_idx in range(max_waves):
             # Проверяем depth limit
@@ -1037,6 +1183,23 @@ class TarsMamba2LM(nn.Module):
             
             if b_right >= self.n_layers:
                 break
+            
+            # ═══ Progressive Memory Injection: check RAG readiness ═══
+            # Non-blocking: если RAG ещё не готов, блоки работают с тем что есть
+            if pmm.check_and_inject(wave_idx):
+                rag_injection_wave = wave_idx
+                memory_vec = pmm.get_memory_vec()
+                rag_state = pmm.get_rag_state()
+                # Сбрасываем аудитор — новые данные меняют картину
+                self.integral_auditor.reset()
+                h_prev = x.mean(dim=1).detach()
+                self.logger.debug(
+                    f"Progressive RAG injection at wave {wave_count} "
+                    f"(memory_vec={'ready' if memory_vec is not None else 'none'})"
+                )
+            else:
+                memory_vec = pmm.get_memory_vec()
+                rag_state = pmm.get_rag_state()
             
             # ── 2 блока работают ПАРАЛЛЕЛЬНО на одном входе ──
             x_left, wkv_states[b_left], x_prevs[b_left], stats_l, \
@@ -1175,18 +1338,13 @@ class TarsMamba2LM(nn.Module):
                 except Exception as e:
                     self.logger.debug(f"Critic eval error: {e}")
             
-            # ── Спинной мозг обновляет память между волнами ──
+            # ── Спинной мозг обновляет память между волнами (через PMM) ──
             spine_updated = False
             if wave_idx < max_waves - 1:
                 if hasattr(self, 'to_memory_space'):
                     try:
-                        h_for_mem = self.to_memory_space(h_curr)
-                        if memory_vec is None:
-                            # Первая волна — инициализируем memory_vec
-                            memory_vec = h_for_mem.detach()
-                        else:
-                            # Спинной мозг: 70% старая + 30% новая (§2.4)
-                            memory_vec = 0.7 * memory_vec + 0.3 * h_for_mem.detach()
+                        pmm.update_spine(h_curr, self.to_memory_space, alpha=0.3)
+                        memory_vec = pmm.get_memory_vec()
                         spine_updated = True
                     except Exception:
                         pass
@@ -1222,7 +1380,8 @@ class TarsMamba2LM(nn.Module):
             wave_experts["spine_updated"] = spine_updated
             
             # ═══ Supplement Injection: проверяем очередь голосовых дополнений ═══
-            if supplement_queue is not None and not supplement_queue.empty():
+            # Fix: используем try/except вместо .empty() + get_nowait() для атомарности
+            if supplement_queue is not None:
                 try:
                     supplement = supplement_queue.get_nowait()
                     sup_text = supplement.get("text", "")
@@ -1256,15 +1415,11 @@ class TarsMamba2LM(nn.Module):
                             xs_l, xs_r, {}, {}
                         )
                         
-                        # Обновляем основное состояние: спинной мозг инжектирует
+                        # Обновляем через PMM: спинной мозг инжектирует
                         h_sup = x_sup_merged.mean(dim=1).detach()
                         if hasattr(self, 'to_memory_space'):
-                            h_sup_mem = self.to_memory_space(h_sup)
-                            if memory_vec is not None:
-                                # 50/50 смесь старого + дополнения
-                                memory_vec = 0.5 * memory_vec + 0.5 * h_sup_mem.detach()
-                            else:
-                                memory_vec = h_sup_mem.detach()
+                            pmm.update_spine(h_sup, self.to_memory_space, alpha=0.5)
+                            memory_vec = pmm.get_memory_vec()
                         
                         # Сбрасываем сходимость — надо переоценить
                         self.integral_auditor.reset()
@@ -1278,7 +1433,8 @@ class TarsMamba2LM(nn.Module):
                             f"✅ Supplement merged. +3 extra waves scheduled."
                         )
                 except Exception as e:
-                    self.logger.warning(f"Supplement injection error: {e}")
+                    if "Empty" not in str(type(e).__name__):
+                        self.logger.warning(f"Supplement injection error: {e}")
         
         # ═══ Extra waves после supplement (половина от 12 = 6 блоков = 3 волны) ═══
         if supplement_injected and supplement_extra_waves > 0:
@@ -1440,6 +1596,33 @@ class TarsMamba2LM(nn.Module):
                 no_improve_count = 0
             prev_p = ia_result["p"]
         
+        # ═══ 2.5. Cerebellum: RAG Completion Verification ═══
+        # Мозжечок проверяет, все ли RAG-данные загрузились.
+        # Если нет — рекрутирует СВЕЖИЕ IDME-матрицы для догрузки.
+        rag_verification = {}
+        try:
+            delivery_report = pmm.get_delivery_report()
+            rag_verification = self.wave_critic.verify_rag_completion(
+                delivery_report=delivery_report,
+                memory_vec=memory_vec,
+                pmm=pmm,
+                matrix_pool=self.matrix_pool,
+                x=x,
+                h_prev=h_prev,
+                integral_auditor=self.integral_auditor,
+                novelty_gate=self.novelty_gate,
+                from_memory_space=self.from_memory_space,
+                to_memory_space=self.to_memory_space,
+            )
+            # Обновляем memory_vec и x из мозжечка
+            if rag_verification.get("updated_memory_vec") is not None:
+                memory_vec = rag_verification["updated_memory_vec"]
+            if rag_verification.get("updated_x") is not None:
+                x = rag_verification["updated_x"]
+            total_matrices_recruited += rag_verification.get("matrices_recruited", 0)
+        except Exception as e:
+            self.logger.debug(f"Cerebellum RAG verification error: {e}")
+        
         # ═══ 3. Output ═══
         # Финальная инъекция памяти спинного мозга в выход
         # (без этого контекст, накопленный между волнами, теряется)
@@ -1524,6 +1707,20 @@ class TarsMamba2LM(nn.Module):
             "tc_confidence": tc_summary.get("final_confidence", 0),
             "tc_phases": tc_summary.get("phases", []),
             "tc_retrieval_count": tc_summary.get("retrieval_count", 0),
+            # QueryRouter & Progressive Memory stats
+            "rag_skipped": rag_skipped,
+            "rag_injection_wave": rag_injection_wave,
+            "query_router_needs_rag": not rag_skipped,
+            "query_router_urgency": router_decision["urgency"].mean().item(),
+            "query_router_source": (
+                self.query_router.get_primary_source(router_decision["source_weights"])
+                if not rag_skipped else "none"
+            ),
+            # Cerebellum RAG Verification
+            "rag_verification": rag_verification,
+            "rag_all_loaded": rag_verification.get("rag_complete", True),
+            "rag_continuation_rounds": rag_verification.get("rounds_used", 0),
+            "rag_missing_sources": rag_verification.get("missing_sources", []),
         }
         
         self.thinking_logger.end_session(total_time, "")

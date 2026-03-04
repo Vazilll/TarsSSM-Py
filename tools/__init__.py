@@ -506,4 +506,16 @@ def create_default_registry(workspace: str = ".") -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(ShellTool(workspace))
     registry.register(FileSearchTool(workspace))
+    
+    # Document tools (PDF, Word, Excel)
+    try:
+        from tools.document_tools import (
+            DocumentReadTool, DocumentWriteTool, SpreadsheetTool
+        )
+        registry.register(DocumentReadTool())
+        registry.register(DocumentWriteTool())
+        registry.register(SpreadsheetTool())
+    except ImportError as e:
+        logger.debug(f"Document tools not available: {e}")
+    
     return registry

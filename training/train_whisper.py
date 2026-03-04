@@ -92,57 +92,70 @@ def train(args):
     model.print_trainable_parameters()
 
     # ═══ Данные ═══
-    logger.info(f"Загрузка Common Voice Russian ({args.samples} train, {args.val_samples} val)...")
+    logger.info(f"Загрузка аудио-данных для русского ({args.samples} train, {args.val_samples} val)...")
     ds_train, ds_val = None, None
     
-    # Попытка 1: Common Voice 17
+    # Попытка 1: Google FLEURS (самый стабильный, не требует auth)
     try:
+        logger.info("Пробуем Google FLEURS (ru_ru)...")
         ds_train = load_dataset(
-            "mozilla-foundation/common_voice_17_0", "ru",
+            "google/fleurs", "ru_ru",
             split=f"train[:{args.samples}]",
+            trust_remote_code=True,
         )
         ds_val = load_dataset(
-            "mozilla-foundation/common_voice_17_0", "ru",
+            "google/fleurs", "ru_ru",
             split=f"validation[:{args.val_samples}]",
+            trust_remote_code=True,
         )
-        logger.info("✅ Common Voice 17 загружен")
-    except Exception as e:
-        logger.warning(f"Common Voice 17 недоступен: {e}")
-    
-    # Попытка 2: Common Voice 11
-    if ds_train is None:
-        try:
-            logger.info("Пробуем Common Voice 11...")
-            ds_train = load_dataset(
-                "mozilla-foundation/common_voice_11_0", "ru",
-                split=f"train[:{args.samples}]",
-            )
-            ds_val = load_dataset(
-                "mozilla-foundation/common_voice_11_0", "ru",
-                split=f"validation[:{args.val_samples}]",
-            )
-            logger.info("✅ Common Voice 11 загружен")
-        except Exception as e:
-            logger.warning(f"Common Voice 11 недоступен: {e}")
-    
-    # Попытка 3: Google FLEURS (всегда доступен)
-    if ds_train is None:
-        try:
-            logger.info("Пробуем Google FLEURS (ru_ru)...")
-            ds_train = load_dataset(
-                "google/fleurs", "ru_ru",
-                split=f"train[:{args.samples}]",
-            )
-            ds_val = load_dataset(
-                "google/fleurs", "ru_ru",
-                split=f"validation[:{args.val_samples}]",
-            )
-            # FLEURS uses "transcription" instead of "sentence"
+        # FLEURS uses "transcription" instead of "sentence"
+        if "transcription" in ds_train.column_names:
             ds_train = ds_train.rename_column("transcription", "sentence")
             ds_val = ds_val.rename_column("transcription", "sentence")
-            logger.info("✅ Google FLEURS загружен")
+        logger.info("✅ Google FLEURS загружен")
+    except Exception as e:
+        logger.warning(f"FLEURS недоступен: {e}")
+    
+    # Попытка 2: Common Voice 17 (требует HF аутентификацию)
+    if ds_train is None:
+        try:
+            logger.info("Пробуем Common Voice 17 (требует HF token)...")
+            ds_train = load_dataset(
+                "mozilla-foundation/common_voice_17_0", "ru",
+                split=f"train[:{args.samples}]",
+                trust_remote_code=True,
+            )
+            ds_val = load_dataset(
+                "mozilla-foundation/common_voice_17_0", "ru",
+                split=f"validation[:{args.val_samples}]",
+                trust_remote_code=True,
+            )
+            logger.info("✅ Common Voice 17 загружен")
         except Exception as e:
-            logger.error(f"FLEURS тоже недоступен: {e}")
+            logger.warning(f"Common Voice 17 недоступен: {e}")
+    
+    # Попытка 3: VoxPopuli (EU Parliament, 400h Russian, no auth needed)
+    if ds_train is None:
+        try:
+            logger.info("Пробуем VoxPopuli (ru)...")
+            ds_train = load_dataset(
+                "facebook/voxpopuli", "ru",
+                split=f"train[:{args.samples}]",
+                trust_remote_code=True,
+            )
+            ds_val = load_dataset(
+                "facebook/voxpopuli", "ru",
+                split=f"validation[:{args.val_samples}]",
+                trust_remote_code=True,
+            )
+            # VoxPopuli uses "raw_text" or "normalized_text"
+            text_col = "normalized_text" if "normalized_text" in ds_train.column_names else "raw_text"
+            if text_col != "sentence":
+                ds_train = ds_train.rename_column(text_col, "sentence")
+                ds_val = ds_val.rename_column(text_col, "sentence")
+            logger.info("✅ VoxPopuli загружен")
+        except Exception as e:
+            logger.error(f"VoxPopuli тоже недоступен: {e}")
             logger.error("❌ Нет доступных аудио-датасетов. Пропуск Whisper.")
             return
 
@@ -193,6 +206,9 @@ def train(args):
     )
 
     # ═══ Обучение ═══
+    import platform
+    _num_workers = 0 if platform.system() == "Windows" else 2
+
     training_args = Seq2SeqTrainingArguments(
         output_dir=output_dir,
         per_device_train_batch_size=args.batch,
@@ -210,7 +226,7 @@ def train(args):
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         report_to="none",
-        dataloader_num_workers=2,
+        dataloader_num_workers=_num_workers,
     )
 
     trainer = Seq2SeqTrainer(

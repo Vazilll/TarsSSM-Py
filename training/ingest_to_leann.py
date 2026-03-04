@@ -3,17 +3,21 @@
   LEANN Ingestion — Загрузка корпуса в векторную память ТАРС
 ═══════════════════════════════════════════════════════════════
 
-Разбивает тексты (Wikipedia, датасеты) на чанки и загружает
-в LEANN индекс для RAG (Retrieval-Augmented Generation).
+Разбивает тексты (Wikipedia, датасеты, PDF, Word, Excel) на чанки
+и загружает в LEANN индекс для RAG (Retrieval-Augmented Generation).
 
-Оптимизация для Colab (54 GB RAM):
-  - Эмбеддинги в float16 (вместо float64 JSON) → ~8x экономия
-  - Батчевое сохранение (не держим всё в RAM)
-  - Numpy binary формат (.npz) вместо JSON
+Поддерживаемые форматы:
+  - .txt, .md, .rst — текстовые
+  - .pdf — PDF документы (PyPDF2)
+  - .docx — Word документы (python-docx)
+  - .xlsx — Excel таблицы (openpyxl)
+  - .csv — CSV таблицы
+  - .json — JSON файлы
 
 Использование:
-  python training/ingest_to_leann.py                      # Всё из data/
-  python training/ingest_to_leann.py --file data/wiki_ru.txt
+  python training/ingest_to_leann.py                              # Всё из data/
+  python training/ingest_to_leann.py --file data/spec.pdf         # PDF файл
+  python training/ingest_to_leann.py --file data/report.docx      # Word файл
   python training/ingest_to_leann.py --chunk-size 500
 """
 
@@ -228,12 +232,29 @@ def ingest_file(file_path: str, index_path: str = None,
         logger.error(f"❌ Файл не найден: {file_path}")
         return existing_texts or [], existing_embeddings
     
-    # Читаем файл
-    with open(file_path, 'r', encoding='utf-8') as f:
-        text = f.read()
+    # ═══ Определяем формат и читаем файл ═══
+    ext = Path(file_path).suffix.lower()
+    SUPPORTED_DOC_FORMATS = {'.pdf', '.docx', '.xlsx', '.csv', '.json', '.xml'}
+    
+    if ext in SUPPORTED_DOC_FORMATS:
+        # Используем document_tools для структурированных форматов
+        try:
+            from tools.document_tools import read_document
+            text = read_document(file_path, max_pages=100, max_rows=2000)
+            logger.info(f"[LEANN] Прочитан {ext} через document_tools")
+        except ImportError as e:
+            logger.error(f"❌ Для {ext} нужно: pip install PyPDF2 python-docx openpyxl")
+            return existing_texts or [], existing_embeddings, None
+        except Exception as e:
+            logger.error(f"❌ Ошибка чтения {ext}: {e}")
+            return existing_texts or [], existing_embeddings, None
+    else:
+        # Текстовые форматы (.txt, .md, .rst, etc.)
+        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+            text = f.read()
     
     file_mb = len(text.encode('utf-8')) / (1024 * 1024)
-    logger.info(f"[LEANN] Файл: {file_path} ({file_mb:.1f} MB)")
+    logger.info(f"[LEANN] Файл: {file_path} ({file_mb:.1f} MB, {ext})")
     
     # Чанкуем
     chunks = chunk_text(text, chunk_size=chunk_size)
@@ -324,14 +345,27 @@ def ingest_all(data_dir: str = None, index_path: str = None,
     logger.info("  LEANN — Загрузка данных в векторную память")
     logger.info("═" * 60)
     
-    txt_files = list(sorted(Path(data_dir).glob("*.txt")))
+    # Ищем ВСЕ поддерживаемые форматы
+    supported_exts = ['*.txt', '*.md', '*.rst', '*.pdf', '*.docx', '*.xlsx', '*.csv', '*.json']
+    all_files = []
+    for ext in supported_exts:
+        all_files.extend(sorted(Path(data_dir).glob(ext)))
+    # Dedup (в случае одного файла, подходящего под несколько паттернов)
+    seen = set()
+    txt_files = []
+    for f in all_files:
+        if f not in seen:
+            seen.add(f)
+            txt_files.append(f)
     
     if not txt_files:
-        logger.info("⚠ Нет .txt файлов в data/")
+        logger.info("⚠ Нет файлов поддерживаемых форматов в data/")
         return
     
     total_mb = sum(f.stat().st_size for f in txt_files) / (1024 * 1024)
+    exts_found = set(f.suffix for f in txt_files)
     logger.info(f"Найдено {len(txt_files)} файлов ({total_mb:.0f} MB)")
+    logger.info(f"Форматы: {', '.join(sorted(exts_found))}")
     
     # Загружаем существующий индекс ОДИН раз
     all_texts, all_embeddings, all_scales = load_index(index_path)

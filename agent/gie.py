@@ -173,13 +173,38 @@ class GieAgent:
         )
 
         # Вектор от Titans для нейронного grounding
+        # ═══ Prefetch: запускаем RAG параллельно с подготовкой контекста ═══
+        # Вместо последовательного await — создаём task, который доставит
+        # данные через ProgressiveMemoryManager когда будет готов.
         recall_vec = None
+        rag_future = None
         if self.titans:
-            try:
-                goal_vec = self._text_to_vec(goal)
-                recall_vec = await self.titans.get_recall(goal_vec)
-            except Exception:
-                pass
+            async def _prefetch_rag():
+                """Prefetch RAG data (runs concurrently with context preparation)."""
+                try:
+                    goal_vec = self._text_to_vec(goal)
+                    rv = await self.titans.get_recall(goal_vec)
+                    return {"memory_vec": rv, "rag_state": None}
+                except Exception:
+                    return None
+            rag_future = asyncio.create_task(_prefetch_rag())
+        
+        # ═══ Uncertainty-Driven Auto-RAG (запускаем параллельно) ═══
+        auto_rag_future = None
+        if self.titans:
+            async def _auto_rag():
+                """Auto-RAG: if surprised, search web."""
+                try:
+                    goal_vec = self._text_to_vec(goal)
+                    recall_surprise = await self.titans.update(goal_vec)
+                    if recall_surprise.get("surprised", False):
+                        self.logger.info("GIE: 🔍 Высокий surprise → автоматический RAG search")
+                        from tools import web_search_sync
+                        return web_search_sync(goal, max_results=3)
+                except Exception:
+                    pass
+                return None
+            auto_rag_future = asyncio.create_task(_auto_rag())
 
         # Early Exit check: если RRN уже нашел четкий ответ в короткой памяти
         if "answer" in relational_map.lower() or "решение:" in relational_map.lower():
@@ -187,22 +212,25 @@ class GieAgent:
              # Подаем сигнал мозгу что можно заканчивать сразу
              full_context += "\nSystem-Hint: Solution found in grounding. Summarize and exit."
 
-        # ═══ Uncertainty-Driven Auto-RAG ═══
-        if self.titans and recall_vec is not None:
+        # ═══ Gather prefetched results (with timeout — не блокируем навечно) ═══
+        if rag_future is not None:
             try:
-                recall_surprise = await self.titans.update(
-                    self._text_to_vec(goal)
-                )
-                if recall_surprise.get("surprised", False):
-                    self.logger.info("GIE: 🔍 Высокий surprise → автоматический RAG search")
-                    try:
-                        from tools import web_search_sync
-                        rag_result = web_search_sync(goal, max_results=3)
-                        if rag_result:
-                            full_context += f"\n\nНайдено в интернете:\n{rag_result[:500]}"
-                            self.logger.info(f"GIE: RAG добавил {len(rag_result)} символов контекста")
-                    except Exception as e:
-                        self.logger.debug(f"GIE: Auto-RAG failed: {e}")
+                rag_result = await asyncio.wait_for(rag_future, timeout=2.0)
+                if rag_result and isinstance(rag_result, dict):
+                    recall_vec = rag_result.get("memory_vec")
+            except asyncio.TimeoutError:
+                self.logger.debug("GIE: RAG prefetch timeout (2s) — model proceeds without")
+            except Exception:
+                pass
+        
+        if auto_rag_future is not None:
+            try:
+                rag_result = await asyncio.wait_for(auto_rag_future, timeout=3.0)
+                if rag_result:
+                    full_context += f"\n\nНайдено в интернете:\n{rag_result[:500]}"
+                    self.logger.info(f"GIE: RAG добавил {len(rag_result)} символов контекста")
+            except asyncio.TimeoutError:
+                self.logger.debug("GIE: Auto-RAG timeout (3s) — skipped")
             except Exception:
                 pass
 

@@ -60,7 +60,12 @@ def download_ruslan(data_dir: Path):
         logger.info("Распаковка...")
         import tarfile
         with tarfile.open(str(tar_path)) as tf:
-            tf.extractall(str(data_dir))
+            # filter='data' strips dangerous paths (Python 3.12+ security)
+            try:
+                tf.extractall(str(data_dir), filter='data')
+            except TypeError:
+                # Python < 3.12 doesn't support filter=
+                tf.extractall(str(data_dir))
         tar_path.unlink(missing_ok=True)
         logger.info("✅ RUSLAN скачан и распакован")
         return True

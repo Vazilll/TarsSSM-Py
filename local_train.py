@@ -407,6 +407,7 @@ def get_config(level, hw):
             "personality_ep": 1, "second_pass_ep": 1,
             "instruct_ep": 1, "cot_ep": 1, "dpo_ep": 1, "rlvr_ep": 1, "distill_ep": 1,
             "wiki_count": 5000,
+            "snn_max_mb": 10,
         }
     elif level == "medium":
         # ═══ СРЕДНИЙ: стандарт ═══
@@ -421,6 +422,7 @@ def get_config(level, hw):
             "personality_ep": 3, "second_pass_ep": 3,
             "instruct_ep": 3, "cot_ep": 3, "dpo_ep": 2, "rlvr_ep": 2, "distill_ep": 2,
             "wiki_count": 50000,
+            "snn_max_mb": 20,
         }
     else:  # max
         # ═══ МАКСИМУМ: продакшн ═══
@@ -435,6 +437,7 @@ def get_config(level, hw):
             "personality_ep": 5, "second_pass_ep": 5,
             "instruct_ep": 3, "cot_ep": 5, "dpo_ep": 3, "rlvr_ep": 3, "distill_ep": 3,
             "wiki_count": 100000,
+            "snn_max_mb": 50,
         }
 
 # ═══════════════════════════════════════════
@@ -943,7 +946,8 @@ def main():
                    "--dim", str(cfg["snn_dim"]), "--heads", str(cfg["snn_heads"]),
                    "--beta", "0.9", "--epochs", str(cfg["snn_ep"]),
                    "--batch", str(cfg["snn_batch"]), "--seq_len", str(cfg["snn_seq"]),
-                   "--lr", "3e-4", "--device", device]
+                   "--lr", "3e-4", "--device", device,
+                   "--max_bytes", str(cfg.get("snn_max_mb", 20))]
         if args.data_dir: snn_cmd += ["--data_dir", args.data_dir]
         if args.resume: snn_cmd += ["--resume"]
         ok = run(snn_cmd, label="SNN")

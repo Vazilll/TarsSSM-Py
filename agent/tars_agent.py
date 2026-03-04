@@ -64,6 +64,7 @@ from tools import (
 from tools.sub_agents import AgentPool
 from tools.web_search import search_duckduckgo, fetch_page_text
 from agent.skill_learn import SkillLearner, SkillRegistry, Skill
+from agent.document_sense import DocumentSense
 
 logger = logging.getLogger("Tars.Agent")
 
@@ -78,6 +79,7 @@ class Intent:
     SEARCH     = "search"       # Поиск в памяти
     EXECUTE    = "execute"      # Выполнить команду
     FILE_OP    = "file_op"      # Файловые операции
+    DOC_WORK   = "doc_work"     # Работа с документами (PDF/Word/Excel)
     REMEMBER   = "remember"     # Запомнить
     ANALYZE    = "analyze"      # Анализ
     CODE       = "code"         # Код
@@ -99,7 +101,17 @@ _PATTERNS = {
         r'выполни|запусти|run|execute|создай|сделай|install|устано|скачай|download|удали|delete',
     ],
     Intent.FILE_OP: [
-        r'файл|file|папк|folder|директори|directory|открой|прочитай|read|скопируй|copy',
+        r'файл|file|папк|folder|директори|directory|открой|скопируй|copy',
+    ],
+    Intent.DOC_WORK: [
+        r'pdf|docx?|xlsx?|word|excel|ворд|эксел',
+        r'прочитай|прочти|read|прочесть',
+        r'спецификац|specification|spec\b',
+        r'документ[аеыи]|document|отчёт|отчет|report',
+        r'таблиц[уае]|table|spreadsheet',
+        r'ТЗ|техническое\s*задание|контракт|договор',
+        r'заполни|дополни|append|напиши\s+в\s+\w+\.docx',
+        r'создай\s+(?:таблиц|excel|xlsx|word|docx|документ)',
     ],
     Intent.REMEMBER: [
         r'запомни|remember|не забудь|заметка|note|сохрани в памят',
@@ -236,6 +248,13 @@ class TarsAgent:
         self.pool = AgentPool(memory=self.memory)
         self.cron = CronScheduler()
         
+        # ── DocumentSense — автономный обработчик документов ──
+        self.doc_sense = DocumentSense(
+            workspace=workspace,
+            memory=self.memory,
+        )
+        self._log(f"DocumentSense: готов (workspace={workspace})")
+        
         # ── Spine (Спинной мозг) ──
         self.spine = None
         try:
@@ -371,19 +390,39 @@ class TarsAgent:
                     break
             return results
         
-        # Запускаем ВСЁ параллельно
-        leann_res, skill_res, hist_res = await asyncio.gather(
+        async def _scan_documents():
+            """Автоматическое обнаружение и чтение документов из запроса."""
+            try:
+                docs = await self.doc_sense.detect_and_read(query)
+                if docs:
+                    return self.doc_sense.format_context(docs, max_chars=3000)
+            except Exception as e:
+                logger.debug(f"DocumentSense error: {e}")
+            return []
+        
+        # Запускаем ВСЁ параллельно (включая DocumentSense)
+        leann_res, skill_res, hist_res, doc_res = await asyncio.gather(
             _search_leann(),
             _search_skills(),
             _search_history(),
+            _scan_documents(),
         )
         
+        # Документы идут первыми (наиболее релевантный контекст)
+        context.extend(doc_res)
         context.extend(leann_res)
         context.extend(skill_res)
         context.extend(hist_res)
         
         dur = time.time() - t
-        steps.append(Step("search", f"Контекст: {len(context)} источников (parallel)", duration=dur))
+        sources = []
+        if doc_res: sources.append(f"{len(doc_res)} doc")
+        if leann_res: sources.append(f"{len(leann_res)} leann")
+        if skill_res: sources.append(f"{len(skill_res)} skill")
+        if hist_res: sources.append(f"{len(hist_res)} hist")
+        steps.append(Step("search",
+            f"Контекст: {len(context)} источников ({', '.join(sources) or 'empty'})",
+            duration=dur))
         return context
     
     def _get_handler(self, intent: str):
@@ -394,6 +433,7 @@ class TarsAgent:
             Intent.SEARCH:     self._do_search,
             Intent.EXECUTE:    self._do_execute,
             Intent.FILE_OP:    self._do_file_op,
+            Intent.DOC_WORK:   self._do_doc_work,
             Intent.REMEMBER:   self._do_remember,
             Intent.ANALYZE:    self._do_analyze,
             Intent.CODE:       self._do_code,
@@ -540,6 +580,10 @@ class TarsAgent:
     
     async def _do_file_op(self, query: str, ctx: List[str], steps: List[Step]) -> str:
         """Файловые операции."""
+        # Если упоминаются документы → перенаправить в doc_work
+        if self.doc_sense.detector.has_document_intent(query):
+            return await self._do_doc_work(query, ctx, steps)
+        
         pattern = self._extract_file_pattern(query)
         content_q = self._extract_quoted(query)
         
@@ -555,6 +599,47 @@ class TarsAgent:
         result = await self.tools.execute("file_search", args)
         
         return f"📁 **Файлы:**\n```\n{result.output[:2000]}\n```"
+    
+    async def _do_doc_work(self, query: str, ctx: List[str], steps: List[Step]) -> str:
+        """Автономная работа с документами (PDF/Word/Excel)."""
+        t = time.time()
+        
+        # 1. Найти и прочитать документы
+        docs = await self.doc_sense.detect_and_read(query)
+        
+        if docs:
+            parts = []
+            for doc in docs:
+                if doc.error:
+                    parts.append(f"⚠ **{doc.name}**: {doc.error}")
+                else:
+                    parts.append(f"📄 **{doc.name}** ({doc.format}, {doc.size_bytes/1024:.0f} KB):")
+                    text_preview = doc.text[:2000]
+                    if len(doc.text) > 2000:
+                        text_preview += f"\n... [{len(doc.text)} символов всего]"
+                    parts.append(text_preview)
+                    if doc.chunks_ingested > 0:
+                        parts.append(f"💾 +{doc.chunks_ingested} чанков → LEANN")
+            
+            dur = time.time() - t
+            steps.append(Step("tool", f"DocSense: {len(docs)} файлов", duration=dur))
+            return "\n\n".join(parts)
+        
+        # 2. Если нет конкретных файлов — показать что есть в workspace
+        steps.append(Step("tool", "DocSense: поиск документов в workspace"))
+        self.doc_sense.detector._build_file_index()
+        available = list(self.doc_sense.detector._file_index.values())[:20]
+        
+        if available:
+            parts = ["📁 **Документы в workspace:**\n"]
+            for p in available:
+                path = Path(p)
+                size_kb = path.stat().st_size / 1024
+                parts.append(f"  • {path.name} ({path.suffix}, {size_kb:.0f} KB)")
+            parts.append(f"\nСкажи: 'прочитай {Path(available[0]).name}'")
+            return "\n".join(parts)
+        
+        return "📁 Документов (PDF/Word/Excel) в workspace не найдено."
     
     async def _do_remember(self, query: str, ctx: List[str], steps: List[Step]) -> str:
         """Сохранение в память."""
@@ -637,10 +722,12 @@ class TarsAgent:
         """Статус системы."""
         health = self.pool.health_report()
         skills = self.skill_registry.list_all()
+        doc_status = self.doc_sense.get_status()
         
         parts = [
             "📊 **ТАРС Status**\n",
             f"  🧠 LEANN: {len(self.memory.texts)} документов",
+            f"  📄 DocSense: {doc_status['indexed_files']} файлов, {doc_status['cached_docs']} кеш",
             f"  🎯 Skills: {len(skills)}",
             f"  📝 History: {len(self.history)} сообщений",
             f"  🔧 Tools: {', '.join(self.tools.list_tools())}",
@@ -724,8 +811,19 @@ async def interactive_cli(auto_learn_topics: List[str] = None,
     
     agent = TarsAgent(workspace=".")
     
+    # ═══ Startup document scan (фоновая индексация) ═══
+    try:
+        scan_result = await agent.doc_sense.scan_workspace(max_files=50)
+        if scan_result.files_ingested > 0:
+            print(f"  📄 DocumentSense: +{scan_result.files_ingested} файлов "
+                  f"({scan_result.total_chunks} чанков) → LEANN")
+    except Exception as e:
+        print(f"  ⚠ DocumentSense scan: {e}")
+    
+    doc_status = agent.doc_sense.get_status()
     print(f"  📂 Workspace : {agent.workspace}")
     print(f"  🧠 LEANN    : {len(agent.memory.texts)} документов")
+    print(f"  📄 DocSense : {doc_status['indexed_files']} файлов проиндексировано")
     print(f"  🔧 Tools    : {', '.join(agent.tools.list_tools())}")
     print(f"  🎯 Skills   : {len(agent.skill_registry.list_all())}")
     print(f"  ⚡ SubAgents: search, fetch, analyze, memory")
@@ -734,7 +832,7 @@ async def interactive_cli(auto_learn_topics: List[str] = None,
     print("  Примеры:")
     print("    научись Docker")
     print("    найди в интернете Mamba SSM")
-    print("    запусти 'pip list'")
+    print("    прочитай spec.pdf")
     print("    запомни мой сервер: 192.168.1.100")
     print()
     

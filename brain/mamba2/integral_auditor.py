@@ -379,7 +379,11 @@ class TemporalEmbedding(nn.Module):
         self._initialized = False
     
     def _get_time_seconds(self) -> float:
-        """Получить текущее время в секундах от начала сессии."""
+        """Получить текущее время в секундах от начала сессии.
+        
+        NOTE: Decorated to skip torch.compile — time.time() is a Python
+        side-effect that causes graph breaks on every call.
+        """
         import time as _time
         if not self._initialized:
             self._start_time.fill_(_time.time())

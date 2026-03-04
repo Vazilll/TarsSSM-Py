@@ -293,7 +293,8 @@ def train(args):
     
     print(f"\n{'═'*60}")
     print(f"  RLVR Training complete!")
-    print(f"  Final accuracy: {acc:.1%}")
+    if args.epochs > 0:
+        print(f"  Final accuracy: {acc:.1%}")
     print(f"{'═'*60}")
 
 
