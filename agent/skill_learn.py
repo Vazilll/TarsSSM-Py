@@ -35,7 +35,8 @@ from dataclasses import dataclass, field, asdict
 
 logger = logging.getLogger("Tars.Skills")
 
-_ROOT = Path(__file__).parent
+_ROOT = Path(__file__).resolve().parent.parent  # agent/ → project root
+sys.path.insert(0, str(_ROOT))
 SKILLS_DIR = _ROOT / "skills"
 SKILLS_DIR.mkdir(exist_ok=True)
 

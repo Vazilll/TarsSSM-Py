@@ -52,8 +52,9 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 from pathlib import Path
 
-_ROOT = Path(__file__).parent
+_ROOT = Path(__file__).resolve().parent.parent  # project root (agent/ → TarsSSM-Py/)
 sys.path.insert(0, str(_ROOT))
+sys.path.insert(0, str(_ROOT / "agent"))
 
 from memory.leann import LeannIndex
 from tools import (
@@ -62,7 +63,7 @@ from tools import (
 )
 from tools.sub_agents import AgentPool
 from tools.web_search import search_duckduckgo, fetch_page_text
-from skill_learn import SkillLearner, SkillRegistry, Skill
+from agent.skill_learn import SkillLearner, SkillRegistry, Skill
 
 logger = logging.getLogger("Tars.Agent")
 
@@ -741,7 +742,7 @@ async def interactive_cli(auto_learn_topics: List[str] = None,
     background_tasks = []
     if auto_learn_topics:
         async def auto_learn():
-            from self_learn import SelfLearner
+            from agent.self_learn import SelfLearner
             sl = SelfLearner(memory=agent.memory)
             await sl.auto_learn(auto_learn_topics, interval_min=60)
         background_tasks.append(asyncio.create_task(auto_learn()))

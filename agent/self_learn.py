@@ -26,7 +26,7 @@ import logging
 from pathlib import Path
 from typing import List, Optional
 
-_ROOT = Path(__file__).parent
+_ROOT = Path(__file__).resolve().parent.parent  # agent/ → project root
 sys.path.insert(0, str(_ROOT))
 
 from memory.leann import LeannIndex

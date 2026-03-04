@@ -655,30 +655,58 @@ ReflexClassifier — MinGRU модель (~16K параметров):
 
 
 ═══════════════════════════════════════════════════════════════════════════════
-              11. ПОЛНЫЙ ПАЙПЛАЙН ОБУЧЕНИЯ
+               11. ПОЛНЫЙ ПАЙПЛАЙН ОБУЧЕНИЯ
 ═══════════════════════════════════════════════════════════════════════════════
 
-Автономный скрипт mega_train.py выполняет полный цикл:
+Универсальный скрипт local_train.py — единственная точка входа для обучения.
+Заменяет устаревшие mega_train.py и quick_full_train.py.
 
-  Фаза 0: pip install (torch, sentence-transformers, datasets)
-  Фаза 1: wget Wikipedia + HuggingFace + LEANN embeddings
-  Фаза 2: Рефлексы (100 эпох, ~1 мин)
-  Фаза 3: MinGRU LM (25 эпох, 512d, 6 слоёв, batch=32, ~30 мин)
-  Фаза 4: Mamba-2 (768d, 12L, 4 под-фазы прогрессивного обучения):
+  15 фаз полного обучения:
+
+  Фаза 0:  pip install        — автоустановка зависимостей
+  Фаза 1:  download_data      — Wikipedia + HuggingFace + LEANN embeddings
+  Фаза 2:  train_reflexes     — ReflexClassifier: 100 эпох, ~1 мин
+  Фаза 3:  train_mingru       — MinGRU LM: 25 эпох, 512d, 6 слоёв
+  Фаза 4:  train_mamba2       — Mamba-2: 4 под-фазы прогрессивного обучения
     Phase 1: Full pretrain         — 5 эпох, lr=3e-4
     Phase 2: Fine-tune WKV+Fusion  — 3 эпохи, lr=1e-4
     Phase 3: Fine-tune MoLE+Pool   — 2 эпохи, lr=3e-5
     Phase 4: Fine-tune RAG         — 2 эпохи, lr=1.5e-5
-  Фаза 5: Квантизация 1.58-bit + STE дообучение (3 эпохи)
-  Фаза 6: Сборка моделей → models/tars_v3/
-  Фаза 7: Валидация (тестовая генерация)
+  Фаза 5:  quantize_158bit    — 1.58-bit BitNet + STE дообучение (3 эпохи)
+  Фаза 6:  consolidate        — сборка моделей → models/tars_v3/
+  Фаза 7:  validate            — тестовая генерация и проверка качества
+  Фаза 8:  train_spiking      — SNN спайковые синапсы
+  Фаза 9:  train_distill      — Knowledge Distillation (ученик-учитель)
+  Фаза 10: train_rlvr         — RLVR (Reinforcement Learning, math+logic)
+  Фаза 11: train_dpo          — DPO (Direct Preference Optimization)
+  Фаза 12: generate_synthetic — Phi-4 стиль синтетических данных
+  Фаза 13: train_voice        — голосовой модуль (Whisper)
+  Фаза 14: post_train         — финальная валидация + сводка
 
-  Общее время: ~24 часа на RTX 4090 + 64GB RAM
-  Логирование: mega_train.log
+  3 уровня обучения:
+
+  ┌────────────┬────────────┬──────────────────────────────────────┐
+  │ Уровень    │ Время      │ Фазы                                 │
+  ├────────────┼────────────┼──────────────────────────────────────┤
+  │ small      │ ~15 мин    │ 0-7 (базовое: рефлексы + MinGRU)     │
+  │ medium     │ ~3 часа    │ 0-9 (+ Mamba-2, квантизация)         │
+  │ max        │ ~15 часов  │ 0-14 (все фазы, включая DPO и RLVR) │
+  └────────────┴────────────┴──────────────────────────────────────┘
+
+  Поддержка Google Drive:
+    --drive none     — без внешнего хранилища
+    --drive colab    — Google Colab (монтирование /content/drive)
+    --drive rclone   — rclone для локальной машины
+
+  Логирование: local_train.log
+  Возобновление: --resume (автоматически продолжает с последней фазы)
 
 Запуск:
-  python mega_train.py              # Полный пайплайн
-  python mega_train.py --phase 4    # Только Mamba-2
+  python local_train.py                          # Интерактивный выбор
+  python local_train.py --level medium --drive none
+  python local_train.py --level max --drive colab --resume
+  python local_train.py --phase 4                # Только Mamba-2
+  python local_train.py --skip-voice --skip-posttrain
 
 
 
@@ -1450,7 +1478,7 @@ MinGRU(64) + проекцию в 768d. Основной мозг не меняе
 
 
 ═══════════════════════════════════════════════════════════════════════════════
-              14. ПЕРСПЕКТИВЫ РАЗВИТИЯ
+               14. ПЕРСПЕКТИВЫ РАЗВИТИЯ
 ═══════════════════════════════════════════════════════════════════════════════
 
   1. Мультимодальные сенсоры: VoiceReflex (Whisper STT → MinGRU),
@@ -1468,6 +1496,246 @@ MinGRU(64) + проекцию в 768d. Основной мозг не меняе
 
   6. Контекстное время: адаптация поведения к времени суток,
      настроению пользователя, истории диалога
+
+
+═══════════════════════════════════════════════════════════════════════════════
+     16. МОДУЛЬНАЯ СТРУКТУРА ПРОЕКТА И НОВЫЕ ФУНКЦИИ
+═══════════════════════════════════════════════════════════════════════════════
+
+16.1. Модульная файловая структура
+
+Проект организован по принципу модульности. Каждый компонент живёт
+в своей директории. В корне остаются только две точки входа:
+
+  TarsSSM-Py/
+  │
+  ├── launch_tars.py           ← Точка входа: запуск агента (CLI)
+  ├── local_train.py           ← Точка входа: обучение (15 фаз)
+  │
+  ├── agent/                   ← Автономный ИИ-агент
+  │   ├── __init__.py
+  │   ├── tars_agent.py        — TarsAgent: ядро агента (classify→search→execute→learn)
+  │   ├── self_learn.py        — SelfLearner: самообучение из интернета
+  │   ├── skill_learn.py       — SkillLearner + SkillRegistry: система навыков
+  │   ├── executor.py          — исполнитель команд
+  │   ├── gie.py               — General Intelligence Engine
+  │   ├── knowledge_graph.py   — граф знаний
+  │   ├── learning_helper.py   — помощник обучения
+  │   └── moira.py             — планировщик задач
+  │
+  ├── brain/                   ← Нейронное ядро (SSM + RNN)
+  │   ├── mamba2/              — TarsMamba2LM: основной мозг
+  │   ├── min_gru/             — MinGRU LM: лёгкая модель
+  │   ├── spiking/             — SNN спайковые синапсы
+  │   ├── reflexes/            — ReflexClassifier (MinGRU)
+  │   ├── rrn.py               — RRN Core (Spine)
+  │   └── tokenizer.py         — TarsTokenizer (CP1251)
+  │
+  ├── memory/                  ← Система памяти
+  │   ├── leann.py             — LEANN: 384d ANN-индекс
+  │   ├── titans.py            — Titans: surprise-based LTM
+  │   └── memo.py              — Memo: LRU семантический кэш
+  │
+  ├── sensory/                 ← Сенсорные органы
+  │   ├── ears.py              — Whisper STT (слух)
+  │   ├── eyes.py              — YOLO (зрение)
+  │   ├── screen.py            — Screen capture (экран)
+  │   ├── voice.py             — TTS (голос)
+  │   └── hands.py             — Executor (действия)
+  │
+  ├── tools/                   ← Утилиты и инструменты
+  │   ├── __init__.py          — ToolRegistry, ShellTool, FileSearchTool
+  │   ├── sub_agents.py        — AgentPool: параллельные суб-агенты
+  │   ├── web_search.py        — DuckDuckGo поиск + fetch
+  │   ├── telegram_bot.py      — Telegram бот
+  │   ├── demo_tars.py         — демонстрация обученных моделей
+  │   └── setup_gdrive.py      — настройка Google Drive (rclone)
+  │
+  ├── hub/                     ← HTTP API сервер
+  │   ├── serve_model.py       — REST API для Rust Hub
+  │   └── static/              — статика для веб-интерфейса
+  │
+  ├── training/                ← Скрипты обучения (вызываются из local_train.py)
+  │   ├── train_mamba2.py      — обучение Mamba-2
+  │   ├── train_mingru.py      — обучение MinGRU
+  │   ├── train_reflexes.py    — обучение рефлексов
+  │   ├── train_spiking.py     — обучение SNN
+  │   ├── train_distill.py     — Knowledge Distillation
+  │   ├── train_rlvr.py        — RLVR
+  │   ├── train_dpo.py         — DPO
+  │   ├── train_corpus.py      — подготовка корпуса
+  │   ├── generate_synthetic.py — генерация синтетических данных
+  │   ├── quantize_158bit.py   — 1.58-bit квантизация
+  │   └── muon.py              — Muon optimizer
+  │
+  ├── ui/                      ← Веб-интерфейс
+  ├── models/                  ← Обученные модели (checkpoints)
+  ├── data/                    ← Данные для обучения
+  ├── TARS_Colab.ipynb         ← Google Colab ноутбук
+  ├── requirements.txt         ← Зависимости
+  └── README.md                ← Документация
+
+
+16.2. Автономный ИИ-агент (agent/tars_agent.py)
+
+TarsAgent — полный цикл обработки задач:
+
+  Запрос → Классификация → Поиск контекста → Выполнение → Обучение → Ответ
+
+  ┌─────────────────────────────────────────────────────────┐
+  │                    TarsAgent                            │
+  │                                                         │
+  │  ┌──────────┐  ┌──────────┐  ┌────────────┐           │
+  │  │ Classifier│  │ Planner  │  │ Executor   │           │
+  │  │ (intent) │→ │ (what?)  │→ │ (do it!)   │           │
+  │  └──────────┘  └──────────┘  └─────┬──────┘           │
+  │                                     │                   │
+  │  ┌──────────────────────────────────┼──────────────┐   │
+  │  │         SubAgent Pool (parallel)  ↓              │   │
+  │  │  ┌─────────┐ ┌─────────┐ ┌──────────┐          │   │
+  │  │  │ Search  │ │ Fetch   │ │ Analyze  │          │   │
+  │  │  └─────────┘ └─────────┘ └──────────┘          │   │
+  │  │  ┌─────────┐ ┌─────────┐ ┌──────────┐          │   │
+  │  │  │ Memory  │ │ Shell   │ │ Skill    │          │   │
+  │  │  └─────────┘ └─────────┘ └──────────┘          │   │
+  │  └─────────────────────────────────────────────────┘   │
+  │                                                         │
+  │  ┌──────────┐  ┌──────────┐  ┌────────────┐           │
+  │  │  LEANN   │  │  Skills  │  │  Telegram  │           │
+  │  │  Memory  │  │  Store   │  │  Bot       │           │
+  │  └──────────┘  └──────────┘  └────────────┘           │
+  └─────────────────────────────────────────────────────────┘
+
+  11 типов намерений (intent):
+    learn, web_search, search, execute, file_op,
+    remember, analyze, code, skill_use, status, chat
+
+  Spine Integration (RRN Core):
+    3 режима обработки:
+      Mode 1: Рефлекс — мгновенный ответ (<50мс)
+      Mode 2: Действие — синапсы ответили
+      Mode 3: Глубокое мышление — данные для Brain
+
+  Auto-ТЗ (TaskSpec):
+    Система ВСЕГДА генерирует ТЗ для самопроверки.
+    Содержит пункты валидации: "Код синтаксически корректен",
+    "Ответ соответствует вопросу", "Обработаны граничные случаи".
+
+  Запуск:
+    python launch_tars.py               # CLI с автоустановкой
+    python agent/tars_agent.py          # Прямой запуск
+    python agent/tars_agent.py --telegram
+    python agent/tars_agent.py --auto-learn
+
+
+16.3. Система самообучения (agent/self_learn.py)
+
+SelfLearner — автономное обучение из интернета:
+
+  1. Получает тему → ищет в DuckDuckGo (top-5 результатов)
+  2. Загружает и очищает контент каждой страницы
+  3. Разбивает на чанки (500 символов) → добавляет в LEANN
+  4. Сохраняет в корпус (data/self_learned/) для дообучения
+  5. Когда корпус > 5 MB → предлагает запустить retraining
+
+  Режимы:
+    Интерактивный:  python agent/self_learn.py "нейронные сети"
+    Автоматический: python agent/self_learn.py --auto "тема1" "тема2"
+    С Telegram:     python agent/self_learn.py --telegram --auto
+    Из URL:         python agent/self_learn.py --urls https://...
+
+
+16.4. Система навыков (agent/skill_learn.py)
+
+SkillLearner — автоматическое обучение навыкам:
+
+  "научись Docker" → ищет инфо → создаёт Skill JSON:
+
+  Skill = {
+    name, description, category,
+    instructions: [шаг1, шаг2, ...],
+    commands: [{cmd, desc}, ...],
+    examples: [{input, output}, ...],
+    knowledge: [факт1, факт2, ...],
+    confidence: 0.0-1.0,
+    sources: [url1, url2, ...]
+  }
+
+  8 категорий: app, code, hardware, system, data, ai, general
+  Через AgentPool: параллельные суб-агенты за 3-7 секунд
+
+  Запуск:
+    python agent/skill_learn.py Docker         # изучить навык
+    python agent/skill_learn.py --list         # список навыков
+    python agent/skill_learn.py --info Docker  # подробности
+
+
+16.5. HTTP API сервер (hub/serve_model.py)
+
+TARS Model Server — REST API для Rust Hub и внешних приложений:
+
+  POST /generate         — полная генерация текста
+    {"prompt": "...", "max_tokens": 256, "temperature": 0.7}
+    → {"text": "...", "tokens_per_sec": 42.5}
+
+  POST /generate_stream  — SSE потоковая генерация
+    → data: {"token": "...", "done": false}
+
+  GET /health            — проверка состояния
+    → {"status": "ok", "model": "TarsMamba2LM", "params": 1000000}
+
+  Запуск:
+    python hub/serve_model.py --model models/mamba2/brain_best.pt --port 8090
+
+
+16.6. Google Colab интеграция (TARS_Colab.ipynb)
+
+Ноутбук с интерактивными элементами управления:
+
+  - Dropdown: выбор уровня обучения (small / medium / max)
+  - Checkbox: пропустить голосовой модуль (--skip-voice)
+  - Checkbox: пропустить пост-обучение (--skip-posttrain)
+  - Автоматическое подключение Google Drive (--drive colab)
+  - Флаг --resume всегда включён для защиты от отключений
+
+  Команда обучения:
+    !python local_train.py --level {level} --drive colab --resume
+
+
+16.7. Демонстрация моделей (tools/demo_tars.py)
+
+Проверка всех обученных моделей:
+
+  1. ReflexClassifier — классификация интентов + confidence
+  2. MinGRU LM — генерация текста (top-k sampling)
+  3. SNN Spiking Synapses — спайковая активность
+  4. Mamba-2 Brain — генерация текста из основного мозга
+
+  Запуск:
+    python tools/demo_tars.py
+
+
+16.8. Суб-агенты (tools/sub_agents.py)
+
+AgentPool — пул параллельных суб-агентов (asyncio):
+
+  ┌──────────────────────────────────────────────────┐
+  │ AgentPool                                        │
+  │                                                  │
+  │  SearchAgent  → DuckDuckGo параллельный поиск    │
+  │  FetchAgent   → загрузка и очистка контента      │
+  │  AnalyzeAgent → извлечение фактов и инструкций   │
+  │  MemoryAgent  → LEANN поиск/сохранение           │
+  │  ShellAgent   → выполнение системных команд      │
+  │  SkillAgent   → применение изученных навыков     │
+  │                                                  │
+  │  deep_research(topic, depth, follow_links)       │
+  │  research(query, depth)                          │
+  │  health_report() → состояние каждого агента      │
+  └──────────────────────────────────────────────────┘
+
+  Кэш результатов: hit/miss статистика
+  Health monitoring: процент успешных задач, среднее время
 
 
 ═══════════════════════════════════════════════════════════════════════════════

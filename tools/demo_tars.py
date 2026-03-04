@@ -7,7 +7,7 @@
 import sys, os, time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent  # tools/ → project root
 sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 

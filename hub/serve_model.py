@@ -30,7 +30,7 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("Tars.Server")
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent  # hub/ → project root
 sys.path.insert(0, str(ROOT))
 
 # Lazy load torch + model

@@ -1,72 +1,39 @@
 """
 ═══════════════════════════════════════════════════════════════════════
-  ТАРС v3 — СТАЦИОНАРНОЕ ОБУЧЕНИЕ (Лаборатория, MAX)
+  ТАРС v3 — УНИВЕРСАЛЬНОЕ ОБУЧЕНИЕ (Единый Скрипт)
 ═══════════════════════════════════════════════════════════════════════
 
-Максимальное обучение на стационарном GPU (RTX 4090 / 3090 / A6000).
-Авто-определение GPU → оптимальный конфиг по VRAM.
+Один скрипт для ВСЕГО обучения. Интерактивный выбор:
+  • Подключать диск? (нет / Colab / rclone)
+  • Уровень: малый / средний / максимум
 
-  ≥22 GB (4090):  768M params (1024d × 20L), batch=8×4=32, bf16, seq→4096
-  ≥14 GB (3090):  400M params (768d × 16L),  batch=4×8=32
-  <14 GB (3060):  250M params (768d × 12L),  batch=2×16=32
-
-ПОЛНЫЙ ПАЙПЛАЙН (фазы 0-15):
-  0. Dependencies
-  1. Download (Wiki 100K + HF all presets + personality corpus)
-  2. Reflex classifier (100 epochs)
-  2.5 RRN Spine routing (50 epochs, mode 1/2/3 classification)
-  3. MinGRU LM (25 epochs)
-  3.5 SNN Spiking Synapses (30 epochs, SI-LIF + surrogate gradient)
-  4. Mamba-2 Brain (4 sub-phases + personality + second pass)
-  5. Quantize 1.58-bit
-  6. Consolidate → models/tars_v3/
-  7. Validate
-  8-10. Voice (Whisper + Piper + Quantize)
-  11. Instruction tuning
-  12. CoT (Chain-of-Thought)
-  13. DPO (preference alignment)
-  14. RLVR (verifiable rewards)
-  15. Knowledge Distillation (optional, --distill)
-
-ДАННЫЕ С ДИСКА:
-  По умолчанию данные берутся из data/ (hf_*.txt, wiki_ru.txt, etc).
-  Для больших корпусов → создайте data/shards_*/shard_*.txt
-  
-  Структура диска:
-    data/
-    ├── wiki_ru.txt              # Wikipedia 100K статей (~300 MB)
-    ├── hf_*.txt                 # HuggingFace датасеты
-    ├── tars_personality*.txt    # Личность ТАРС
-    ├── tars_identity.txt        # Архитектура ТАРС
-    ├── instruct_data.jsonl      # Instruction tuning
-    ├── cot_data.jsonl           # CoT задачи
-    ├── dpo_pairs.jsonl          # DPO пары
-    └── shards_custom/           # Большие корпуса (sharded)
-        ├── shard_000.txt
-        ├── shard_001.txt
-        └── ...
+ФАЗЫ (0-15):
+  0. Зависимости           8.  Whisper STT
+  1. Скачивание данных      9.  Piper TTS
+  2. Рефлекс-классификатор  10. Квантизация голоса
+  2.5 RRN маршрутизация     11. Instruction tuning
+  3. MinGRU LM              12. Chain-of-Thought
+  3.5 SNN спайковые         13. DPO alignment
+  4. Mamba-2 Brain          14. RLVR
+  5. Квантизация 1.58-bit   15. Knowledge Distillation
+  6. Консолидация
+  7. Валидация
 
 ИСПОЛЬЗОВАНИЕ:
-  python local_train.py                    # Авто-конфиг по GPU (полный пайплайн)
-  python local_train.py --1b              # Форсировать 768M модель
-  python local_train.py --resume          # Продолжить с чекпоинта
-  python local_train.py --phase 4         # Только Mamba-2
-  python local_train.py --phase 12        # Только CoT
-  python local_train.py --download-only   # Только скачать данные
-  python local_train.py --distill         # Включить Knowledge Distillation
-  python local_train.py --skip-posttrain  # Без post-training (CoT/DPO/RLVR)
-  python local_train.py --data-dir D:\datasets  # Данные с другого диска
-
+  python local_train.py                        # Интерактивный выбор
+  python local_train.py --level small          # Быстрая отладка (~15 мин)
+  python local_train.py --level medium         # Стандарт (~3 часа)
+  python local_train.py --level max            # Продакшн (~15 часов)
+  python local_train.py --drive colab          # + Google Drive через Colab
+  python local_train.py --drive rclone         # + Google Drive через rclone
+  python local_train.py --phase 4              # Только Mamba-2
+  python local_train.py --resume               # Продолжить с чекпоинта
+  python local_train.py --download-only        # Только скачать данные
+  python local_train.py --distill              # + Knowledge Distillation
 ═══════════════════════════════════════════════════════════════════════
 """
 
-import os
-import sys
-import time
-import argparse
-import subprocess
-import json
-import shutil
+import os, sys, time, json, shutil, argparse, subprocess, random
 from pathlib import Path
 from datetime import datetime
 
@@ -79,7 +46,7 @@ if hasattr(sys.stdout, 'reconfigure'):
         pass
 
 # ═══════════════════════════════════════════
-# 1. Paths & Constants
+# 1. Пути
 # ═══════════════════════════════════════════
 
 ROOT = Path(__file__).resolve().parent
@@ -95,271 +62,419 @@ LOG_FILE = ROOT / "local_train.log"
 STATE_FILE = ROOT / "train_state.json"
 
 # ═══════════════════════════════════════════
-# 2. Arguments
+# 2. Аргументы CLI
 # ═══════════════════════════════════════════
 
 parser = argparse.ArgumentParser(
-    description="ТАРС v3 — Local Training (RTX 4090 MAX)",
+    description="ТАРС v3 — Универсальное обучение",
     formatter_class=argparse.RawDescriptionHelpFormatter,
-    epilog="""
-Примеры:
-  python local_train.py                    # Полный пайплайн (все 15 фаз)
-  python local_train.py --1b              # 768M модель
-  python local_train.py --resume          # Продолжить с чекпоинта
-  python local_train.py --phase 4         # Только Mamba-2
-  python local_train.py --phase 12        # Только CoT
-  python local_train.py --download-only   # Только скачать все данные
-  python local_train.py --distill         # + Knowledge Distillation
-  python local_train.py --data-dir D:\\datasets  # Данные с другого диска
-  python local_train.py --gdrive          # Синхронизировать данные с Google Drive
-  python local_train.py --gdrive --gdrive-backup  # + бэкап моделей после обучения
-    """
 )
-parser.add_argument("--1b", dest="one_billion", action="store_true",
-                    help="Форсировать 768M модель (1024d × 20L)")
-parser.add_argument("--resume", action="store_true",
-                    help="Продолжить с чекпоинта")
-parser.add_argument("--phase", type=int, default=None,
-                    help="Запустить только конкретную фазу (0-15)")
-parser.add_argument("--download-only", action="store_true",
-                    help="Только скачать данные")
-parser.add_argument("--skip-download", action="store_true",
-                    help="Пропустить скачивание (данные есть)")
-parser.add_argument("--skip-voice", action="store_true",
-                    help="Пропустить голосовые модули")
-parser.add_argument("--skip-posttrain", action="store_true",
-                    help="Пропустить post-training (CoT, DPO, RLVR)")
-parser.add_argument("--distill", action="store_true",
-                    help="Включить Knowledge Distillation (фаза 15)")
-parser.add_argument("--data-dir", type=str, default=None,
-                    help="Директория с данными (default: data/)")
+parser.add_argument("--level", choices=["small", "medium", "max"], default=None,
+                    help="Уровень обучения: small (~15 мин), medium (~3ч), max (~15ч)")
+parser.add_argument("--drive", choices=["none", "colab", "rclone"], default=None,
+                    help="Подключение диска: none / colab / rclone")
+parser.add_argument("--resume", action="store_true", help="Продолжить с чекпоинта")
+parser.add_argument("--phase", type=int, default=None, help="Запустить только фазу (0-15)")
+parser.add_argument("--download-only", action="store_true", help="Только скачать данные")
+parser.add_argument("--skip-download", action="store_true", help="Пропустить скачивание")
+parser.add_argument("--skip-voice", action="store_true", help="Пропустить голосовые модули")
+parser.add_argument("--skip-posttrain", action="store_true", help="Без post-training (CoT/DPO/RLVR)")
+parser.add_argument("--distill", action="store_true", help="Включить Knowledge Distillation")
+parser.add_argument("--data-dir", type=str, default=None, help="Директория с данными")
 parser.add_argument("--data-preset", default="all",
                     choices=["all", "max", "quality", "massive", "reasoning"],
-                    help="Какие данные скачивать (default: all)")
-parser.add_argument("--gdrive", action="store_true",
-                    help="Синхронизировать данные с Google Drive перед обучением")
-parser.add_argument("--gdrive-backup", action="store_true",
-                    help="Выгрузить модели на Google Drive после обучения")
-parser.add_argument("--checkpoint-interval", type=int, default=1800,
-                    help="Интервал сохранения чекпоинтов (сек, default: 1800)")
+                    help="HF preset (default: all)")
+parser.add_argument("--checkpoint-interval", type=int, default=1800, help="Интервал чекпоинтов (сек)")
 args = parser.parse_args()
 
 # ═══════════════════════════════════════════
-# 3. GPU Detection + Auto-Config
+# 3. Hardware Benchmark & Auto-Tuning
 # ═══════════════════════════════════════════
 
 def detect_gpu():
-    """Определяет GPU и возвращает (name, vram_gb, device, bf16)."""
+    """Определяет GPU → (name, vram_gb, device, bf16)."""
     try:
         import torch
         if not torch.cuda.is_available():
             return None, 0, "cpu", False
-        
-        gpu_name = torch.cuda.get_device_name(0)
-        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        
-        # Check bf16 support (Ampere+)
-        bf16_ok = torch.cuda.get_device_capability(0) >= (8, 0)
-        
-        return gpu_name, vram_gb, "cuda", bf16_ok
+        name = torch.cuda.get_device_name(0)
+        vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        bf16 = torch.cuda.get_device_capability(0) >= (8, 0)
+        return name, vram, "cuda", bf16
     except Exception:
         return None, 0, "cpu", False
 
-
 def get_ram_gb():
-    """Get system RAM in GB."""
     try:
         import psutil
         return psutil.virtual_memory().total / 1024**3
     except ImportError:
-        # Fallback for Windows
         try:
             import ctypes
-            kernel32 = ctypes.windll.kernel32
-            class MEMORYSTATUSEX(ctypes.Structure):
-                _fields_ = [
-                    ('dwLength', ctypes.c_ulong),
-                    ('dwMemoryLoad', ctypes.c_ulong),
-                    ('ullTotalPhys', ctypes.c_ulonglong),
-                    ('ullAvailPhys', ctypes.c_ulonglong),
-                    ('ullTotalPageFile', ctypes.c_ulonglong),
-                    ('ullAvailPageFile', ctypes.c_ulonglong),
-                    ('ullTotalVirtual', ctypes.c_ulonglong),
-                    ('ullAvailVirtual', ctypes.c_ulonglong),
-                    ('ullAvailExtendedVirtual', ctypes.c_ulonglong),
-                ]
-            stat = MEMORYSTATUSEX()
-            stat.dwLength = ctypes.sizeof(stat)
-            kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
-            return stat.ullTotalPhys / 1024**3
+            class MS(ctypes.Structure):
+                _fields_ = [('dwLength', ctypes.c_ulong), ('dwMemoryLoad', ctypes.c_ulong),
+                            ('ullTotalPhys', ctypes.c_ulonglong), ('ullAvailPhys', ctypes.c_ulonglong),
+                            ('ullTotalPageFile', ctypes.c_ulonglong), ('ullAvailPageFile', ctypes.c_ulonglong),
+                            ('ullTotalVirtual', ctypes.c_ulonglong), ('ullAvailVirtual', ctypes.c_ulonglong),
+                            ('ullAvailExtendedVirtual', ctypes.c_ulonglong)]
+            s = MS(); s.dwLength = ctypes.sizeof(s)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(s))
+            return s.ullTotalPhys / 1024**3
         except Exception:
-            return 16  # fallback
+            return 16
 
-
-def get_config(vram_gb, ram_gb, force_1b=False):
-    """Возвращает оптимальный конфиг по VRAM + RAM.
-    
-    RTX 4090 + 64GB RAM: максимальная модель, большие батчи, длинные контексты.
+def benchmark_hardware():
     """
-    if force_1b or vram_gb >= 22:
-        # ═══ RTX 4090 / A6000 / A100 — МАКСИМУМ ═══
-        # 24GB VRAM: 1024d × 20L = ~768M params
-        # batch=8 × accum=4 = 32 effective (больше batch → лучше GPU utilization)
-        # seq_len до 4096 (grad_ckpt позволяет)
-        if force_1b and vram_gb < 22:
-            print(f"  ⚠️ WARNING: --1b задан, но VRAM={vram_gb:.1f} GB < 22 GB!")
-            print(f"     Возможен OOM. Снижаю batch до 2.")
-        batch = 8 if vram_gb >= 22 else (4 if vram_gb >= 14 else 2)
-        return {
-            "name": "768M",
-            "d_model": 1024,
-            "n_layers": 20,
-            "batch": batch,
-            "accum": 4,          # effective batch = 32
-            "seq_len_start": 512,
-            "seq_len_mid": 1024,
-            "seq_len_max": 4096,
-            # Learning rates по фазам
-            "lr_p1": 3e-4,       # Full pretrain
-            "lr_p2": 1e-4,       # WKV fine-tune
-            "lr_p3": 3e-5,       # MoLE fine-tune
-            "lr_p4": 1.5e-5,     # RAG fine-tune
-            "lr_p5": 5e-5,       # Personality
-            # Эпохи по фазам
-            "epochs_p1": 10,
-            "epochs_p2": 5,
-            "epochs_p3": 3,
-            "epochs_p4": 3,
-            "epochs_p5": 5,      # personality
-            # Post-training epochs
-            "epochs_instruct": 3,
-            "epochs_cot": 5,
-            "epochs_dpo": 3,
-            "epochs_rlvr": 3,
-            "epochs_distill": 3,
-            # Extra flags for 4090
-            "use_muon": True,         # 2x faster optimizer
-            "use_wsd": True,          # Better scheduler
-            "use_mod": False,         # MoD пока экспериментальный
-            "wiki_count": 100_000,    # Больше данных с диска
-            "second_pass_epochs": 5,  # Больше эпох на длинном контексте
-        }
-    elif vram_gb >= 14:
-        return {
-            "name": "400M",
-            "d_model": 768,
-            "n_layers": 16,
-            "batch": 4,
-            "accum": 8,
-            "seq_len_start": 384,
-            "seq_len_mid": 512,
-            "seq_len_max": 1024,
-            "lr_p1": 3e-4, "lr_p2": 1e-4, "lr_p3": 3e-5,
-            "lr_p4": 1.5e-5, "lr_p5": 5e-5,
-            "epochs_p1": 10, "epochs_p2": 5, "epochs_p3": 3,
-            "epochs_p4": 3, "epochs_p5": 3,
-            "epochs_instruct": 3, "epochs_cot": 3,
-            "epochs_dpo": 2, "epochs_rlvr": 2, "epochs_distill": 2,
-            "use_muon": False, "use_wsd": False, "use_mod": False,
-            "wiki_count": 50_000, "second_pass_epochs": 3,
-        }
+    Полный бенчмарк железа (~5 сек).
+    Тестирует VRAM (бинарный поиск 90%), matmul TFLOPS, torch.compile,
+    оптимальный batch size для каждого d_model.
+    """
+    import torch
+    gpu_name, vram_total, device, bf16 = detect_gpu()
+    ram_gb = get_ram_gb()
+    cpu_count = os.cpu_count() or 4
+
+    hw = {
+        "gpu_name": gpu_name,
+        "vram_total_gb": round(vram_total, 2),
+        "vram_usable_gb": 0,
+        "device": device,
+        "bf16": bf16,
+        "fp16": device == "cuda",
+        "ram_gb": round(ram_gb, 1),
+        "cpu_count": cpu_count,
+        "num_workers": min(cpu_count, 4) if device == "cuda" else 0,
+        "tflops": 0,
+        "compile_ok": False,
+        "cuda_capability": (0, 0),
+        "is_colab": os.path.exists("/content"),
+        "pin_memory": device == "cuda",
+        "max_batch": {},
+    }
+
+    if device != "cuda":
+        print("  ⚙️  CPU mode — пропускаем GPU-тесты")
+        return hw
+
+    props = torch.cuda.get_device_properties(0)
+    hw["cuda_capability"] = (props.major, props.minor)
+
+    # ────── Тест 1: VRAM стресс-тест (бинарный поиск 90%) ──────
+    print("  ⚙️  Тест VRAM...  ", end="", flush=True)
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+
+    lo, hi = 0.5, vram_total
+    best_gb = 0.5
+    for _ in range(12):  # 12 итераций бинарного поиска
+        mid = (lo + hi) / 2
+        try:
+            n_floats = int(mid * 1024**3 / 4)  # float32 = 4 bytes
+            t = torch.empty(n_floats, dtype=torch.float32, device="cuda")
+            del t
+            torch.cuda.empty_cache()
+            best_gb = mid
+            lo = mid
+        except (torch.cuda.OutOfMemoryError, RuntimeError):
+            hi = mid
+            torch.cuda.empty_cache()
+
+    hw["vram_usable_gb"] = round(best_gb * 0.90, 2)  # 90% от доступного
+    print(f"{hw['vram_usable_gb']:.1f} GB доступно (90% от {best_gb:.1f} GB)")
+
+    # ────── Тест 2: Throughput (matmul TFLOPS) ──────
+    print("  ⚙️  Тест matmul... ", end="", flush=True)
+    try:
+        sz = 2048
+        dtype = torch.bfloat16 if bf16 else torch.float16
+        a = torch.randn(sz, sz, dtype=dtype, device="cuda")
+        b = torch.randn(sz, sz, dtype=dtype, device="cuda")
+        # Прогрев
+        for _ in range(3):
+            torch.mm(a, b)
+        torch.cuda.synchronize()
+        # Замер
+        start_ev = torch.cuda.Event(enable_timing=True)
+        end_ev = torch.cuda.Event(enable_timing=True)
+        n_iters = 20
+        start_ev.record()
+        for _ in range(n_iters):
+            torch.mm(a, b)
+        end_ev.record()
+        torch.cuda.synchronize()
+        elapsed_ms = start_ev.elapsed_time(end_ev)
+        flops = 2 * sz**3 * n_iters  # matmul: 2*N^3 FLOP
+        tflops = flops / (elapsed_ms / 1000) / 1e12
+        hw["tflops"] = round(tflops, 1)
+        del a, b
+        torch.cuda.empty_cache()
+        print(f"{tflops:.1f} TFLOPS ({dtype})")
+    except Exception as e:
+        print(f"skip ({e})")
+
+    # ────── Тест 3: torch.compile ──────
+    print("  ⚙️  Тест torch.compile... ", end="", flush=True)
+    try:
+        if hasattr(torch, 'compile'):
+            @torch.compile(mode="reduce-overhead", fullgraph=False)
+            def _test_fn(x):
+                return x * 2 + 1
+            _test_fn(torch.tensor([1.0], device="cuda"))
+            hw["compile_ok"] = True
+            print("✅ поддерживается")
+        else:
+            print("❌ PyTorch < 2.0")
+    except Exception as e:
+        print(f"❌ ({e})")
+
+    # ────── Тест 4: Оптимальный batch (расчёт по VRAM) ──────
+    print("  ⚙️  Расчёт batch size... ", end="", flush=True)
+    torch.cuda.empty_cache()
+    max_batch_for_d = {}
+    for d_model in [256, 512, 768, 1024]:
+        seq = 512
+        lo_b, hi_b = 1, 64
+        best_b = 1
+        while lo_b <= hi_b:
+            mid_b = (lo_b + hi_b) // 2
+            # Прикидка: model + batch memory
+            model_mem_gb = (d_model ** 2 * 12 * 4) / 1024**3  # rough model size
+            dtype_size = 2 if (bf16 or hw["fp16"]) else 4
+            # fwd + bwd + grad + activations ≈ ×6
+            batch_mem_gb = (mid_b * seq * d_model * dtype_size * 6) / 1024**3
+            total_need = model_mem_gb + batch_mem_gb
+            if total_need <= hw["vram_usable_gb"]:
+                best_b = mid_b
+                lo_b = mid_b + 1
+            else:
+                hi_b = mid_b - 1
+        max_batch_for_d[d_model] = max(1, best_b)
+    hw["max_batch"] = max_batch_for_d
+    print(f"d=768→batch={max_batch_for_d.get(768, '?')}, d=1024→batch={max_batch_for_d.get(1024, '?')}")
+
+    # ────── Тест 5: Optimal num_workers ──────
+    if hw["is_colab"]:
+        hw["num_workers"] = min(cpu_count, 2)
     else:
-        return {
-            "name": "250M",
-            "d_model": 768,
-            "n_layers": 12,
-            "batch": 2,
-            "accum": 16,
-            "seq_len_start": 256,
-            "seq_len_mid": 384,
-            "seq_len_max": 512,
-            "lr_p1": 3e-4, "lr_p2": 1e-4, "lr_p3": 3e-5,
-            "lr_p4": 1.5e-5, "lr_p5": 5e-5,
-            "epochs_p1": 10, "epochs_p2": 5, "epochs_p3": 3,
-            "epochs_p4": 3, "epochs_p5": 3,
-            "epochs_instruct": 2, "epochs_cot": 2,
-            "epochs_dpo": 1, "epochs_rlvr": 1, "epochs_distill": 1,
-            "use_muon": False, "use_wsd": False, "use_mod": False,
-            "wiki_count": 10_000, "second_pass_epochs": 2,
+        hw["num_workers"] = min(cpu_count // 2, 4) if cpu_count > 1 else 0
+
+    torch.cuda.empty_cache()
+    return hw
+
+def print_hw_report(hw):
+    """Красивый вывод результатов бенчмарка."""
+    print()
+    print("  ┌──────────────────────────────────────────────────────┐")
+    print("  │            ⚙️  HARDWARE BENCHMARK RESULTS            │")
+    print("  ├──────────────────────────────────────────────────────┤")
+    if hw["gpu_name"]:
+        g = hw['gpu_name'][:40]
+        print(f"  │  🎮 GPU:     {g:<40}│")
+        print(f"  │  💾 VRAM:    {hw['vram_total_gb']:.1f} GB total → {hw['vram_usable_gb']:.1f} GB usable (90%)    │")
+        print(f"  │  ⚡ TFLOPS:  {hw['tflops']:.1f}{'':>40}│")
+        cap = hw['cuda_capability']
+        dtypes = []
+        if hw['bf16']: dtypes.append('bf16')
+        if hw['fp16']: dtypes.append('fp16')
+        print(f"  │  📐 Compute: sm_{cap[0]}{cap[1]}, {'+'.join(dtypes):<33}│")
+        cs = '✅ yes' if hw['compile_ok'] else '❌ no'
+        print(f"  │  🔧 Compile: {cs:<40}│")
+        for dm in [512, 768, 1024]:
+            if dm in hw.get('max_batch', {}):
+                b = hw['max_batch'][dm]
+                print(f"  │  📦 d={dm}:   max batch={b:<31}│")
+    else:
+        print(f"  │  🖥️  CPU mode (no GPU){'':>32}│")
+    print(f"  │  🧠 RAM:     {hw['ram_gb']:.0f} GB{'':>39}│")
+    print(f"  │  🔢 CPU:     {hw['cpu_count']} cores → {hw['num_workers']} workers{'':>23}│")
+    colab_s = 'Да' if hw['is_colab'] else 'Нет'
+    print(f"  │  📍 Colab:   {colab_s:<40}│")
+    print("  └──────────────────────────────────────────────────────┘")
+    print()
+
+# ═══════════════════════════════════════════
+# 4. Интерактивное меню
+# ═══════════════════════════════════════════
+
+def interactive_menu():
+    """Интерактивный выбор диска и уровня (если не задано через CLI)."""
+    drive = args.drive
+    level = args.level
+
+    if drive is None:
+        print()
+        print("  ┌─────────────────────────────────────────────────┐")
+        print("  │  💾 Подключить диск для данных/бэкапа?          │")
+        print("  │                                                 │")
+        print("  │  [1] Нет (локально)                             │")
+        print("  │  [2] Google Drive через Colab                   │")
+        print("  │  [3] Google Drive через rclone (локально)       │")
+        print("  └─────────────────────────────────────────────────┘")
+        try:
+            ch = input("  Выберите [1/2/3] (default=1): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            ch = "1"
+        drive = {"2": "colab", "3": "rclone"}.get(ch, "none")
+
+    if level is None:
+        print()
+        print("  ┌─────────────────────────────────────────────────┐")
+        print("  │  📊 Уровень обучения:                           │")
+        print("  │                                                 │")
+        print("  │  [1] Малый   — отладка, ~15 мин                 │")
+        print("  │  [2] Средний — стандарт, ~3 часа                │")
+        print("  │  [3] Максимум — продакшн, ~15 часов             │")
+        print("  └─────────────────────────────────────────────────┘")
+        try:
+            ch = input("  Выберите [1/2/3] (default=2): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            ch = "2"
+        level = {"1": "small", "3": "max"}.get(ch, "medium")
+
+    return drive, level
+
+# ═══════════════════════════════════════════
+# 5. Конфигурация по уровню + бенчмарку
+# ═══════════════════════════════════════════
+
+def get_config(level, hw):
+    """Возвращает конфиг обучения по уровню и результатам бенчмарка."""
+    vram = hw["vram_usable_gb"]  # уже 90% от реального
+    tflops = hw["tflops"]
+    ram_gb = hw["ram_gb"]
+    max_batch = hw.get("max_batch", {})
+
+    # ── Размер модели по доступному VRAM ──
+    if vram >= 18:    # A100(40GB)→36, L4(24GB)→~20, RTX4090(24GB)→~20
+        d, nl = 1024, 20
+    elif vram >= 11:  # T4(15GB)→~13, RTX3060(12GB)→~10
+        d, nl = 768, 16
+    elif vram >= 5:
+        d, nl = 512, 8
+    elif vram >= 2:
+        d, nl = 256, 4
+    else:
+        d, nl = 256, 4
+
+    # ── Batch из бенчмарка (по шкале d_model) ──
+    batch = max_batch.get(d, 4)
+
+    # ── Accum для effective batch ≥ 32 ──
+    eff_target = 32
+    accum = max(1, eff_target // batch)
+
+    # ── Seq_len ограничение по RAM (Colab: ~13 GB) ──
+    max_seq_by_ram = min(4096, int(ram_gb * 256))  # ~256 tokens / GB RAM
+
+    # ── Muon: быстрый, но жрёт больше VRAM ──
+    use_muon = vram >= 18 and tflops >= 20
+    # ── WSD: работает на любом GPU ──
+    use_wsd = vram >= 10
+    # ── torch.compile ──
+    use_compile = hw.get("compile_ok", False)
+    # ── AMP dtype ──
+    amp_dtype = "bf16" if hw["bf16"] else ("fp16" if hw["fp16"] else "fp32")
+    # ── num_workers ──
+    num_workers = hw["num_workers"]
+    pin_memory = hw["pin_memory"]
+
+    # ── Общие поля для всех уровней ──
+    common = {
+        "d_model": d, "n_layers": nl,
+        "batch": batch, "accum": accum,
+        "use_muon": use_muon, "use_wsd": use_wsd,
+        "use_compile": use_compile,
+        "amp_dtype": amp_dtype,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "vram_usable": vram,
+    }
+
+    if level == "small":
+        # ═══ МАЛЫЙ: отладка, smoke-test ═══
+        return {**common,
+            "name": f"SMALL ({d}d×{nl}L, batch={batch}×{accum})",
+            "seq_start": 256, "seq_mid": 384, "seq_max": min(512, max_seq_by_ram),
+            # Эпохи (мало)
+            "reflex_ep": 10, "rrn_ep": 10, "mingru_ep": 5,
+            "snn_ep": 5, "snn_dim": 256, "snn_heads": 4, "snn_batch": min(batch * 4, 32), "snn_seq": 128,
+            "mingru_dim": min(d, 256), "mingru_layers": 4,
+            "mamba_ep": [2, 1, 1, 1], "mamba_lr": [3e-4, 1e-4, 5e-5, 1.5e-5],
+            "personality_ep": 1, "second_pass_ep": 1,
+            "instruct_ep": 1, "cot_ep": 1, "dpo_ep": 1, "rlvr_ep": 1, "distill_ep": 1,
+            "wiki_count": 5000,
+        }
+    elif level == "medium":
+        # ═══ СРЕДНИЙ: стандарт ═══
+        return {**common,
+            "name": f"MEDIUM ({d}d×{nl}L, batch={batch}×{accum})",
+            "seq_start": 384, "seq_mid": 512, "seq_max": min(1024, max_seq_by_ram),
+            "reflex_ep": 30, "rrn_ep": 25, "mingru_ep": 15,
+            "snn_ep": 15, "snn_dim": min(d, 384), "snn_heads": 4,
+            "snn_batch": min(batch * 6, 48), "snn_seq": 192,
+            "mingru_dim": min(d, 512), "mingru_layers": 6,
+            "mamba_ep": [5, 3, 2, 2], "mamba_lr": [3e-4, 1e-4, 3e-5, 1.5e-5],
+            "personality_ep": 3, "second_pass_ep": 3,
+            "instruct_ep": 3, "cot_ep": 3, "dpo_ep": 2, "rlvr_ep": 2, "distill_ep": 2,
+            "wiki_count": 50000,
+        }
+    else:  # max
+        # ═══ МАКСИМУМ: продакшн ═══
+        return {**common,
+            "name": f"MAX ({d}d×{nl}L, batch={batch}×{accum})",
+            "seq_start": 512, "seq_mid": 1024, "seq_max": min(4096, max_seq_by_ram),
+            "reflex_ep": 100, "rrn_ep": 50, "mingru_ep": 25,
+            "snn_ep": 30, "snn_dim": min(d, 512), "snn_heads": 8,
+            "snn_batch": min(batch * 8, 64), "snn_seq": 256,
+            "mingru_dim": min(d, 512), "mingru_layers": 6,
+            "mamba_ep": [10, 5, 3, 3], "mamba_lr": [3e-4, 1e-4, 3e-5, 1.5e-5],
+            "personality_ep": 5, "second_pass_ep": 5,
+            "instruct_ep": 3, "cot_ep": 5, "dpo_ep": 3, "rlvr_ep": 3, "distill_ep": 3,
+            "wiki_count": 100000,
         }
 
-
 # ═══════════════════════════════════════════
-# 4. State Management (resume support)
-# ═══════════════════════════════════════════
-
-def load_state():
-    """Загрузить состояние обучения."""
-    if STATE_FILE.exists():
-        with open(STATE_FILE, 'r') as f:
-            return json.load(f)
-    return {"completed_phases": [], "current_phase": None, "started": None}
-
-
-def save_state(state):
-    """Сохранить состояние обучения."""
-    with open(STATE_FILE, 'w') as f:
-        json.dump(state, f, indent=2)
-
-
-def mark_done(state, phase_key):
-    """Отметить фазу как завершённую."""
-    state.setdefault("completed_phases", [])
-    if phase_key not in state["completed_phases"]:
-        state["completed_phases"].append(phase_key)
-    save_state(state)
-
-
-def is_done(state, phase_key):
-    """Проверить, завершена ли фаза."""
-    return phase_key in state.get("completed_phases", [])
-
-
-# ═══════════════════════════════════════════
-# 5. Training Runner
+# 6. CUDA Environment
 # ═══════════════════════════════════════════
 
-def run(cmd, timeout=None, label=""):
-    """Запустить команду с логированием (tee: и в консоль, и в лог)."""
+def setup_cuda_env(device, cfg):
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    if device == "cuda":
+        env["NVIDIA_TF32_OVERRIDE"] = "1"
+        env["TORCH_CUDNN_V8_API_ENABLED"] = "1"
+        env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    return env
+
+# ═══════════════════════════════════════════
+# 7. Runner + State
+# ═══════════════════════════════════════════
+
+CUDA_ENV = None  # заполняется в main()
+
+def run(cmd, label="", timeout=None):
+    """Запустить команду (tee: консоль + лог)."""
     cmd = [str(c) for c in cmd]
-    
-    # Вставляем -u после python для unbuffered output
     if len(cmd) >= 2 and ('python' in cmd[0].lower() or cmd[0] == PYTHON):
         if '-u' not in cmd:
             cmd.insert(1, '-u')
-    
+
     cmd_str = " ".join(cmd)
-    if label:
-        print(f"  → [{label}] {cmd_str[:120]}...")
-    else:
-        print(f"  → {cmd_str[:120]}...")
+    print(f"  → [{label}] {cmd_str[:120]}..." if label else f"  → {cmd_str[:120]}...")
     sys.stdout.flush()
-    
+
     with open(LOG_FILE, 'a', encoding='utf-8') as log:
-        log.write(f"\n{'='*60}\n")
-        log.write(f"[{datetime.now()}] {cmd_str}\n")
-        log.write(f"{'='*60}\n")
-    
-    # PYTHONUNBUFFERED=1 → вывод подпроцесса виден в реальном времени
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
-    
+        log.write(f"\n{'='*60}\n[{datetime.now()}] {cmd_str}\n{'='*60}\n")
+
     try:
-        # Tee: вывод идёт И в консоль, И в лог-файл
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(ROOT),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=env,
-            bufsize=1,
-        )
+        proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, env=CUDA_ENV, bufsize=1)
         with open(LOG_FILE, 'a', encoding='utf-8', errors='replace') as log:
-            for raw_line in proc.stdout:
+            for raw in proc.stdout:
                 try:
-                    line = raw_line.decode('utf-8', errors='replace')
+                    line = raw.decode('utf-8', errors='replace')
                 except Exception:
-                    line = str(raw_line)
+                    line = str(raw)
                 sys.stdout.write(line)
                 sys.stdout.flush()
                 log.write(line)
@@ -371,914 +486,738 @@ def run(cmd, timeout=None, label=""):
         return False
     except KeyboardInterrupt:
         proc.kill()
-        print(f"\n  ⏸ Прервано пользователем. Чекпоинт сохранён.")
+        print(f"\n  ⏸ Прервано. Чекпоинт сохранён.")
         return False
     except Exception as e:
         print(f"  ❌ {e}")
         return False
 
+def load_state():
+    if STATE_FILE.exists():
+        with open(STATE_FILE, 'r') as f:
+            return json.load(f)
+    return {"completed_phases": [], "current_phase": None, "started": None}
 
-def train_mamba_phase(phase_num, config, device, bf16, extra_args=None):
-    """Запустить одну фазу обучения Mamba-2."""
-    
-    phase_keys = {
-        1: ("epochs_p1", "lr_p1", "seq_len_start"),
-        2: ("epochs_p2", "lr_p2", "seq_len_mid"),
-        3: ("epochs_p3", "lr_p3", "seq_len_max"),
-        4: ("epochs_p4", "lr_p4", "seq_len_max"),
-        5: ("epochs_p5", "lr_p5", "seq_len_mid"),
-    }
-    
-    epoch_key, lr_key, seq_key = phase_keys[phase_num]
-    
-    cmd = [
-        PYTHON, str(TRAINING / "train_mamba2.py"),
-        "--d_model", str(config["d_model"]),
-        "--n_layers", str(config["n_layers"]),
-        "--vocab_size", "256",
-        "--batch", str(config["batch"]),
-        "--accum_steps", str(config["accum"]),
-        "--epochs", str(config[epoch_key]),
-        "--lr", str(config[lr_key]),
-        "--seq_len", str(config[seq_key]),
-        "--phase", str(phase_num),
-        "--device", device,
-        "--curriculum",
-        "--label_smoothing", "0.1",
-        "--grad_ckpt",
-        "--no_wiki",  # Wikipedia скачивается в Phase 1, не при обучении
-    ]
-    
-    if bf16:
-        cmd += ["--bf16"]
-    
-    # RTX 4090 optimizations
-    if config.get("use_muon"):
-        cmd += ["--muon"]
-    if config.get("use_wsd"):
-        cmd += ["--wsd"]
-    if config.get("use_mod"):
-        cmd += ["--mod"]
-    
-    if phase_num > 1 or args.resume:
-        cmd += ["--resume"]
-    
-    # Data directory support
-    if args.data_dir:
-        cmd += ["--data_dir", args.data_dir]
-    
-    if extra_args:
-        cmd += extra_args
-    
-    return run(cmd, label=f"Mamba P{phase_num}")
+def save_state(state):
+    with open(STATE_FILE, 'w') as f:
+        json.dump(state, f, indent=2)
 
+def mark_done(state, key):
+    state.setdefault("completed_phases", [])
+    if key not in state["completed_phases"]:
+        state["completed_phases"].append(key)
+    save_state(state)
 
-def train_post_phase(script, config, device, bf16, epochs_key, extra_args=None):
-    """Запустить post-training фазу (CoT/DPO/RLVR/Distill)."""
-    cmd = [
-        PYTHON, str(TRAINING / script),
-        "--d_model", str(config["d_model"]),
-        "--n_layers", str(config["n_layers"]),
-        "--epochs", str(config.get(epochs_key, 3)),
-        "--batch", str(config["batch"]),
-        "--device", device,
-        "--save_dir", str(TARS_V3),
-        "--resume",
-        "--grad_ckpt",
-    ]
-    
-    if bf16:
-        cmd += ["--bf16"]
-    
-    if extra_args:
-        cmd += extra_args
-    
-    return run(cmd, label=script.replace("train_", "").replace(".py", "").upper())
-
+def is_done(state, key):
+    return key in state.get("completed_phases", [])
 
 # ═══════════════════════════════════════════
-# 6. DPO Data Auto-Generation
+# 8. Google Drive (Colab / rclone)
 # ═══════════════════════════════════════════
 
-def _generate_dpo_pairs(output_path, n_pairs=500):
-    """Генерирует DPO пары (chosen vs rejected) из instruction-подобных промптов.
-    
-    Формат: {"prompt": "...", "chosen": "хороший ответ", "rejected": "плохой ответ"}
-    """
-    import json, random
-    
+def setup_drive(mode):
+    """Настроить Google Drive. mode = 'colab' | 'rclone' | 'none'."""
+    if mode == "none":
+        return False
+
+    if mode == "colab":
+        print("\n  ☁️  Google Drive: подключение через Colab...")
+        try:
+            from google.colab import drive
+            drive.mount('/content/drive')
+            print("  ✅ Google Drive смонтирован!")
+            return True
+        except ImportError:
+            print("  ❌ google.colab недоступен (не запущен в Colab)")
+            print("     Используйте --drive rclone для локального подключения")
+            return False
+        except Exception as e:
+            print(f"  ❌ Ошибка монтирования: {e}")
+            return False
+
+    if mode == "rclone":
+        print("\n  ☁️  Google Drive: подключение через rclone...")
+        setup_script = ROOT / "tools" / "setup_gdrive.py"
+        if not setup_script.exists():
+            print("  ❌ setup_gdrive.py не найден")
+            return False
+        try:
+            r = subprocess.run([PYTHON, str(setup_script), "status"],
+                               capture_output=True, text=True, timeout=30)
+            if r.returncode == 0:
+                print("  ✅ rclone уже настроен!")
+                return True
+        except Exception:
+            pass
+        print("  🔧 Запускаю настройку rclone...")
+        ok = run([PYTHON, str(setup_script), "setup"], label="rclone Setup")
+        if ok:
+            print("  ✅ rclone настроен!")
+        return ok
+
+    return False
+
+def drive_sync_data(mode):
+    """Синхронизировать данные с Drive."""
+    if mode == "colab":
+        drive_data = Path("/content/drive/MyDrive/TarsData/data")
+        if drive_data.exists():
+            print("  ☁️  Копирование данных с Drive → data/...")
+            DATA.mkdir(parents=True, exist_ok=True)
+            for f in drive_data.glob("*"):
+                dst = DATA / f.name
+                if not dst.exists():
+                    shutil.copy2(str(f), str(dst))
+                    print(f"    + {f.name}")
+            return True
+        return False
+    elif mode == "rclone":
+        setup_script = ROOT / "tools" / "setup_gdrive.py"
+        if setup_script.exists():
+            return run([PYTHON, str(setup_script), "sync"], label="GDrive Sync")
+    return False
+
+def drive_backup(mode):
+    """Бэкап моделей на Drive."""
+    if mode == "colab":
+        drive_models = Path("/content/drive/MyDrive/TarsData/models")
+        drive_models.mkdir(parents=True, exist_ok=True)
+        if TARS_V3.exists():
+            print("  ☁️  Копирование моделей на Drive...")
+            for f in TARS_V3.glob("*.pt"):
+                shutil.copy2(str(f), str(drive_models / f.name))
+                print(f"    → {f.name}")
+            return True
+        return False
+    elif mode == "rclone":
+        setup_script = ROOT / "tools" / "setup_gdrive.py"
+        if setup_script.exists():
+            return run([PYTHON, str(setup_script), "sync-models"], label="GDrive Backup")
+    return False
+
+# ═══════════════════════════════════════════
+# 9. Утилиты обучения
+# ═══════════════════════════════════════════
+
+def download_all_data(cfg):
+    """Скачать ВСЕ данные: Wiki + HF + Personality + Synthetic + Pretrained."""
+    data_dir = Path(args.data_dir) if args.data_dir else DATA
+    data_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\n  📂 Data directory: {data_dir}")
+
+    # Wikipedia
+    wiki = data_dir / "wiki_ru.txt"
+    if not wiki.exists() or wiki.stat().st_size < 100_000:
+        print(f"\n  📚 Wikipedia: {cfg['wiki_count']:,} статей...")
+        run([PYTHON, str(TRAINING / "download_wiki.py"),
+             "--count", str(cfg["wiki_count"]), "--output", str(wiki)], label="Wiki")
+    else:
+        print(f"  ✓ Wikipedia: {wiki.stat().st_size / 1024 / 1024:.1f} MB (кеш)")
+
+    # HuggingFace
+    hf_files = list(data_dir.glob("hf_*.txt"))
+    if not hf_files or sum(f.stat().st_size for f in hf_files) < 1024:
+        print(f"\n  📦 HuggingFace datasets (preset: {args.data_preset})...")
+        run([PYTHON, str(TRAINING / "download_hf_dataset.py"),
+             "--preset", args.data_preset, "--output", str(data_dir)], label="HF")
+    else:
+        print(f"  ✓ HuggingFace: {len(hf_files)} файлов (кеш)")
+
+    # Personality
+    pers = data_dir / "tars_personality_mega.txt"
+    if not pers.exists() or pers.stat().st_size < 100_000:
+        print("\n  🧠 Generating personality corpus...")
+        run([PYTHON, str(TRAINING / "generate_tars_corpus.py")], label="Personality")
+    else:
+        print(f"  ✓ Personality: {pers.stat().st_size // 1024} KB (кеш)")
+
+    # Synthetic STEM
+    stem = data_dir / "synthetic_stem.jsonl"
+    if not stem.exists():
+        print("\n  🔬 Generating STEM data...")
+        run([PYTHON, str(TRAINING / "generate_synthetic.py")], label="STEM")
+
+    # HF pretrained Mamba-2 weights
+    pret = MODELS / "pretrained" / "mamba2-130m"
+    if not pret.exists() or not list(pret.glob("*.safetensors")):
+        print("\n  🧠 Downloading pretrained Mamba-2 base weights...")
+        try:
+            from huggingface_hub import snapshot_download
+            snapshot_download("state-spaces/mamba2-130m",
+                              local_dir=str(pret), ignore_patterns=["*.bin", "*.msgpack"])
+            print(f"  ✅ Pretrained Mamba-2 saved: {pret}")
+        except Exception as e:
+            print(f"  ⚠ Mamba-2 download failed: {e}")
+
+    # Summary
+    total_mb = 0
+    cnt = 0
+    print(f"\n  {'─' * 50}")
+    print(f"  📁 Файлы данных:")
+    for f in sorted(data_dir.glob("*.txt")) + sorted(data_dir.glob("*.jsonl")):
+        mb = f.stat().st_size / 1024 / 1024
+        if mb > 0.01:
+            total_mb += mb; cnt += 1
+            print(f"    {f.name:40s} {mb:8.1f} MB")
+    for sd in sorted(data_dir.glob("shards_*")):
+        if sd.is_dir():
+            sf = list(sd.glob("shard_*.txt"))
+            smb = sum(f.stat().st_size for f in sf) / 1024 / 1024
+            total_mb += smb; cnt += len(sf)
+            print(f"    {sd.name + '/':40s} {smb:8.1f} MB ({len(sf)} shards)")
+    print(f"  {'─' * 50}")
+    print(f"  Итого: {cnt} файлов, {total_mb:.1f} MB ({total_mb / 1024:.2f} GB)")
+    return total_mb
+
+def generate_dpo_pairs(output_path, n_pairs=500):
+    """Генерация DPO пар (chosen vs rejected)."""
     pairs = [
-        # Формат: (prompt, chosen, rejected)
-        ("Привет!", "Привет! Я ТАРС, ваш ИИ-ассистент. Чем могу помочь?",
-         "ну привет"),
-        ("Кто ты?", "Я ТАРС — искусственный интеллект, созданный для помощи людям. Я могу отвечать на вопросы, помогать с кодом и вести диалог.",
-         "я бот"),
-        ("Что такое Python?", "Python — это высокоуровневый язык программирования, известный своей простотой и читаемостью. Он широко используется в веб-разработке, науке о данных, машинном обучении и автоматизации.",
-         "язык"),
-        ("Помоги с кодом", "Конечно! Опишите задачу, и я помогу написать код. Я работаю с Python, JavaScript и другими языками.",
-         "не могу"),
-        ("Сколько будет 2+2?", "2 + 2 = 4. Это базовая арифметическая операция сложения.",
-         "4"),
-        ("Объясни рекурсию", "Рекурсия — это когда функция вызывает саму себя. Каждый вызов решает меньшую подзадачу, пока не достигнет базового случая. Пример: факториал — n! = n × (n-1)!",
-         "это когда функция вызывает себя"),
-        ("Что лучше: Python или JavaScript?", "Оба языка отличные, но для разных задач. Python хорош для backend, ML и анализа данных. JavaScript — для веб-фронтенда и full-stack с Node.js. Выбор зависит от вашей задачи.",
-         "python лучше"),
-        ("Расскажи про нейросети", "Нейронные сети — это модели машинного обучения, вдохновлённые работой мозга. Они состоят из слоёв нейронов, которые обучаются на данных. Основные типы: CNN (изображения), RNN/LSTM/Mamba (последовательности), Transformer (NLP).",
-         "это типа мозг"),
-        ("Как работает git?", "Git — система контроля версий. Основные команды: git add (добавить файлы), git commit (зафиксировать), git push (отправить на сервер), git pull (получить обновления). Это позволяет отслеживать изменения и работать в команде.",
-         "не знаю"),
-        ("Спасибо!", "Рад помочь! Если будут ещё вопросы — обращайтесь.",
-         "ок"),
-    ]
-    
-    # Генерируем вариации
-    templates_q = [
-        "Объясни {topic}", "Что такое {topic}?", "Расскажи про {topic}",
-        "Как работает {topic}?", "Зачем нужен {topic}?",
+        ("Привет!", "Привет! Я ТАРС, ваш ИИ-ассистент. Чем могу помочь?", "ну привет"),
+        ("Кто ты?", "Я ТАРС — ИИ, созданный для помощи людям.", "я бот"),
+        ("Что такое Python?", "Python — высокоуровневый язык программирования для ML, веба и автоматизации.", "язык"),
+        ("Помоги с кодом", "Конечно! Опишите задачу, и я помогу.", "не могу"),
+        ("Сколько будет 2+2?", "2 + 2 = 4.", "4"),
+        ("Объясни рекурсию", "Рекурсия — когда функция вызывает саму себя до базового случая. Пример: n! = n × (n-1)!", "это когда функция вызывает себя"),
+        ("Расскажи про нейросети", "Нейронные сети — модели ML, состоящие из слоёв нейронов. Типы: CNN, RNN, Mamba, Transformer.", "это типа мозг"),
+        ("Спасибо!", "Рад помочь! Обращайтесь.", "ок"),
     ]
     topics = [
-        ("machine learning", "машинное обучение — подраздел ИИ, где модели учатся на данных без явного программирования", "это ии"),
-        ("Docker", "Docker — платформа контейнеризации. Позволяет упаковать приложение с зависимостями в изолированный контейнер", "программа"),
-        ("API", "API (Application Programming Interface) — набор правил для взаимодействия программ. REST API использует HTTP-запросы: GET, POST, PUT, DELETE", "интерфейс"),
-        ("база данных", "база данных — организованное хранилище данных. SQL (PostgreSQL, MySQL) — реляционные, NoSQL (MongoDB, Redis) — гибкие", "хранилище"),
-        ("Linux", "Linux — свободная операционная система на ядре Linux. Используется на серверах, в разработке, встраиваемых системах и Android", "операционка"),
+        ("machine learning", "машинное обучение — подраздел ИИ, модели учатся на данных", "это ии"),
+        ("Docker", "Docker — платформа контейнеризации приложений", "программа"),
+        ("API", "API — набор правил для взаимодействия программ. REST: GET, POST, PUT, DELETE", "интерфейс"),
     ]
-    
-    all_pairs = list(pairs)
-    for topic_name, good, bad in topics:
-        for tmpl in templates_q:
-            q = tmpl.format(topic=topic_name)
-            all_pairs.append((q, good, bad))
-    
-    # Дублируем с вариациями до n_pairs
-    output_data = []
+    for tn, good, bad in topics:
+        for t in [f"Что такое {tn}?", f"Объясни {tn}", f"Расскажи про {tn}"]:
+            pairs.append((t, good, bad))
+
+    out = []
     for i in range(n_pairs):
-        p, c, r = random.choice(all_pairs)
-        output_data.append({"prompt": p, "chosen": c, "rejected": r})
-    
+        p, c, r = random.choice(pairs)
+        out.append({"prompt": p, "chosen": c, "rejected": r})
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, 'w', encoding='utf-8') as f:
-        for item in output_data:
+        for item in out:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
-    
-    size_kb = output_path.stat().st_size / 1024
-    print(f"  ✅ Generated {len(output_data)} DPO pairs → {output_path} ({size_kb:.0f} KB)")
+    print(f"  ✅ Generated {len(out)} DPO pairs → {output_path}")
 
-
-def quick_validate(config, device):
-    """Быстрая валидация: 3 тестовых промпта через модель."""
-    print("\n  🔍 Quick validation (3 prompts)...")
+def quick_validate(cfg, device):
+    """Быстрая валидация: 3 промпта."""
+    print("\n  🔍 Quick validation...")
     try:
         import torch
         from brain.mamba2.model import TarsMamba2LM
-        
-        model_path = TARS_V3 / "mamba2_omega.pt"
-        alt_path = TARS_V3 / "mamba2.pt"
-        load_path = alt_path if alt_path.exists() else model_path
-        
-        if not load_path.exists():
-            print("     ⚠ No model checkpoint found, skipping validation")
+        mp = TARS_V3 / "mamba2.pt"
+        if not mp.exists():
+            mp = TARS_V3 / "mamba2_omega.pt"
+        if not mp.exists():
+            print("     ⚠ Нет модели для валидации")
             return
-        
-        model = TarsMamba2LM(
-            d_model=config["d_model"],
-            n_layers=config["n_layers"],
-            vocab_size=256,
-            quant_mode="fp16",
-        )
-        ckpt = torch.load(str(load_path), map_location='cpu', weights_only=False)
+        model = TarsMamba2LM(d_model=cfg["d_model"], n_layers=cfg["n_layers"],
+                             vocab_size=256, quant_mode="fp16")
+        ckpt = torch.load(str(mp), map_location='cpu', weights_only=False)
         model.load_state_dict(ckpt['model_state_dict'], strict=False)
         model.eval()
         dev = torch.device(device)
         model.to(dev)
-        
-        prompts = ["Привет!", "Что такое Python?", "2+2="]
-        for prompt in prompts:
+        for prompt in ["Привет!", "Что такое Python?", "2+2="]:
             tokens = list(prompt.encode('cp1251', errors='replace'))
             x = torch.tensor([tokens], dtype=torch.long, device=dev)
             with torch.no_grad():
                 for _ in range(60):
                     logits = model(x)
                     probs = torch.softmax(logits[:, -1, :] / 0.7, dim=-1)
-                    next_tok = torch.multinomial(probs, 1)
-                    x = torch.cat([x, next_tok], dim=1)
-                    if next_tok.item() == 0 or x.shape[1] > 200:
+                    nt = torch.multinomial(probs, 1)
+                    x = torch.cat([x, nt], dim=1)
+                    if nt.item() == 0 or x.shape[1] > 200:
                         break
             out = bytes(x[0].cpu().tolist()).decode('cp1251', errors='replace')
-            answer = out[len(prompt):].strip()[:80]
             print(f"     Q: {prompt}")
-            print(f"     A: {answer}")
-        
+            print(f"     A: {out[len(prompt):].strip()[:80]}")
         del model
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         print("  ✅ Validation complete")
     except Exception as e:
         print(f"     ⚠ Validation error: {e}")
 
-
-def estimate_vram_needed(config, phase_name):
-    """Оценка необходимого VRAM для фазы."""
-    d_model = config["d_model"]
-    n_layers = config["n_layers"]
-    params = d_model ** 2 * n_layers * 12
-    
-    multipliers = {
-        "mamba2": 4.0,     # model + grads + optimizer + activations
-        "dpo": 8.5,        # 2x model (policy + ref) + grads + optimizer
-        "distill": 6.0,    # teacher + student + grads
-        "default": 4.0,
+def consolidate_models(cfg, results, total_time):
+    """Фаза 6: собрать модели в models/tars_v3/."""
+    TARS_V3.mkdir(parents=True, exist_ok=True)
+    copies = {
+        "reflex": (MODELS / "reflex" / "reflex_classifier.pt", TARS_V3 / "reflex.pt"),
+        "mingru": (MODELS / "mingru_weights.pt", TARS_V3 / "mingru.pt"),
+        "mamba2_fp16": (MODELS / "mamba2" / "mamba2_omega.pt", TARS_V3 / "mamba2.pt"),
+        "mamba2_158bit": (MODELS / "mamba2" / "mamba2_omega_158bit.pt", TARS_V3 / "mamba2_158bit.pt"),
     }
-    
-    mult = multipliers.get(phase_name, multipliers["default"])
-    vram_gb = (params * 2 * mult) / (1024 ** 3)  # fp16 base
-    return vram_gb
-
-
-# ═══════════════════════════════════════════
-# 7. Data Download (from disk/network)
-# ═══════════════════════════════════════════
-
-def download_all_data(config):
-    """Скачать ВСЕ данные: Wiki + HF + Personality + Synthetic."""
-    
-    data_dir = Path(args.data_dir) if args.data_dir else DATA
-    data_dir.mkdir(parents=True, exist_ok=True)
-    
-    print(f"\n  📂 Data directory: {data_dir}")
-    
-    # ── 1. Wikipedia (100K статей) ──
-    wiki_path = data_dir / "wiki_ru.txt"
-    if not wiki_path.exists() or wiki_path.stat().st_size < 100_000:
-        print(f"\n  📚 Wikipedia: скачивание {config['wiki_count']:,} статей...")
-        run([
-            PYTHON, str(TRAINING / "download_wiki.py"),
-            "--count", str(config["wiki_count"]),
-            "--output", str(wiki_path),
-        ], label="Wiki")
-    else:
-        wiki_mb = wiki_path.stat().st_size / (1024 * 1024)
-        print(f"  ✓ Wikipedia: {wiki_mb:.1f} MB (кеш)")
-    
-    # ── 2. HuggingFace datasets (ALL presets) ──
-    # Cache check: только если нет hf_*.txt файлов
-    existing_hf = list(data_dir.glob("hf_*.txt"))
-    total_hf_mb = sum(f.stat().st_size for f in existing_hf) / (1024 * 1024)
-    if not existing_hf or total_hf_mb < 1:
-        print(f"\n  📦 HuggingFace datasets (preset: {args.data_preset})...")
-        run([
-            PYTHON, str(TRAINING / "download_hf_dataset.py"),
-            "--preset", args.data_preset,
-            "--output", str(data_dir),
-        ], label="HF")
-    else:
-        print(f"  ✓ HuggingFace: {len(existing_hf)} файлов, {total_hf_mb:.1f} MB (кеш)")
-    
-    # ── 3. Personality corpus ──
-    personality = data_dir / "tars_personality_mega.txt"
-    if not personality.exists() or personality.stat().st_size < 100_000:
-        print("\n  🧠 Generating personality corpus...")
-        run([PYTHON, str(TRAINING / "generate_tars_corpus.py")], label="Personality")
-    else:
-        print(f"  ✓ Personality: {personality.stat().st_size // 1024} KB (кеш)")
-    
-    # ── 4. Synthetic STEM data ──
-    stem_path = data_dir / "synthetic_stem.jsonl"
-    if not stem_path.exists():
-        print("\n  🔬 Generating synthetic STEM data...")
-        run([PYTHON, str(TRAINING / "generate_synthetic.py")], label="STEM")
-    else:
-        print(f"  ✓ STEM data: {stem_path.stat().st_size // 1024} KB (кеш)")
-    
-    # ── 5. HuggingFace Mamba-2 pretrained weights ──
-    pretrained_dir = MODELS / "pretrained" / "mamba2-130m"
-    if not pretrained_dir.exists() or not list(pretrained_dir.glob("*.safetensors")):
-        print("\n  🧠 Downloading pretrained Mamba-2 base weights (state-spaces/mamba2-130m)...")
-        try:
-            from huggingface_hub import snapshot_download
-            snapshot_download(
-                "state-spaces/mamba2-130m",
-                local_dir=str(pretrained_dir),
-                ignore_patterns=["*.bin", "*.msgpack"],
-            )
-            print(f"  ✅ Pretrained Mamba-2 saved: {pretrained_dir}")
-        except Exception as e:
-            print(f"  ⚠ HF Mamba-2 download failed (training from scratch): {e}")
-            print(f"    pip install huggingface_hub — для загрузки базовых весов")
-    else:
-        print(f"  ✓ Pretrained Mamba-2: {pretrained_dir} (кеш)")
-    
-    # ── 6. Show data summary ──
-    total_mb = 0
-    file_count = 0
-    print(f"\n  {'─' * 50}")
-    print(f"  📁 Файлы данных в {data_dir}:")
-    for f in sorted(data_dir.glob("*.txt")) + sorted(data_dir.glob("*.jsonl")):
-        mb = f.stat().st_size / (1024 * 1024)
-        if mb > 0.01:
-            total_mb += mb
-            file_count += 1
-            print(f"    {f.name:40s} {mb:8.1f} MB")
-    
-    # Sharded data
-    for shard_dir in sorted(data_dir.glob("shards_*")):
-        if shard_dir.is_dir():
-            shard_files = list(shard_dir.glob("shard_*.txt"))
-            shard_mb = sum(f.stat().st_size for f in shard_files) / (1024 * 1024)
-            total_mb += shard_mb
-            file_count += len(shard_files)
-            print(f"    {shard_dir.name + '/':40s} {shard_mb:8.1f} MB ({len(shard_files)} shards)")
-    
-    print(f"  {'─' * 50}")
-    print(f"  Итого: {file_count} файлов, {total_mb:.1f} MB ({total_mb / 1024:.2f} GB)")
-    
-    # If data_dir is not default, symlink to data/ for train scripts
-    if args.data_dir and Path(args.data_dir).resolve() != DATA.resolve():
-        print(f"\n  🔗 Данные в {args.data_dir} — скрипты будут использовать --data_dir")
-    
-    return total_mb
-
-
-# ═══════════════════════════════════════════
-# 7. Google Drive Integration (AUTO)
-# ═══════════════════════════════════════════
-
-# Глобальный флаг — подключён ли GDrive в этом сеансе
-gdrive_connected = False
-
-
-def gdrive_check_and_prompt():
-    """Проверить подключение к GDrive.
-    
-    Если не подключён — спросить пользователя, хочет ли подключить.
-    Вызывается АВТОМАТИЧЕСКИ при старте обучения.
-    """
-    global gdrive_connected
-    
-    setup_script = ROOT / "setup_gdrive.py"
-    if not setup_script.exists():
-        print("  ⚠ setup_gdrive.py не найден — GDrive пропущен")
-        return False
-    
-    # Проверить, есть ли rclone и настроен ли remote
-    import subprocess as sp
-    try:
-        r = sp.run(
-            [PYTHON, str(setup_script), "status"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if r.returncode == 0:
-            print("  ☁️  Google Drive: подключён ✅")
-            gdrive_connected = True
-            return True
-    except Exception:
-        pass
-    
-    # GDrive не подключён — спросить пользователя
-    print()
-    print("  ┌─────────────────────────────────────────────────────┐")
-    print("  │  ☁️  Google Drive НЕ подключён                      │")
-    print("  │                                                     │")
-    print("  │  Подключение позволит:                              │")
-    print("  │  • Скачать данные для обучения с Drive              │")
-    print("  │  • Автоматически выгружать модели после обучения    │")
-    print("  │  • Видеть прогресс обучения на Drive в реальном     │")
-    print("  │    времени                                          │")
-    print("  └─────────────────────────────────────────────────────┘")
-    print()
-    
-    try:
-        answer = input("  Подключить Google Drive? [Y/n]: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        answer = "n"
-    
-    if answer in ("", "y", "yes", "д", "да"):
-        print()
-        print("  🔧 Запускаю настройку Google Drive...")
-        print("     (Следуйте инструкциям в терминале)")
-        print()
-        ok = run([PYTHON, str(setup_script), "setup"], label="GDrive Setup")
-        if ok:
-            gdrive_connected = True
-            print("  ✅ Google Drive подключён!")
-            return True
+    consolidated = []
+    for name, (src, dst) in copies.items():
+        if src.exists():
+            shutil.copy2(str(src), str(dst))
+            mb = dst.stat().st_size / 1024 / 1024
+            print(f"  📦 {name}: → tars_v3/{dst.name} ({mb:.1f} MB)")
+            consolidated.append(name)
         else:
-            print("  ⚠ Не удалось подключить Drive — продолжаю без него")
-            return False
-    else:
-        print("  ⏭ Пропускаю Google Drive (можно подключить позже)")
-        print("     python setup_gdrive.py setup")
-        return False
+            print(f"  ⏭ {name}: не найден")
 
+    # config.json
+    mc = {"d_model": cfg["d_model"], "n_layers": cfg["n_layers"], "vocab_size": 256,
+          "d_state": 64, "headdim": 64, "omega_dim": 32, "pool_size": 48, "n_experts": 8}
+    for pt_name in ["mamba2.pt", "mamba2_158bit.pt"]:
+        pt = TARS_V3 / pt_name
+        if pt.exists():
+            try:
+                import torch
+                ck = torch.load(str(pt), map_location="cpu", weights_only=False)
+                c = ck.get("config", {})
+                mc.update({k: c[k] for k in ["d_model", "n_layers", "vocab_size"] if k in c})
+                del ck
+                break
+            except Exception:
+                pass
+    cj = {"name": "tars_v3", "version": "3.0", "encoding": "cp1251",
+          "models": {"mamba2": {"params": mc}}}
+    (TARS_V3 / "config.json").write_text(json.dumps(cj, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def gdrive_sync():
-    """Синхронизировать данные с Google Drive → data/."""
-    if not gdrive_connected:
-        return False
-    
-    print("\n  ☁️  Google Drive: синхронизация данных...")
-    
-    setup_script = ROOT / "setup_gdrive.py"
-    ok = run([PYTHON, str(setup_script), "sync"], label="GDrive Sync")
-    if ok:
-        print("  ✅ Данные с Drive синхронизированы → data/")
-    return ok
-
-
-def gdrive_backup():
-    """Выгрузить модели на Google Drive (rclone copy, неразрушающий)."""
-    if not gdrive_connected:
-        return False
-    
-    print("\n  ☁️  Google Drive: выгрузка моделей...")
-    
-    setup_script = ROOT / "setup_gdrive.py"
-    if not setup_script.exists():
-        return False
-    
-    ok = run([PYTHON, str(setup_script), "sync-models"], label="GDrive Backup")
-    if ok:
-        print("  ✅ Модели выгружены на Google Drive")
-        print("     Проверьте: Google Drive → TarsLocalModels/")
-    return ok
-
-
-def gdrive_sync_memory():
-    """Синхронизировать LEANN память + embeddings с Google Drive."""
-    if not gdrive_connected:
-        return False
-    
-    setup_script = ROOT / "setup_gdrive.py"
-    if not setup_script.exists():
-        return False
-    
-    ok = run([PYTHON, str(setup_script), "sync-memory"], label="GDrive Memory")
-    if ok:
-        print("  ✅ Память синхронизирована с Google Drive")
-        print("     Проверьте: Google Drive → TarsMemory/")
-    return ok
-
-
-def gdrive_backup_if_enabled():
-    """Промежуточный бэкап — вызывается АВТОМАТИЧЕСКИ после ключевых фаз."""
-    if gdrive_connected:
-        gdrive_backup()
-        gdrive_sync_memory()
-
+    # Training log
+    entry = {"timestamp": datetime.now().isoformat(), "total_time_sec": round(total_time, 1),
+             "results": {k: ("ok" if v else "failed") for k, v in results.items()},
+             "config": mc}
+    lp = TARS_V3 / "training_log.json"
+    logs = []
+    if lp.exists():
+        try: logs = json.loads(lp.read_text(encoding="utf-8"))
+        except Exception: pass
+    if not isinstance(logs, list): logs = []
+    logs.append(entry)
+    lp.write_text(json.dumps(logs, ensure_ascii=False, indent=2), encoding="utf-8")
+    return True
 
 # ═══════════════════════════════════════════
-# 8. Main Pipeline
+# 10. MAIN PIPELINE
 # ═══════════════════════════════════════════
 
 def main():
-    # Detect hardware
-    gpu_name, vram_gb, device, bf16 = detect_gpu()
-    ram_gb = get_ram_gb()
-    
-    config = get_config(vram_gb, ram_gb, force_1b=args.one_billion)
+    global CUDA_ENV
+
+    # ── Бенчмарк железа (~5 сек) ──
+    print()
+    print("═" * 65)
+    print("  ⚙️  ТАРС v3 — ТЕСТИРОВАНИЕ ЖЕЛЕЗА...")
+    print("═" * 65)
+    print()
+    hw = benchmark_hardware()
+    print_hw_report(hw)
+
+    device = hw["device"]
+    bf16 = hw["bf16"]
+
+    # Интерактивный выбор
+    drive_mode, level = interactive_menu()
+
+    # Конфигурация на основе бенчмарка
+    cfg = get_config(level, hw)
     state = load_state()
-    
-    # ── Google Drive: авто-проверка и подключение ──
-    # Запрашивает подключение ПЕРЕД началом обучения
-    if not args.phase:  # Не спрашиваем если запуск конкретной фазы
-        gdrive_check_and_prompt()
-    elif args.gdrive:
-        gdrive_check_and_prompt()
-    
+    CUDA_ENV = setup_cuda_env(device, cfg)
+
+    # Google Drive
+    drive_ok = False
+    if drive_mode != "none":
+        drive_ok = setup_drive(drive_mode)
+
     # Banner
     print()
     print("═" * 65)
-    print("  🤖 ТАРС v3 — LOCAL TRAINING (MAX POWER)")
+    print("  🤖 ТАРС v3 — УНИВЕРСАЛЬНОЕ ОБУЧЕНИЕ")
     print("═" * 65)
     print()
-    print(f"  🎮 GPU:    {gpu_name or 'CPU'}")
-    print(f"  💾 VRAM:   {vram_gb:.1f} GB")
-    print(f"  🧠 RAM:    {ram_gb:.0f} GB")
-    print(f"  📐 Model:  {config['name']} ({config['d_model']}d × {config['n_layers']}L)")
-    print(f"  📦 Batch:  {config['batch']} × {config['accum']} = {config['batch'] * config['accum']} effective")
-    print(f"  📏 SeqLen: {config['seq_len_start']} → {config['seq_len_mid']} → {config['seq_len_max']}")
-    print(f"  ⚡ bf16:   {'Yes' if bf16 else 'No'}")
-    if config.get("use_muon"):
-        print(f"  🚀 Muon:   Yes (2x faster optimizer)")
-    if config.get("use_wsd"):
-        print(f"  📈 WSD:    Yes (Warmup-Stable-Decay scheduler)")
-    print(f"  📁 Data:   {args.data_dir or str(DATA)}")
-    if gdrive_connected:
-        print(f"  ☁️  GDrive: ON (авто-синхронизация + авто-бэкап)")
-    else:
-        print(f"  ☁️  GDrive: OFF")
-    if args.resume:
-        print(f"  🔄 Resume: from checkpoint")
-        if state.get("completed_phases"):
-            print(f"     Done:   {state['completed_phases']}")
+    print(f"  📐 Model:   {cfg['name']}")
+    print(f"  📦 Batch:   {cfg['batch']} × {cfg['accum']} = {cfg['batch'] * cfg['accum']} effective")
+    print(f"  📏 SeqLen:  {cfg['seq_start']} → {cfg['seq_mid']} → {cfg['seq_max']}")
+    print(f"  ⚡ AMP:     {cfg['amp_dtype']}")
+    print(f"  📊 Уровень: {level.upper()}")
+    print(f"  💾 Диск:    {drive_mode}")
+    if cfg.get("use_compile"):
+        print(f"  🔧 Compile: Да (+30% speed)")
+    if cfg.get("use_muon"):
+        print(f"  🚀 Muon:    Да (2x faster)")
+    if cfg.get("use_wsd"):
+        print(f"  📈 WSD:     Да")
+    if cfg.get("num_workers", 0) > 0:
+        print(f"  🔄 Workers: {cfg['num_workers']} (pin_memory={cfg['pin_memory']})")
+    if args.resume and state.get("completed_phases"):
+        print(f"  🔄 Resume:  {state['completed_phases']}")
     print()
-    
-    # ── Estimate total params ──
-    est_params = config["d_model"] ** 2 * config["n_layers"] * 12
-    print(f"  📊 ~{est_params / 1e6:.0f}M parameters")
-    est_size_mb = est_params * 2 / (1024 * 1024)  # fp16
-    print(f"  💿 ~{est_size_mb:.0f} MB model size (fp16)")
-    est_vram = est_size_mb * 4 / 1024  # ~4x for training (model + grads + optimizer + activations)
-    print(f"  ⚙️  ~{est_vram:.1f} GB VRAM needed (training)")
+
+    est_params = cfg["d_model"] ** 2 * cfg["n_layers"] * 12
+    print(f"  📊 ~{est_params / 1e6:.0f}M параметров")
     print()
     print("─" * 65)
-    
+
     t0 = time.time()
     results = {}
-    
-    # ── Google Drive: синхронизация данных (ДО обучения) ──
-    if gdrive_connected:
-        ok = gdrive_sync()
-        results["gdrive_sync"] = ok
-        if not ok:
-            print("  ⚠ Не удалось синхронизировать — продолжаю с локальными данными")
-    
-    def should_run(phase_num):
-        """Проверить, нужно ли запускать фазу."""
-        return args.phase is None or args.phase == phase_num
-    
-    # ══════════════════════════════════════════════════
-    # Phase 0: Install dependencies
-    # ══════════════════════════════════════════════════
+
+    def should_run(phase):
+        return args.phase is None or args.phase == phase
+
+    # Drive sync
+    if drive_ok:
+        drive_sync_data(drive_mode)
+
+    # ═══ Phase 0: Dependencies ═══
     if should_run(0):
-        print("\n  📦 Phase 0: Dependencies...")
-        results["deps"] = run([PYTHON, "mega_train.py", "--phase", "0"], label="deps")
-    
-    # ══════════════════════════════════════════════════
-    # Phase 1: Download ALL data
-    # ══════════════════════════════════════════════════
+        print("\n  📦 Phase 0: Зависимости...")
+        # Проверка ключевых пакетов
+        missing = []
+        for pkg in ["torch", "numpy", "einops", "tqdm", "datasets", "transformers", "psutil"]:
+            try:
+                __import__(pkg.replace("-", "_"))
+            except ImportError:
+                missing.append(pkg)
+        if missing:
+            print(f"  📦 Установка: {', '.join(missing)}")
+            run([PYTHON, "-m", "pip", "install"] + missing + ["--quiet"], label="pip")
+        else:
+            print("  ✅ Все зависимости установлены")
+        results["deps"] = True
+
+    # ═══ Phase 1: Download ═══
     if not args.skip_download and (should_run(1) or args.download_only):
-        print(f"\n  📚 Phase 1: Download ALL data (preset: {args.data_preset})...")
-        data_mb = download_all_data(config)
+        print(f"\n  📚 Phase 1: Скачивание данных (preset: {args.data_preset})...")
+        data_mb = download_all_data(cfg)
         results["download"] = data_mb > 1
-        
         if args.download_only:
-            elapsed = time.time() - t0
-            print(f"\n  ✅ Данные скачаны за {elapsed/60:.0f} минут ({data_mb:.0f} MB)")
+            print(f"\n  ✅ Данные скачаны за {(time.time()-t0)/60:.0f} мин ({data_mb:.0f} MB)")
             return
-    
-    # ══════════════════════════════════════════════════
-    # Phase 2: Reflex classifier
-    # ══════════════════════════════════════════════════
+
+    # ═══ Phase 2: Reflex ═══
     if should_run(2) and not is_done(state, "reflex"):
-        print("\n  🔁 Phase 2: Reflex classifier (100 epochs)...")
-        ok = run([PYTHON, "mega_train.py", "--phase", "2"], label="Reflex")
+        print(f"\n  🔁 Phase 2: Рефлекс-классификатор ({cfg['reflex_ep']} epochs)...")
+        ok = run([PYTHON, str(TRAINING / "train_reflex.py"),
+                  "--epochs", str(cfg["reflex_ep"]), "--lr", "0.002"], label="Reflex")
         results["reflex"] = ok
-        if ok:
-            mark_done(state, "reflex")
-    
-    # ══════════════════════════════════════════════════
-    # Phase 2.5: RRN Spine routing
-    # ══════════════════════════════════════════════════
+        if ok: mark_done(state, "reflex")
+
+    # ═══ Phase 2.5: RRN ═══
     if should_run(2) and not is_done(state, "rrn"):
-        print("\n  🦴 Phase 2.5: RRN Spine routing (50 epochs)...")
-        rrn_cmd = [
-            PYTHON, str(TRAINING / "train_rrn.py"),
-            "--epochs", "50",
-            "--brain_dim", str(config["d_model"]),
-            "--lr", "0.002",
-            "--batch", "32",
-        ]
-        ok = run(rrn_cmd, label="RRN")
+        print(f"\n  🦴 Phase 2.5: RRN маршрутизация ({cfg['rrn_ep']} epochs)...")
+        ok = run([PYTHON, str(TRAINING / "train_rrn.py"),
+                  "--epochs", str(cfg["rrn_ep"]),
+                  "--brain_dim", str(cfg["d_model"]),
+                  "--lr", "0.002", "--batch", "32"], label="RRN")
         results["rrn"] = ok
-        if ok:
-            mark_done(state, "rrn")
-    
-    # ══════════════════════════════════════════════════
-    # Phase 3: MinGRU LM
-    # ══════════════════════════════════════════════════
+        if ok: mark_done(state, "rrn")
+
+    # ═══ Phase 3: MinGRU ═══
     if should_run(3) and not is_done(state, "mingru"):
-        print("\n  🧪 Phase 3: MinGRU LM (25 epochs)...")
-        cmd = [
-            PYTHON, str(TRAINING / "train_mingru.py"),
-            "--dim", "512", "--layers", "6",
-            "--epochs", "25",
-        ]
-        ok = run(cmd, label="MinGRU")
+        print(f"\n  🧪 Phase 3: MinGRU ({cfg['mingru_dim']}d×{cfg['mingru_layers']}L, {cfg['mingru_ep']}ep)...")
+        ok = run([PYTHON, str(TRAINING / "train_mingru.py"),
+                  "--dim", str(cfg["mingru_dim"]),
+                  "--layers", str(cfg["mingru_layers"]),
+                  "--epochs", str(cfg["mingru_ep"]), "--augment"], label="MinGRU")
         results["mingru"] = ok
-        if ok:
-            mark_done(state, "mingru")
-    
-    # ══════════════════════════════════════════════════
-    # Phase 3.5: SNN Spiking Synapses
-    # ══════════════════════════════════════════════════
-    if (should_run(3) or (args.phase is None)) and not is_done(state, "spiking"):
-        print("\n  ⚡ Phase 3.5: SNN Spiking Synapses (30 epochs)...")
-        snn_cmd = [
-            PYTHON, str(TRAINING / "train_spiking.py"),
-            "--dim", "256", "--heads", "4",
-            "--beta", "0.9", "--epochs", "30",
-            "--batch", "32", "--seq_len", "128",
-            "--lr", "3e-4",
-            "--device", device,
-        ]
-        if args.data_dir:
-            snn_cmd += ["--data_dir", args.data_dir]
-        if args.resume:
-            snn_cmd += ["--resume"]
-        
+        if ok: mark_done(state, "mingru")
+
+    # ═══ Phase 3.5: SNN ═══
+    if (should_run(3) or args.phase is None) and not is_done(state, "spiking"):
+        print(f"\n  ⚡ Phase 3.5: SNN ({cfg['snn_dim']}d×{cfg['snn_heads']}H, {cfg['snn_ep']}ep)...")
+        snn_cmd = [PYTHON, str(TRAINING / "train_spiking.py"),
+                   "--dim", str(cfg["snn_dim"]), "--heads", str(cfg["snn_heads"]),
+                   "--beta", "0.9", "--epochs", str(cfg["snn_ep"]),
+                   "--batch", str(cfg["snn_batch"]), "--seq_len", str(cfg["snn_seq"]),
+                   "--lr", "3e-4", "--device", device]
+        if args.data_dir: snn_cmd += ["--data_dir", args.data_dir]
+        if args.resume: snn_cmd += ["--resume"]
         ok = run(snn_cmd, label="SNN")
         results["spiking"] = ok
-        if ok:
-            mark_done(state, "spiking")
-    
-    # ══════════════════════════════════════════════════
-    # Phase 4: Mamba-2 Brain — THE MAIN EVENT
-    # ══════════════════════════════════════════════════
-    for mamba_phase in [1, 2, 3, 4]:
-        phase_key = f"mamba_p{mamba_phase}"
-        if not should_run(4):
+        if ok: mark_done(state, "spiking")
+
+    # ═══ Phase 4: Mamba-2 Brain ═══
+    mamba_seq = [cfg["seq_start"], cfg["seq_mid"], cfg["seq_max"], cfg["seq_max"]]
+    mamba_names = {1: "Full Pretrain (SSD+WKV+Ω-SSM+MoLE)",
+                   2: "WKV + Fusion Fine-tune",
+                   3: "MoLE + MatrixPool + WaveMerge",
+                   4: "RAG + Memory + NoveltyGate"}
+    for mp in [1, 2, 3, 4]:
+        pk = f"mamba_p{mp}"
+        if not should_run(4): continue
+        if is_done(state, pk):
+            print(f"\n  ⏭ Phase 4.{mp}: уже выполнена")
             continue
-        if is_done(state, phase_key):
-            print(f"\n  ⏭ Phase 4.{mamba_phase}: already done")
-            continue
-        
-        phase_names = {
-            1: "Full Pretrain (SSD + WKV + Ω-SSM + MoLE)",
-            2: "WKV + Fusion Fine-tune (SSD frozen)",
-            3: "MoLE + MatrixPool + WaveMerge",
-            4: "RAG + Memory + NoveltyGate",
-        }
-        
-        print(f"\n  🧠 Phase 4.{mamba_phase}: {phase_names[mamba_phase]}...")
-        print(f"     {config['d_model']}d × {config['n_layers']}L, "
-              f"batch={config['batch']}×{config['accum']}")
-        
-        # Transfer embedding from MinGRU for Phase 1
-        extra = []
-        if mamba_phase == 1:
-            # ── HF pretrained base weights (SSM layers) ──
-            pretrained_dir = MODELS / "pretrained" / "mamba2-130m"
-            if pretrained_dir.exists() and list(pretrained_dir.glob("*.safetensors")):
-                print("     🧠 Loading HF Mamba-2 base weights for initialization...")
-                extra += ["--pretrained", str(pretrained_dir)]
-            
-            # ── MinGRU embedding transfer ──
-            emb_path = ROOT / "models" / "tars_v3" / "_transfer_embedding.pt"
-            mingru_path = ROOT / "models" / "mingru_weights.pt"
+        print(f"\n  🧠 Phase 4.{mp}: {mamba_names[mp]}...")
+        print(f"     {cfg['d_model']}d × {cfg['n_layers']}L, "
+              f"batch={cfg['batch']}×{cfg['accum']}, "
+              f"{cfg['mamba_ep'][mp-1]} epochs")
+
+        cmd = [PYTHON, str(TRAINING / "train_mamba2.py"),
+               "--d_model", str(cfg["d_model"]),
+               "--n_layers", str(cfg["n_layers"]),
+               "--vocab_size", "256",
+               "--batch", str(cfg["batch"]),
+               "--accum_steps", str(cfg["accum"]),
+               "--epochs", str(cfg["mamba_ep"][mp-1]),
+               "--lr", str(cfg["mamba_lr"][mp-1]),
+               "--seq_len", str(mamba_seq[mp-1]),
+               "--phase", str(mp),
+               "--device", device,
+               "--curriculum", "--label_smoothing", "0.1",
+               "--grad_ckpt", "--no_wiki"]
+        # ── AMP: bf16 для Ampere+, fp16 для T4/Turing ──
+        amp = cfg.get("amp_dtype", "fp32")
+        if amp == "bf16": cmd += ["--bf16"]
+        elif amp == "fp16": cmd += ["--fp16"]
+        # ── Оптимизации из бенчмарка ──
+        if cfg.get("use_compile"): cmd += ["--compile"]
+        if cfg.get("use_muon"): cmd += ["--muon"]
+        if cfg.get("use_wsd"): cmd += ["--wsd"]
+        if cfg.get("num_workers", 0) > 0:
+            cmd += ["--num_workers", str(cfg["num_workers"])]
+        if cfg.get("pin_memory"): cmd += ["--pin_memory"]
+        if mp > 1 or args.resume: cmd += ["--resume"]
+        if args.data_dir: cmd += ["--data_dir", args.data_dir]
+
+        # Pretrained weights для Phase 1
+        if mp == 1:
+            pret_dir = MODELS / "pretrained" / "mamba2-130m"
+            if pret_dir.exists() and list(pret_dir.glob("*.safetensors")):
+                cmd += ["--pretrained", str(pret_dir)]
+            # MinGRU embedding transfer
+            emb_path = TARS_V3 / "_transfer_embedding.pt"
+            mingru_path = MODELS / "mingru_weights.pt"
             if mingru_path.exists() and not emb_path.exists():
-                print("     🔗 Transferring MinGRU embedding...")
                 try:
                     import torch
-                    ckpt = torch.load(str(mingru_path), map_location='cpu', weights_only=False)
-                    if 'model_state_dict' in ckpt:
-                        for k, v in ckpt['model_state_dict'].items():
+                    ck = torch.load(str(mingru_path), map_location='cpu', weights_only=False)
+                    if 'model_state_dict' in ck:
+                        for k, v in ck['model_state_dict'].items():
                             if 'token_emb' in k or 'embedding' in k:
                                 emb_path.parent.mkdir(parents=True, exist_ok=True)
                                 torch.save(v, str(emb_path))
-                                print(f"     ✅ Embedding saved: {v.shape}")
+                                print(f"     🔗 Embedding transferred: {v.shape}")
                                 break
-                except Exception as e:
-                    print(f"     ⚠ Embedding transfer: {e}")
-            
+                except Exception:
+                    pass
             if emb_path.exists():
-                extra += ["--pretrained_emb", str(emb_path)]
-        
-        ok = train_mamba_phase(mamba_phase, config, device, bf16, extra)
-        results[phase_key] = ok
-        
+                cmd += ["--pretrained_emb", str(emb_path)]
+
+        ok = run(cmd, label=f"Mamba P{mp}")
+        results[pk] = ok
         if ok:
-            mark_done(state, phase_key)
-            print(f"  ✅ Phase 4.{mamba_phase} done")
+            mark_done(state, pk)
         else:
-            print(f"  ⚠️ Phase 4.{mamba_phase} failed → run with --resume to retry")
+            print(f"  ⚠️ Phase 4.{mp} failed → --resume для повтора")
             break
-    
-    # ── Промежуточный бэкап после Mamba-2 ──
-    gdrive_backup_if_enabled()
-    
-    # ── Phase 4.5: PersonalityAdapter ──
+
+    # Drive backup after Mamba-2
+    if drive_ok: drive_backup(drive_mode)
+
+    # ═══ Phase 4.5: Personality ═══
     if should_run(4) and not is_done(state, "personality"):
-        print(f"\n  🎭 Phase 4.5: PersonalityAdapter ({config['epochs_p5']} epochs)...")
-        ok = train_mamba_phase(5, config, device, bf16)
+        print(f"\n  🎭 Phase 4.5: PersonalityAdapter ({cfg['personality_ep']} epochs)...")
+        cmd = [PYTHON, str(TRAINING / "train_mamba2.py"),
+               "--d_model", str(cfg["d_model"]), "--n_layers", str(cfg["n_layers"]),
+               "--vocab_size", "256", "--batch", str(cfg["batch"]),
+               "--accum_steps", str(cfg["accum"]),
+               "--epochs", str(cfg["personality_ep"]),
+               "--lr", "5e-5", "--seq_len", str(cfg["seq_mid"]),
+               "--phase", "5", "--device", device,
+               "--curriculum", "--label_smoothing", "0.1",
+               "--grad_ckpt", "--resume", "--no_wiki"]
+        if bf16: cmd += ["--bf16"]
+        if args.data_dir: cmd += ["--data_dir", args.data_dir]
+        ok = run(cmd, label="Personality")
         results["personality"] = ok
-        if ok:
-            mark_done(state, "personality")
-    
-    # ── Phase 4.6: Second Pass (longer context) ──
+        if ok: mark_done(state, "personality")
+
+    # ═══ Phase 4.6: Second Pass ═══
     if should_run(4) and not is_done(state, "second_pass"):
-        epochs_2nd = config.get("second_pass_epochs", 5)
-        print(f"\n  🔄 Phase 4.6: Second Pass (seq_len={config['seq_len_max']}, "
-              f"{epochs_2nd} epochs)...")
-        cmd = [
-            PYTHON, str(TRAINING / "train_mamba2.py"),
-            "--d_model", str(config["d_model"]),
-            "--n_layers", str(config["n_layers"]),
-            "--vocab_size", "256",
-            "--batch", str(config["batch"]),
-            "--accum_steps", str(config["accum"]),
-            "--epochs", str(epochs_2nd),
-            "--lr", "5e-5",
-            "--seq_len", str(config["seq_len_max"]),
-            "--phase", "1",
-            "--device", device,
-            "--curriculum",
-            "--label_smoothing", "0.05",
-            "--grad_ckpt",
-            "--resume",
-            "--no_wiki",  # Wikipedia скачивается в Phase 1, не при обучении
-        ]
-        if bf16:
-            cmd += ["--bf16"]
-        if config.get("use_muon"):
-            cmd += ["--muon"]
-        if config.get("use_wsd"):
-            cmd += ["--wsd"]
-        if args.data_dir:
-            cmd += ["--data_dir", args.data_dir]
-        
+        print(f"\n  🔄 Phase 4.6: Second Pass (seq={cfg['seq_max']}, {cfg['second_pass_ep']}ep)...")
+        cmd = [PYTHON, str(TRAINING / "train_mamba2.py"),
+               "--d_model", str(cfg["d_model"]), "--n_layers", str(cfg["n_layers"]),
+               "--vocab_size", "256", "--batch", str(cfg["batch"]),
+               "--accum_steps", str(cfg["accum"]),
+               "--epochs", str(cfg["second_pass_ep"]),
+               "--lr", "5e-5", "--seq_len", str(cfg["seq_max"]),
+               "--phase", "1", "--device", device,
+               "--curriculum", "--label_smoothing", "0.05",
+               "--grad_ckpt", "--resume", "--no_wiki"]
+        if bf16: cmd += ["--bf16"]
+        if cfg.get("use_muon"): cmd += ["--muon"]
+        if cfg.get("use_wsd"): cmd += ["--wsd"]
+        if args.data_dir: cmd += ["--data_dir", args.data_dir]
         ok = run(cmd, label="2nd Pass")
         results["second_pass"] = ok
-        if ok:
-            mark_done(state, "second_pass")
-    
-    # ══════════════════════════════════════════════════
-    # Phase 5: Quantize 1.58-bit
-    # ══════════════════════════════════════════════════
+        if ok: mark_done(state, "second_pass")
+
+    # ═══ Phase 5: Quantize 1.58-bit ═══
     if should_run(5) and not is_done(state, "quantize"):
-        print("\n  ⚗️ Phase 5: Quantize 1.58-bit...")
-        ok = run([PYTHON, "mega_train.py", "--phase", "5"], label="Quantize")
+        print("\n  ⚗️ Phase 5: Квантизация 1.58-bit...")
+        fp16 = MODELS / "mamba2" / "mamba2_omega.pt"
+        if fp16.exists():
+            try:
+                import torch
+                ck = torch.load(str(fp16), map_location="cpu", weights_only=False)
+                c = ck.get("config", {})
+                dm = str(c.get("d_model", cfg["d_model"]))
+                nl = str(c.get("n_layers", cfg["n_layers"]))
+                del ck
+            except Exception:
+                dm, nl = str(cfg["d_model"]), str(cfg["n_layers"])
+            ok = run([PYTHON, str(TRAINING / "train_mamba2.py"),
+                      "--d_model", dm, "--n_layers", nl, "--vocab_size", "256",
+                      "--batch", str(cfg["batch"]), "--accum_steps", str(cfg["accum"]),
+                      "--epochs", "3", "--lr", "5e-5", "--phase", "1",
+                      "--quant", "--resume", "--device", device,
+                      "--seq_len", "256", "--label_smoothing", "0.1",
+                      "--no_wiki", "--no_compile"], label="Quantize")
+        else:
+            print("  ⚠ FP16 модель не найдена — пропуск")
+            ok = False
         results["quantize"] = ok
         if ok:
             mark_done(state, "quantize")
-            gdrive_backup_if_enabled()
-    
-    # ══════════════════════════════════════════════════
-    # Phase 6: Consolidate → models/tars_v3/
-    # ══════════════════════════════════════════════════
+            if drive_ok: drive_backup(drive_mode)
+
+    # ═══ Phase 6: Consolidate ═══
     if should_run(6) and not is_done(state, "consolidate"):
-        print("\n  📦 Phase 6: Consolidate...")
-        ok = run([PYTHON, "mega_train.py", "--phase", "6"], label="Consolidate")
+        print("\n  📦 Phase 6: Консолидация моделей...")
+        ok = consolidate_models(cfg, results, time.time() - t0)
         results["consolidate"] = ok
-        if ok:
-            mark_done(state, "consolidate")
-    
-    # ══════════════════════════════════════════════════
-    # Phase 7: Validate
-    # ══════════════════════════════════════════════════
+        if ok: mark_done(state, "consolidate")
+
+    # ═══ Phase 7: Validate ═══
     if should_run(7) and not is_done(state, "validate"):
-        print("\n  ✅ Phase 7: Validate...")
-        ok = run([PYTHON, "mega_train.py", "--phase", "7"], label="Validate")
+        print("\n  ✅ Phase 7: Валидация...")
+        qt = TRAINING / "quick_test.py"
+        if qt.exists():
+            ok = run([PYTHON, str(qt)], label="Validate", timeout=120)
+        else:
+            quick_validate(cfg, device)
+            ok = True
         results["validate"] = ok
-        if ok:
-            mark_done(state, "validate")
-    
-    # ══════════════════════════════════════════════════
-    # Phase 8-10: Voice (Whisper + Piper + Quantize)
-    # ══════════════════════════════════════════════════
+        if ok: mark_done(state, "validate")
+
+    # ═══ Phase 8-10: Voice ═══
     if not args.skip_voice and (should_run(8) or should_run(9) or should_run(10)):
-        print("\n  🎙 Phase 8-10: Voice (Whisper + Piper + INT8)...")
-        
+        print("\n  🎙 Phase 8-10: Голосовые модули...")
         if should_run(8) and not is_done(state, "whisper"):
-            ok = run([PYTHON, "mega_train.py", "--phase", "8"], label="Whisper")
-            if ok:
-                mark_done(state, "whisper")
+            ok = run([PYTHON, str(TRAINING / "train_whisper.py"),
+                      "--device", device, "--epochs", "3", "--batch", "16"], label="Whisper")
+            if ok: mark_done(state, "whisper")
             results["whisper"] = ok
-        
         if should_run(9) and not is_done(state, "piper"):
-            ok = run([PYTHON, "mega_train.py", "--phase", "9"], label="Piper")
-            if ok:
-                mark_done(state, "piper")
+            ok = run([PYTHON, str(TRAINING / "train_piper.py"),
+                      "--epochs", "1000", "--batch", "16"], label="Piper")
+            if ok: mark_done(state, "piper")
             results["piper"] = ok
-        
         if should_run(10) and not is_done(state, "voice_quant"):
-            ok = run([PYTHON, "mega_train.py", "--phase", "10"], label="VoiceQ")
-            if ok:
-                mark_done(state, "voice_quant")
+            run([PYTHON, str(TRAINING / "whisper_boost.py")], label="HotWords")
+            ok = run([PYTHON, str(TRAINING / "quantize_voice.py")], label="VoiceQ")
+            if ok: mark_done(state, "voice_quant")
             results["voice_quant"] = ok
-        
-        # ── Промежуточный бэкап после Voice ──
-        gdrive_backup_if_enabled()
-    
-    # ══════════════════════════════════════════════════
-    # Phase 11: Instruction Tuning
-    # ══════════════════════════════════════════════════
+        if drive_ok: drive_backup(drive_mode)
+
+    # ═══ Phase 11: Instruction Tuning ═══
     if (should_run(11) or args.phase is None) and not is_done(state, "instruct"):
-        print(f"\n  📖 Phase 11: Instruction Tuning ({config.get('epochs_instruct', 3)} epochs)...")
-        ok = train_post_phase(
-            "train_instruct.py", config, device, bf16,
-            "epochs_instruct",
-            extra_args=["--lr", "5e-5"],
-        )
+        print(f"\n  📖 Phase 11: Instruction Tuning ({cfg['instruct_ep']} epochs)...")
+        ok = run([PYTHON, str(TRAINING / "train_instruct.py"),
+                  "--d_model", str(cfg["d_model"]), "--n_layers", str(cfg["n_layers"]),
+                  "--epochs", str(cfg["instruct_ep"]), "--batch", str(cfg["batch"]),
+                  "--device", device, "--save_dir", str(TARS_V3),
+                  "--resume", "--grad_ckpt", "--lr", "5e-5"]
+                 + (["--bf16"] if bf16 else []), label="Instruct")
         results["instruct"] = ok
         if ok:
             mark_done(state, "instruct")
-            gdrive_backup_if_enabled()  # Phase 11 — важная, бэкап сразу
-            quick_validate(config, device)  # Проверка после Instruction Tuning
-    
-    # ══════════════════════════════════════════════════
-    # Phase 12-14: Post-Training (CoT → DPO → RLVR)
-    # ══════════════════════════════════════════════════
+            if drive_ok: drive_backup(drive_mode)
+            quick_validate(cfg, device)
+
+    # ═══ Phase 12-14: Post-Training ═══
     if not args.skip_posttrain:
-        
-        # Phase 12: Chain-of-Thought
+        data_dir = Path(args.data_dir) if args.data_dir else DATA
+
+        # Phase 12: CoT
         if (should_run(12) or args.phase is None) and not is_done(state, "cot"):
-            # Генерация CoT данных (если нет)
-            cot_data = Path(args.data_dir or str(DATA)) / "cot_reasoning.txt"
+            cot_data = data_dir / "cot_reasoning.txt"
             if not cot_data.exists() or cot_data.stat().st_size < 1000:
-                print(f"\n  📝 Phase 12a: Generating CoT training data...")
-                run([
-                    PYTHON, str(TRAINING / "train_cot.py"),
-                    "--generate", "--n_samples", "20000",
-                    "--cot_data", str(cot_data),
-                ], label="CoT-Gen")
-            
-            print(f"\n  🧩 Phase 12b: CoT Training ({config.get('epochs_cot', 5)} epochs)...")
-            ok = train_post_phase(
-                "train_cot.py", config, device, bf16,
-                "epochs_cot",
-                extra_args=["--lr", "3e-5", "--train", "--cot_data", str(cot_data)],
-            )
+                print(f"\n  📝 Phase 12a: Генерация CoT данных...")
+                run([PYTHON, str(TRAINING / "train_cot.py"),
+                     "--generate", "--n_samples", "20000",
+                     "--cot_data", str(cot_data)], label="CoT-Gen")
+            print(f"\n  🧩 Phase 12b: CoT Training ({cfg['cot_ep']} epochs)...")
+            ok = run([PYTHON, str(TRAINING / "train_cot.py"),
+                      "--d_model", str(cfg["d_model"]), "--n_layers", str(cfg["n_layers"]),
+                      "--epochs", str(cfg["cot_ep"]), "--batch", str(cfg["batch"]),
+                      "--device", device, "--save_dir", str(TARS_V3),
+                      "--resume", "--grad_ckpt", "--lr", "3e-5",
+                      "--train", "--cot_data", str(cot_data)]
+                     + (["--bf16"] if bf16 else []), label="CoT")
             results["cot"] = ok
-            if ok:
-                mark_done(state, "cot")
-                quick_validate(config, device)  # Проверка после CoT
-        
-        # Phase 13: DPO (preference alignment)
+            if ok: mark_done(state, "cot")
+
+        # Phase 13: DPO
         if (should_run(13) or args.phase is None) and not is_done(state, "dpo"):
-            dpo_data = Path(args.data_dir or str(DATA)) / "dpo_pairs.jsonl"
-            # Авто-генерация DPO пар если файла нет
+            dpo_data = data_dir / "dpo_pairs.jsonl"
             if not dpo_data.exists() or dpo_data.stat().st_size < 100:
-                print(f"\n  📝 Phase 13a: Generating DPO preference pairs...")
-                _generate_dpo_pairs(dpo_data)
-            
+                print(f"\n  📝 Phase 13a: Генерация DPO пар...")
+                generate_dpo_pairs(dpo_data)
             if dpo_data.exists() and dpo_data.stat().st_size > 100:
-                # VRAM check: DPO загружает 2x модель (policy + ref)
-                vram_needed = estimate_vram_needed(config, "dpo")
-                if vram_gb > 0 and vram_needed > vram_gb * 0.95:
-                    print(f"     ⚠ DPO требует ~{vram_needed:.1f} GB VRAM (есть {vram_gb:.1f} GB)")
-                    print(f"       Попробуйте уменьшить batch или добавить --grad_ckpt")
-                print(f"\n  ⚖️ Phase 13b: DPO ({config.get('epochs_dpo', 3)} epochs)...")
-                ok = train_post_phase(
-                    "train_dpo.py", config, device, bf16,
-                    "epochs_dpo",
-                    extra_args=["--lr", "1e-5", "--data", str(dpo_data)],
-                )
+                print(f"\n  ⚖️ Phase 13b: DPO ({cfg['dpo_ep']} epochs)...")
+                ok = run([PYTHON, str(TRAINING / "train_dpo.py"),
+                          "--d_model", str(cfg["d_model"]), "--n_layers", str(cfg["n_layers"]),
+                          "--epochs", str(cfg["dpo_ep"]), "--batch", str(cfg["batch"]),
+                          "--device", device, "--save_dir", str(TARS_V3),
+                          "--resume", "--grad_ckpt", "--lr", "1e-5",
+                          "--data", str(dpo_data)]
+                         + (["--bf16"] if bf16 else []), label="DPO")
                 results["dpo"] = ok
-                if ok:
-                    mark_done(state, "dpo")
-                    quick_validate(config, device)  # Проверка после DPO
-            else:
-                print(f"\n  ⏭ Phase 13: DPO пропущен (не удалось создать dpo_pairs.jsonl)")
-                results["dpo"] = True  # не блокирует pipeline
-        
-        # Phase 14: RLVR (verifiable rewards)
+                if ok: mark_done(state, "dpo")
+
+        # Phase 14: RLVR
         if (should_run(14) or args.phase is None) and not is_done(state, "rlvr"):
-            print(f"\n  🎯 Phase 14: RLVR ({config.get('epochs_rlvr', 3)} epochs)...")
-            ok = train_post_phase(
-                "train_rlvr.py", config, device, bf16,
-                "epochs_rlvr",
-                extra_args=["--lr", "3e-5"],
-            )
+            print(f"\n  🎯 Phase 14: RLVR ({cfg['rlvr_ep']} epochs)...")
+            ok = run([PYTHON, str(TRAINING / "train_rlvr.py"),
+                      "--d_model", str(cfg["d_model"]), "--n_layers", str(cfg["n_layers"]),
+                      "--epochs", str(cfg["rlvr_ep"]), "--batch", str(cfg["batch"]),
+                      "--device", device, "--save_dir", str(TARS_V3),
+                      "--resume", "--grad_ckpt", "--lr", "3e-5"]
+                     + (["--bf16"] if bf16 else []), label="RLVR")
             results["rlvr"] = ok
-            if ok:
-                mark_done(state, "rlvr")
-    else:
-        print("\n  ⏭ Post-training пропущен (--skip-posttrain)")
-    
-    # ══════════════════════════════════════════════════
-    # Phase 15: Knowledge Distillation (optional)
-    # ══════════════════════════════════════════════════
+            if ok: mark_done(state, "rlvr")
+
+    # ═══ Phase 15: Knowledge Distillation ═══
     if args.distill and (should_run(15) or args.phase is None) and not is_done(state, "distill"):
-        print(f"\n  🎓 Phase 15: Knowledge Distillation ({config.get('epochs_distill', 3)} epochs)...")
-        ok = train_post_phase(
-            "train_distill.py", config, device, bf16,
-            "epochs_distill",
-            extra_args=[
-                "--lr", "1e-4",
-                "--temperature", "3.0",
-                "--alpha", "0.7",
-                "--teacher_model", "Qwen/Qwen2.5-1.5B",
-            ],
-        )
+        print(f"\n  🎓 Phase 15: Knowledge Distillation ({cfg['distill_ep']} epochs)...")
+        ok = run([PYTHON, str(TRAINING / "train_distill.py"),
+                  "--d_model", str(cfg["d_model"]), "--n_layers", str(cfg["n_layers"]),
+                  "--epochs", str(cfg["distill_ep"]), "--batch", str(cfg["batch"]),
+                  "--device", device, "--save_dir", str(TARS_V3),
+                  "--resume", "--grad_ckpt", "--lr", "1e-4",
+                  "--temperature", "3.0", "--alpha", "0.7",
+                  "--teacher_model", "Qwen/Qwen2.5-1.5B"]
+                 + (["--bf16"] if bf16 else []), label="Distill")
         results["distill"] = ok
-        if ok:
-            mark_done(state, "distill")
-    
-    # ══════════════════════════════════════════════════
-    # Results
-    # ══════════════════════════════════════════════════
-    
+        if ok: mark_done(state, "distill")
+
+    # ═══════════════════════════════════════════
+    # РЕЗУЛЬТАТЫ
+    # ═══════════════════════════════════════════
     elapsed = time.time() - t0
-    hours = elapsed / 3600
-    
+    hrs = elapsed / 3600
+
     print()
     print("═" * 65)
-    print(f"  🤖 ТАРС v3 — РЕЗУЛЬТАТЫ ({hours:.1f} часов)")
+    print(f"  🤖 ТАРС v3 — РЕЗУЛЬТАТЫ ({hrs:.1f} часов)")
     print("═" * 65)
     print()
-    
     for name, ok in results.items():
-        icon = "✅" if ok else "❌"
-        print(f"    {icon} {name}")
-    
+        print(f"    {'✅' if ok else '❌'} {name}")
     print()
-    
+
     all_ok = all(results.values()) if results else False
     if all_ok:
         print(f"  🎯 ВСЕ ФАЗЫ ЗАВЕРШЕНЫ!")
-        print(f"  📐 Модель: {config['name']} ({config['d_model']}d × {config['n_layers']}L)")
-        print()
-        
+        print(f"  📐 Модель: {cfg['name']}")
         if TARS_V3.exists():
             total_mb = 0
             for f in sorted(TARS_V3.glob("*.pt")):
@@ -1287,7 +1226,6 @@ def main():
                 print(f"    {f.name}: {mb:.1f} MB")
             print(f"    {'─' * 40}")
             print(f"    Итого: {total_mb:.0f} MB")
-        
         print()
         print("  🚀 Запуск: python launch_tars.py")
     else:
@@ -1295,16 +1233,13 @@ def main():
         if failed:
             print(f"  ⚠️ Ошибки: {', '.join(failed)}")
         print(f"  🔄 Продолжить: python local_train.py --resume")
-    
-    # ── Google Drive: финальный бэкап (АВТО) ──
-    if gdrive_connected:
+
+    # Final Drive backup
+    if drive_ok:
         print()
-        print("  ☁️  Финальная выгрузка моделей на Google Drive...")
-        gdrive_ok = gdrive_backup()
-        results["gdrive_backup"] = gdrive_ok
-        if gdrive_ok:
-            print("  ✅ Все модели на Drive — проверьте Google Drive → tars_training/models/")
-    
+        print("  ☁️  Финальная выгрузка на Drive...")
+        drive_backup(drive_mode)
+
     print()
     print("═" * 65)
 
