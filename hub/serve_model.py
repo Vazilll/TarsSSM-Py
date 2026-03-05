@@ -53,13 +53,13 @@ def _load_model(model_path: str, device: str = "auto"):
     
     logger.info(f"Loading model from {model_path} on {_device}...")
     
-    ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
+    ckpt = torch.load(model_path, map_location='cpu', weights_only=True)
     
     # Extract config
     config = ckpt.get('config', {})
     d_model = config.get('d_model', 2048)
     n_layers = config.get('n_layers', 24)
-    vocab_size = config.get('vocab_size', 256)
+    vocab_size = config.get('vocab_size', 4096)
     
     _model = TarsMamba2LM(
         d_model=d_model,
@@ -75,15 +75,9 @@ def _load_model(model_path: str, device: str = "auto"):
     logger.info(f"Model loaded: d={d_model}, L={n_layers}, V={vocab_size}")
     logger.info(f"Parameters: {sum(p.numel() for p in _model.parameters()):,}")
     
-    # Byte-level tokenizer (trivial)
-    class ByteTokenizer:
-        def encode(self, text: str):
-            return list(text.encode('utf-8', errors='replace'))
-        
-        def decode(self, tokens):
-            return bytes(tokens).decode('utf-8', errors='replace')
-    
-    _tokenizer = ByteTokenizer()
+    # BPE tokenizer (через TarsTokenizer)
+    from brain.tokenizer import TarsTokenizer
+    _tokenizer = TarsTokenizer(mode="auto")
     return _model
 
 
@@ -171,12 +165,14 @@ async def handle_generate(request):
     
     data = await request.json()
     prompt = data.get("prompt", "")
-    max_tokens = data.get("max_tokens", 256)
-    temperature = data.get("temperature", 0.7)
+    max_tokens = min(int(data.get("max_tokens", 256)), 2048)  # ═══ cap ═══
+    temperature = max(0.0, min(float(data.get("temperature", 0.7)), 2.0))  # ═══ clamp ═══
     task_type = data.get("task_type", "chat")
     
     if not prompt:
         return web.json_response({"error": "prompt required"}, status=400)
+    if len(prompt) > 10_000:  # ═══ limit prompt size ═══
+        return web.json_response({"error": "prompt too long (max 10K chars)"}, status=400)
     
     result = _generate(prompt, max_tokens, temperature, task_type)
     return web.json_response(result)
@@ -188,12 +184,14 @@ async def handle_stream(request):
     
     data = await request.json()
     prompt = data.get("prompt", "")
-    max_tokens = data.get("max_tokens", 256)
-    temperature = data.get("temperature", 0.7)
+    max_tokens = min(int(data.get("max_tokens", 256)), 2048)  # ═══ cap ═══
+    temperature = max(0.0, min(float(data.get("temperature", 0.7)), 2.0))  # ═══ clamp ═══
     task_type = data.get("task_type", "chat")
     
     if not prompt:
         return web.json_response({"error": "prompt required"}, status=400)
+    if len(prompt) > 10_000:  # ═══ limit prompt size ═══
+        return web.json_response({"error": "prompt too long (max 10K chars)"}, status=400)
     
     response = web.StreamResponse(
         status=200,

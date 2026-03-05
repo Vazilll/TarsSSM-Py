@@ -83,7 +83,7 @@ class LeannIndex:
     def _get_embedding(self, text: str):
         """Превращение сырого текста в семантический вектор. Returns (int8_vec, scale)."""
         # ═══ CPU-OPT: check LRU cache first ═══
-        cache_key = hashlib.md5(text.encode('utf-8', errors='replace')).hexdigest()
+        cache_key = hashlib.sha256(text.encode('utf-8', errors='replace')).hexdigest()
         if cache_key in self._emb_cache:
             self._emb_cache.move_to_end(cache_key)
             return self._emb_cache[cache_key]
@@ -151,7 +151,12 @@ class LeannIndex:
         self.logger.info(f"LEANN: IVF индекс: {k} кластеров, {n} документов")
 
     def add_document(self, text: str, timestamp: float = 0.0):
-        """Регистрация нового знания в памяти ассистента."""
+        """Регистрация нового знания в памяти ассистента.
+        
+        Incremental IVF: новый документ назначается ближайшему кластеру
+        вместо полной перестройки индекса.
+        Auto-save: каждые 50 новых документов.
+        """
         self.texts.append(text)
         self.timestamps.append(timestamp or time.time())
         emb_q, scale = self._get_embedding(text)
@@ -163,9 +168,124 @@ class LeannIndex:
             self.embeddings = emb_q.reshape(1, -1)
             self.emb_scales = np.array([scale], dtype=np.float32)
         
-        # IVF и BM25 инвалидируются при добавлении
-        self.ivf_centroids = None
+        # ═══ Incremental IVF: assign to nearest cluster ═══
+        if self.ivf_centroids is not None and self.ivf_assignments is not None:
+            # Деквантизация нового вектора
+            new_emb_f32 = emb_q.astype(np.float32) * scale
+            new_norm = np.linalg.norm(new_emb_f32) + 1e-8
+            new_emb_normed = new_emb_f32 / new_norm
+            
+            # Ближайший кластер
+            cluster_scores = self.ivf_centroids @ new_emb_normed
+            best_cluster = int(cluster_scores.argmax())
+            self.ivf_assignments = np.append(self.ivf_assignments, best_cluster)
+            
+            # Полная перестройка каждые 200 документов
+            if len(self.texts) % 200 == 0:
+                self._build_ivf()
+                self.logger.debug(f"IVF rebuilt at {len(self.texts)} docs")
+        else:
+            # Если IVF ещё не построен и достаточно документов — построить
+            if (self.embeddings is not None and 
+                len(self.embeddings) >= self.ivf_n_clusters * 2):
+                self._build_ivf()
+        
+        # BM25 нужно обновить
         self._bm25_dirty = True
+        
+        # ═══ Auto-save: каждые 50 новых документов ═══
+        if len(self.texts) % 50 == 0:
+            try:
+                self.save()
+                self.logger.debug(f"Auto-saved at {len(self.texts)} docs")
+            except Exception as e:
+                self.logger.warning(f"Auto-save failed: {e}")
+    
+    def remove_document(self, index: int) -> bool:
+        """Remove a document by index. Rebuilds BM25 and invalidates IVF.
+        
+        Args:
+            index: Index of the document to remove (0-based)
+        Returns:
+            True if removed, False if index out of range
+        """
+        if index < 0 or index >= len(self.texts):
+            return False
+        
+        # Remove from texts and timestamps
+        removed_text = self.texts.pop(index)
+        if index < len(self.timestamps):
+            self.timestamps.pop(index)
+        
+        # Remove from embeddings
+        if self.embeddings is not None and index < len(self.embeddings):
+            self.embeddings = np.delete(self.embeddings, index, axis=0)
+            self.emb_scales = np.delete(self.emb_scales, index)
+        
+        # Invalidate IVF (rebuild needed)
+        if self.ivf_assignments is not None:
+            self.ivf_assignments = np.delete(self.ivf_assignments, index)
+            # Full rebuild if significant portion removed
+            if len(self.texts) > self.ivf_n_clusters * 2:
+                self._build_ivf()
+        
+        # Force BM25 rebuild
+        self._bm25_dirty = True
+        self._bm25 = None
+        
+        # Clear embedding cache (it may reference removed text)
+        self._emb_cache.clear()
+        
+        self.logger.info(f"LEANN: Removed doc #{index}: '{removed_text[:40]}...'")
+        return True
+    
+    def _get_embeddings_batch(self, texts: List[str]) -> List[tuple]:
+        """Batch embedding: process multiple texts in a single forward pass.
+        
+        Significantly faster than calling _get_embedding() one by one
+        when adding multiple documents.
+        
+        Returns:
+            List of (int8_vec, scale) tuples
+        """
+        if not texts:
+            return []
+        
+        if self.model:
+            # Single batched forward pass
+            embs = self.model.encode(texts, batch_size=min(32, len(texts))).astype(np.float32)
+        else:
+            # TF-IDF fallback (can't batch, but fast anyway)
+            embs = []
+            for text in texts:
+                words = text.lower().split()
+                emb = np.zeros(384, dtype=np.float32)
+                for w in words:
+                    idx = hash(w) % 384
+                    emb[idx] += 1.0
+                norm = np.linalg.norm(emb)
+                if norm > 0:
+                    emb = emb / norm
+                embs.append(emb)
+            embs = np.array(embs, dtype=np.float32)
+        
+        # Quantize each vector to int8
+        results = []
+        for i in range(len(embs)):
+            emb = embs[i]
+            scale = np.abs(emb).max() / 127.0
+            if scale < 1e-8:
+                scale = 1e-8
+            emb_q = np.clip(np.round(emb / scale), -128, 127).astype(np.int8)
+            results.append((emb_q, np.float32(scale)))
+            
+            # Also cache
+            cache_key = hashlib.sha256(texts[i].encode('utf-8', errors='replace')).hexdigest()
+            self._emb_cache[cache_key] = results[-1]
+            if len(self._emb_cache) > self._emb_cache_max:
+                self._emb_cache.popitem(last=False)
+        
+        return results
 
     def _ensure_bm25(self):
         """Построить BM25 индекс если нужно (лениво)."""
@@ -320,31 +440,62 @@ class LeannIndex:
         return results[:top_k]
 
     def save(self):
-        """Фиксация памяти на диске (int8 + IVF)."""
+        """Atomic save: writes to .tmp then renames, keeping .bak backup.
+        
+        Prevents data corruption if TARS crashes mid-write.
+        """
+        import shutil
         os.makedirs(os.path.dirname(self.index_path) or ".", exist_ok=True)
         
         npz_path = self.index_path.replace(".index", ".npz")
         texts_path = self.index_path.replace(".index", ".texts.json")
+        npz_tmp = npz_path + ".tmp"
+        texts_tmp = texts_path + ".tmp"
         
         # Построить IVF перед сохранением
         if self.ivf_centroids is None and self.embeddings is not None:
             self._build_ivf()
         
-        if self.embeddings is not None:
-            save_dict = {
-                'embeddings': self.embeddings,
-                'scales': self.emb_scales,
-            }
-            if self.ivf_centroids is not None:
-                save_dict['ivf_centroids'] = self.ivf_centroids
-                save_dict['ivf_assignments'] = self.ivf_assignments
-            # Сохраняем timestamps
-            if self.timestamps:
-                save_dict['timestamps'] = np.array(self.timestamps, dtype=np.float64)
-            np.savez_compressed(npz_path, **save_dict)
-        
-        with open(texts_path, 'w', encoding='utf-8') as f:
-            json.dump(self.texts, f, ensure_ascii=False)
+        try:
+            # Write to temp files first
+            if self.embeddings is not None:
+                save_dict = {
+                    'embeddings': self.embeddings,
+                    'scales': self.emb_scales,
+                }
+                if self.ivf_centroids is not None:
+                    save_dict['ivf_centroids'] = self.ivf_centroids
+                    save_dict['ivf_assignments'] = self.ivf_assignments
+                if self.timestamps:
+                    save_dict['timestamps'] = np.array(self.timestamps, dtype=np.float64)
+                np.savez_compressed(npz_tmp, **save_dict)
+            
+            with open(texts_tmp, 'w', encoding='utf-8') as f:
+                json.dump(self.texts, f, ensure_ascii=False)
+            
+            # Backup existing files
+            for path in [npz_path, texts_path]:
+                if os.path.exists(path):
+                    bak_path = path + ".bak"
+                    try:
+                        shutil.copy2(path, bak_path)
+                    except OSError:
+                        pass  # Non-critical: backup is best-effort
+            
+            # Atomic rename (on same filesystem this is atomic)
+            if os.path.exists(npz_tmp):
+                shutil.move(npz_tmp, npz_path)
+            shutil.move(texts_tmp, texts_path)
+            
+        except Exception as e:
+            # Cleanup temp files on failure
+            for tmp in [npz_tmp, texts_tmp]:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except OSError:
+                    pass
+            raise  # Re-raise so caller knows save failed
 
     def load(self):
         """Восстановление 'воспоминаний' при запуске TARS."""

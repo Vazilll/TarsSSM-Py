@@ -116,7 +116,7 @@ def detect_gpu() -> Tuple[str, Dict[str, Any]]:
         return "cpu", _HW_PROFILES["cpu"]
     
     gpu_name = torch.cuda.get_device_name(0).lower()
-    vram_gb = torch.cuda.get_device_properties(0).total_mem / (1024 ** 3)
+    vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
     
     # Match by name
     if "4090" in gpu_name:

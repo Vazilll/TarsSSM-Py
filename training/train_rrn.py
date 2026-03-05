@@ -128,20 +128,38 @@ def build_dataset(max_len: int = 128):
                     query = line.replace('Запрос:', '').strip()[:200]
                     if len(query) > 30:
                         samples.append((query, 2))  # complex queries → mode 3
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[Warning] HF data read error: {e}")
     
-    random.shuffle(samples)
-    print(f"[Dataset] {len(samples)} samples: "
-          f"mode1={sum(1 for _,m in samples if m==0)}, "
-          f"mode2={sum(1 for _,m in samples if m==1)}, "
-          f"mode3={sum(1 for _,m in samples if m==2)}")
-    return samples
+    # ═══ Class balancing: oversample underrepresented classes ═══
+    class_counts = {0: 0, 1: 0, 2: 0}
+    for _, m in samples:
+        class_counts[m] += 1
+    max_count = max(class_counts.values())
+    
+    balanced = []
+    by_class = {0: [], 1: [], 2: []}
+    for s in samples:
+        by_class[s[1]].append(s)
+    
+    for cls in [0, 1, 2]:
+        cls_samples = by_class[cls]
+        # Oversample to match largest class
+        while len(cls_samples) < max_count:
+            cls_samples.extend(by_class[cls])
+        balanced.extend(cls_samples[:max_count])
+    
+    random.shuffle(balanced)
+    print(f"[Dataset] {len(balanced)} samples (balanced from {len(samples)}): "
+          f"mode1={sum(1 for _,m in balanced if m==0)}, "
+          f"mode2={sum(1 for _,m in balanced if m==1)}, "
+          f"mode3={sum(1 for _,m in balanced if m==2)}")
+    return balanced
 
 
 def text_to_bytes(text: str, max_len: int = 128) -> torch.Tensor:
-    """Конвертирует текст в байтовый тензор."""
-    b = list(text.encode('cp1251', errors='replace'))[:max_len]
+    """Конвертирует текст в байтовый тензор (UTF-8, для MinGRU num_tokens=256)."""
+    b = list(text.encode('utf-8', errors='replace'))[:max_len]
     # Паддинг до max_len
     b = b + [0] * (max_len - len(b))
     return torch.tensor(b, dtype=torch.long)
@@ -160,7 +178,7 @@ def train(args):
         mingru = MinGRU_LM(dim=256, num_tokens=256, num_layers=4)
         weights_path = ROOT / "models" / "mingru" / "mingru_best.pt"
         if weights_path.exists():
-            ckpt = torch.load(str(weights_path), map_location='cpu', weights_only=False)
+            ckpt = torch.load(str(weights_path), map_location='cpu', weights_only=True)
             mingru.load_state_dict(ckpt['model_state_dict'], strict=False)
             print(f"[Model] MinGRU embedding loaded (epoch {ckpt.get('epoch', '?')})")
         mingru_emb = mingru.embedding  # nn.Embedding(256, 256)
@@ -317,8 +335,8 @@ def train(args):
         is_best = eval_acc > best_acc
         if is_best:
             best_acc = eval_acc
-            # Save
-            torch.save({
+            # Save (including fallback_emb if used)
+            save_data = {
                 'rrn_core': rrn_core.state_dict(),
                 'input_proj': input_proj.state_dict(),
                 'output_proj': output_proj.state_dict(),
@@ -326,7 +344,10 @@ def train(args):
                 'epoch': epoch,
                 'eval_acc': eval_acc,
                 'brain_dim': brain_dim,
-            }, str(save_dir / "rrn_spine.pt"))
+            }
+            if fallback_emb is not None:
+                save_data['fallback_emb'] = fallback_emb.state_dict()
+            torch.save(save_data, str(save_dir / "rrn_spine.pt"))
         
         marker = "★ BEST" if is_best else ""
         if (epoch + 1) % 5 == 0 or epoch == 0 or is_best:

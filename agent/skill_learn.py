@@ -82,9 +82,17 @@ class Skill:
     
     @classmethod
     def load(cls, path: str) -> 'Skill':
-        """Загрузить skill с диска."""
-        with open(path, 'r', encoding='utf-8') as f:
-            return cls.from_dict(json.load(f))
+        """Загрузить skill с диска (с валидацией)."""
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if not isinstance(data, dict) or 'name' not in data:
+                logger.warning(f"Invalid skill file: {path}")
+                return None
+            return cls.from_dict(data)
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.warning(f"Failed to load skill {path}: {e}")
+            return None
     
     def summary(self) -> str:
         """Краткое описание навыка."""

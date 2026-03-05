@@ -14,6 +14,7 @@
 
 import os
 import sys
+import re
 import json
 import time
 import asyncio
@@ -159,14 +160,33 @@ class ShellTool(Tool):
     Из PicoClaw:
       - Таймаут (default 30s)
       - Whitelisted директории
-      - Блокировка опасных команд
+      - Блокировка опасных команд (regex-based)
     """
     
-    BLOCKED_COMMANDS = {
-        'rm -rf /', 'format', 'del /s /q',
-        'mkfs', 'dd if=', ':(){:|:&};:',
-        'shutdown', 'reboot', 'halt',
-    }
+    # ═══ Security: regex-based blocklist (covers bypass variants) ═══
+    BLOCKED_PATTERNS = [
+        r'rm\s+-r',                      # rm -rf, rm -r /home, etc.
+        r'del\s+/[sq]',                  # del /s, del /q, del /s /q
+        r'del\s+\*',                     # del *.* wildcard
+        r'rmdir\s+/s',                   # rmdir /s /q
+        r'format\s+[a-z]:',             # format C:
+        r'mkfs',                         # mkfs.ext4 etc.
+        r'dd\s+if=',                     # dd if=/dev/zero
+        r':.*\(\)\s*\{.*\|.*\}',         # fork bomb
+        r'shutdown', r'reboot', r'halt',
+        r'>\s*/dev/sd',                  # write to raw device
+        r'\|\s*(bash|sh|cmd|powershell)', # pipe to shell
+        r'curl\s.*\|\s*(bash|sh)',       # curl | bash
+        r'wget\s.*\|\s*(bash|sh)',       # wget | sh
+        r'powershell\s+.*-e(nc)?',       # powershell -enc (encoded)
+        r'Remove-Item.*-Recurse',        # PowerShell recursive delete
+        r'reg\s+(delete|add)',           # registry modification
+        r'net\s+(user|stop|start)',      # user/service manipulation
+        r'icacls.*(/grant|/deny)',       # ACL modification
+    ]
+    _BLOCKED_RE = [re.compile(p, re.IGNORECASE) for p in BLOCKED_PATTERNS]
+    
+    MAX_COMMAND_LENGTH = 500  # подозрительно длинные команды
     
     def __init__(self, workspace: str = ".", timeout: int = 30,
                  allowed_dirs: Optional[List[str]] = None):
@@ -180,8 +200,8 @@ class ShellTool(Tool):
     def description(self) -> str:
         return (
             "Execute a shell command. Commands run in the workspace directory. "
-            "Dangerous commands (rm -rf /, format, etc.) are blocked. "
-            f"Timeout: {self.timeout}s."
+            "Dangerous commands are blocked by regex patterns. "
+            f"Timeout: {self.timeout}s. Max length: {self.MAX_COMMAND_LENGTH}."
         )
     
     def parameters(self) -> Dict[str, Any]:
@@ -201,10 +221,11 @@ class ShellTool(Tool):
         }
     
     def _is_blocked(self, command: str) -> bool:
-        """Проверка на опасные команды."""
-        cmd_lower = command.lower().strip()
-        for blocked in self.BLOCKED_COMMANDS:
-            if blocked in cmd_lower:
+        """Проверка на опасные команды (regex-based)."""
+        if len(command) > self.MAX_COMMAND_LENGTH:
+            return True
+        for pattern in self._BLOCKED_RE:
+            if pattern.search(command):
                 return True
         return False
     

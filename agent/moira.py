@@ -54,6 +54,14 @@ class MoIRA(nn.Module):
         2. Текстовое уточнение (если есть текст мысли)
         3. Извлечение параметров
         """
+        try:
+            return await self._route_impl(thought_vector, thought_text)
+        except Exception as e:
+            self.logger.error(f"MoIRA: Route failed: {e}. Falling back to FinalAnswer.")
+            return "FinalAnswer", {"answer": thought_text or "Ошибка маршрутизации."}, 1.0
+    
+    async def _route_impl(self, thought_vector: torch.Tensor, thought_text: str = "") -> Tuple[str, Dict[str, Any], float]:
+        """Internal routing logic (separated for clean error boundary)."""
         with torch.no_grad():
             query_vec = self.router_head(thought_vector.mean(dim=1))  # [B, 256]
             

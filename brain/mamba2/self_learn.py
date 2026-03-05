@@ -27,6 +27,8 @@ import json
 from typing import Optional, List, Dict
 from datetime import datetime
 
+from brain.tokenizer import TarsTokenizer
+
 
 class SelfLearner:
     """
@@ -53,6 +55,9 @@ class SelfLearner:
         
         # Оптимизатор (lazy init)
         self._optimizer = None
+        
+        # Кешированный токенизатор (не создавать в каждом цикле)
+        self._tokenizer = TarsTokenizer(mode="auto")
     
     def record_feedback(self, quality: float):
         """
@@ -232,9 +237,9 @@ class SelfLearner:
                     response_text = session.get("response", "")
                     if not input_text or not response_text:
                         continue
-                    # Токенизация через cp1251 byte-level
+                    # Токенизация через TarsTokenizer (BPE or byte fallback)
                     combined = f"{input_text}\n{response_text}"
-                    tokens = list(combined.encode('cp1251', errors='replace'))
+                    tokens = self._tokenizer.encode(combined)
                     if len(tokens) < 8:
                         continue
                     token_tensor = torch.tensor(tokens, dtype=torch.long, device=device)
@@ -314,7 +319,7 @@ class SelfLearner:
                 continue
             
             combined = f"{input_text}\n{response_text}"
-            tokens = list(combined.encode('cp1251', errors='replace'))
+            tokens = self._tokenizer.encode(combined)
             
             # Temporal compression: skip every N-th token (5× faster)
             tokens = tokens[::compression]

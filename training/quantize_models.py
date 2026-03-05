@@ -73,14 +73,14 @@ def quantize_brain(input_path: str = None, output_path: str = None,
     
     # ═══ 1. Загрузка FP16 модели ═══
     logger.info("\n[1/4] Загрузка FP16 модели...")
-    checkpoint = torch.load(input_path, map_location="cpu", weights_only=False)
+    checkpoint = torch.load(input_path, map_location="cpu", weights_only=True)
     
     # Определяем параметры модели из чекпоинта
     config = checkpoint.get("config", {})
     model = TarsMamba2LM(
         d_model=config.get("d_model", 256),
         n_layers=config.get("n_layers", 4),
-        vocab_size=config.get("vocab_size", 256),
+        vocab_size=config.get("vocab_size", 4096),
         quant_mode="fp16",  # Начинаем в FP16
     )
     
@@ -111,8 +111,10 @@ def quantize_brain(input_path: str = None, output_path: str = None,
         from training.train_mamba2 import load_corpus
         corpus = load_corpus()
         
-        # Byte-level tokenization (cp1251, vocab=256) — как в train_mamba2.py
-        tokens = list(corpus[:500000].encode('cp1251', errors='replace'))
+        # Tokenization via TarsTokenizer (matches training)
+        from brain.tokenizer import TarsTokenizer
+        _qt = TarsTokenizer(mode="auto")
+        tokens = _qt.encode(corpus[:500000])
         token_tensor = torch.tensor(tokens, dtype=torch.long)
         
         seq_len = 256  # Короче для fine-tune

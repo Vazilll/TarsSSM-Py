@@ -32,11 +32,14 @@ import time
 import json
 import copy
 import hashlib
+import logging
 import argparse
 import numpy as np
 import torch
 import torch.nn.functional as F
 from pathlib import Path
+
+logger = logging.getLogger("training.mamba2")
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -49,7 +52,8 @@ def parse_args():
     # ═══ Model params ═══
     p.add_argument('--d_model', type=int, default=2048)   # TARS 1B
     p.add_argument('--n_layers', type=int, default=24)    # 24 rich blocks
-    p.add_argument('--vocab_size', type=int, default=256)  # cp1251 bytes
+    p.add_argument('--vocab_size', type=int, default=4096,
+                    help="BPE vocab size (0=byte-level 256)")
     # ═══ Training params ═══
     p.add_argument('--seq_len', type=int, default=256)
     p.add_argument('--batch', type=int, default=8)
@@ -95,7 +99,16 @@ def parse_args():
     p.add_argument('--pin_memory', action='store_true')
     p.add_argument('--compile', action='store_true',
                    help="Force torch.compile")
+    # ═══ Data repeat multipliers (configurable, not hardcoded) ═══
+    p.add_argument('--identity_repeat', type=int, default=5,
+                   help="Кол-во повторов identity корпуса (default: 5)")
+    p.add_argument('--personality_repeat', type=int, default=10,
+                   help="Кол-во повторов personality корпуса (default: 10)")
+    p.add_argument('--mega_repeat', type=int, default=3,
+                   help="Кол-во повторов mega personality (default: 3)")
     # ═══ Advanced Optimizations ═══
+    p.add_argument('--patience', type=int, default=5,
+                   help="Early stopping patience (0=off)")
     p.add_argument('--lora', action='store_true',
                    help="LoRA fine-tuning (parameter-efficient, trains only adapters)")
     p.add_argument('--lora_rank', type=int, default=16,
@@ -107,14 +120,20 @@ def parse_args():
     return p.parse_args()
 
 
-def load_corpus(data_path=None, download_wiki=True, data_dir=None):
+def load_corpus(data_path=None, download_wiki=True, data_dir=None,
+                identity_repeat=5, personality_repeat=10, mega_repeat=3):
     """Загружает обучающий корпус.
     
     Источники (по приоритету):
       1. --data (пользовательский файл)
       2. Встроенный корпус (train_corpus.py: диалоги + тексты)
-      3. Wikipedia (auto-download 500 статей при первом запуске)
+      3. Wikipedia (из кеша, без auto-download)
       4. TARS memories (data/tars_memories.json)
+    
+    Args:
+        identity_repeat: кол-во повторов identity (default 5)
+        personality_repeat: кол-во повторов personality (default 10)  
+        mega_repeat: кол-во повторов mega personality (default 3)
     """
     parts = []
     
@@ -145,19 +164,11 @@ def load_corpus(data_path=None, download_wiki=True, data_dir=None):
             wiki_mb = len(wiki_text.encode('utf-8')) / (1024 * 1024)
             print(f"[Data] Wikipedia: {len(wiki_text):,} символов ({wiki_mb:.1f} MB, кеш)")
     elif download_wiki:
-        print("[Data] Wikipedia корпус не найден — скачиваю 5000 статей...")
-        print("[Data] Это может занять 3-10 минут при первом запуске.")
-        try:
-            sys.path.insert(0, str(ROOT / "training"))
-            from download_wiki import download_corpus
-            wiki_text = download_corpus(count=5000)
-            if wiki_text:
-                parts.append(wiki_text)
-                wiki_mb = len(wiki_text.encode('utf-8')) / (1024 * 1024)
-                print(f"[Data] Wikipedia: {len(wiki_text):,} символов ({wiki_mb:.1f} MB)")
-        except Exception as e:
-            print(f"[Data] ⚠ Не удалось скачать Wikipedia: {e}")
-            print("[Data]   Запустите вручную: python training/download_wiki.py")
+        logger.warning(
+            "[Data] Wikipedia корпус не найден. "
+            "Скачайте отдельно: python training/download_datasets.py"
+        )
+        logger.warning("[Data] Пропускаем Wikipedia (не тратим GPU-время на скачивание)")
     
     # 4. HuggingFace датасеты (data/hf_*.txt)
     hf_dir = _data_root
@@ -183,8 +194,8 @@ def load_corpus(data_path=None, download_wiki=True, data_dir=None):
                     parts.append(hf_text)
                     hf_mb = len(hf_text.encode('utf-8')) / (1024 * 1024)
                     print(f"[Data] HF {hf_file.stem}: {len(hf_text):,} символов ({hf_mb:.1f} MB)")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Skipped HF file {hf_file.name}: {e}")
     
     # 4b. Sharded datasets (data/shards_*/shard_*.txt) — для 50+ GB
     if hf_dir.exists():
@@ -201,8 +212,8 @@ def load_corpus(data_path=None, download_wiki=True, data_dir=None):
                     if len(shard_text) > 1000:
                         parts.append(shard_text)
                         shard_total += len(shard_text)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Skipped shard {sf.name}: {e}")
             if shard_total > 0:
                 shard_gb = shard_total / (1024**3)
                 print(f"[Data] Shards {shard_dir.name}: {len(shard_files)} шардов, {shard_gb:.2f} GB")
@@ -216,8 +227,8 @@ def load_corpus(data_path=None, download_wiki=True, data_dir=None):
             texts = [e.get("text", e.get("memory", "")) for e in data if isinstance(e, dict)]
             parts.append("\n".join(texts))
             print(f"[Data] Memories: {len(texts)} записей")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Memories load error: {e}")
     
     corpus = "\n\n".join(parts)
     
@@ -227,10 +238,9 @@ def load_corpus(data_path=None, download_wiki=True, data_dir=None):
         with open(identity_path, 'r', encoding='utf-8') as f:
             identity_text = f.read()
         if len(identity_text) > 100:
-            # Повторяем 5x для усиления — модель должна знать свою архитектуру
-            identity_repeated = ("\n\n" + identity_text) * 5
+            identity_repeated = ("\n\n" + identity_text) * identity_repeat
             corpus = identity_repeated + "\n\n" + corpus
-            print(f"[Data] ТАРС Identity: {len(identity_text):,} символов (×5 для усиления)")
+            logger.info(f"[Data] ТАРС Identity: {len(identity_text):,} символов (×{identity_repeat})")
     
     # 7. TARS Personality (стиль общения — юмор, сарказм, прямолинейность)
     personality_path = _data_root / "tars_personality.txt"
@@ -238,10 +248,9 @@ def load_corpus(data_path=None, download_wiki=True, data_dir=None):
         with open(personality_path, 'r', encoding='utf-8') as f:
             personality_text = f.read()
         if len(personality_text) > 100:
-            # Повторяем 10x — личность должна быть СИЛЬНО выражена
-            personality_repeated = ("\n\n" + personality_text) * 10
+            personality_repeated = ("\n\n" + personality_text) * personality_repeat
             corpus = personality_repeated + "\n\n" + corpus
-            print(f"[Data] ТАРС Personality: {len(personality_text):,} символов (×10 для усиления)")
+            logger.info(f"[Data] ТАРС Personality: {len(personality_text):,} символов (×{personality_repeat})")
     
     # 8. TARS Mega Personality (6000+ реплик — основной корпус личности)
     mega_path = _data_root / "tars_personality_mega.txt"
@@ -249,11 +258,10 @@ def load_corpus(data_path=None, download_wiki=True, data_dir=None):
         with open(mega_path, 'r', encoding='utf-8') as f:
             mega_text = f.read()
         if len(mega_text) > 1000:
-            # Повторяем 3x — 385KB × 3 = ~1.1MB доминирующего сигнала
-            mega_repeated = ("\n\n" + mega_text) * 3
+            mega_repeated = ("\n\n" + mega_text) * mega_repeat
             corpus = mega_repeated + "\n\n" + corpus
             mega_lines = mega_text.count('\n')
-            print(f"[Data] ТАРС Mega Personality: {mega_lines:,} строк ({len(mega_text)//1024} KB, ×3)")
+            logger.info(f"[Data] ТАРС Mega Personality: {mega_lines:,} строк ({len(mega_text)//1024} KB, ×{mega_repeat})")
     
     
     # Повторяем маленький корпус
@@ -289,8 +297,8 @@ def filter_corpus_quality(corpus: str) -> str:
         if len(p) < 50:
             stats['short'] += 1
             continue
-        # 2. Дедупликация (MD5)
-        h = hashlib.md5(p.encode('utf-8', errors='replace')).hexdigest()
+        # 2. Дедупликация (SHA256 — нет коллизий в отличие от MD5)
+        h = hashlib.sha256(p.encode('utf-8', errors='replace')).hexdigest()
         if h in seen_hashes:
             stats['dup'] += 1
             continue
@@ -319,19 +327,21 @@ def filter_corpus_quality(corpus: str) -> str:
     return result
 
 
-def prepare_byte_data(text: str, seq_len: int, vocab_size: int = 32000, max_samples: int = 0):
+def prepare_data(text: str, seq_len: int, vocab_size: int = 32000, max_samples: int = 0, tokenizer=None):
     """
-    Подготовка данных для byte-level обучения.
-    Для полной модели нужен SentencePiece tokenizer,
-    но для начала используем byte-level (vocab=256, кириллица через cp1251).
+    Подготовка данных для next-token prediction.
+    Использует BPE токенизатор если передан, иначе byte-level CP1251.
     """
-    tokens = list(text.encode('cp1251', errors='replace'))
+    if tokenizer is not None:
+        tokens = tokenizer.encode(text)
+    else:
+        tokens = list(text.encode('cp1251', errors='replace'))
     
     # Если max_samples задан, ограничиваем длину текста
     if max_samples > 0:
-        max_chars = max_samples * seq_len
-        if len(tokens) > max_chars:
-            tokens = tokens[:max_chars]
+        max_toks = max_samples * seq_len
+        if len(tokens) > max_toks:
+            tokens = tokens[:max_toks]
     
     inputs = []
     targets = []
@@ -367,7 +377,7 @@ def load_hf_weights(model, pretrained_dir):
             if f.suffix == '.safetensors':
                 state_dict.update(load_file(f))
             else:
-                state_dict.update(torch.load(f, map_location='cpu'))
+                state_dict.update(torch.load(f, map_location='cpu', weights_only=True))
 
         # Очистка ключей HF (примерная адаптация)
         mapped_dict = {}
@@ -402,20 +412,41 @@ def train(args):
     
     # Данные (корпус загружается 1 раз, токенизация — по curriculum)
     corpus = load_corpus(data_path=args.data, download_wiki=not args.no_wiki,
-                         data_dir=args.data_dir)
+                         data_dir=args.data_dir,
+                         identity_repeat=args.identity_repeat,
+                         personality_repeat=args.personality_repeat,
+                         mega_repeat=args.mega_repeat)
     print(f"[Data] Корпус загружен ({len(corpus):,} символов)")
     
-    # ═══════════════════════════════════════════════════════════
+    # ═══ Tokenizer: обучить BPE или использовать byte-level ═══
+    from brain.tokenizer import TarsTokenizer, reset_tokenizer
+    reset_tokenizer()
+    if args.vocab_size > 0:
+        print(f"\n[Tokenizer] Обучение SentencePiece BPE (vocab={args.vocab_size})...")
+        try:
+            tokenizer = TarsTokenizer.train(
+                corpus_text=corpus,
+                vocab_size=args.vocab_size,
+            )
+            print(f"[Tokenizer] ✅ BPE: vocab={tokenizer.vocab_size}")
+        except Exception as e:
+            print(f"[Tokenizer] ⚠ BPE не удалось ({e}), fallback byte-level")
+            tokenizer = TarsTokenizer(mode="byte")
+    else:
+        print(f"[Tokenizer] Byte-level (vocab=256)")
+        tokenizer = TarsTokenizer(mode="byte")
+    
+    actual_vocab = tokenizer.vocab_size
+    
+    # ═════════════════════════════════════════════════════════
     # Модель: 3-шаговый пайплайн
     #   Step A: Создание модели в FP16 (нормальная инициализация)
     #   Step B: Квантизация в 1.58-bit (если --quant)
     #   Step C: Обучение на данных (Wiki + HF + встроенный корпус)
-    # ═══════════════════════════════════════════════════════════
-    
-    actual_vocab = 256  # byte level
+    # ═════════════════════════════════════════════════════════
     
     # ── Step A: Инициализация в FP16 ──
-    print(f"\n[Step A] Создание модели в FP16...")
+    print(f"\n[Step A] Создание модели в FP16 (vocab={actual_vocab})...")
     model = TarsMamba2LM(
         d_model=args.d_model,
         n_layers=args.n_layers,
@@ -435,14 +466,14 @@ def train(args):
 
     if args.resume and save_path.exists():
         print(f"[Model] Loading checkpoint: {save_path}")
-        checkpoint = torch.load(str(save_path), map_location='cpu', weights_only=False)
+        checkpoint = torch.load(str(save_path), map_location='cpu', weights_only=True)
         model.load_state_dict(checkpoint['model_state_dict'], strict=False)
     elif args.resume and args.quant:
         # Quant mode but no 158bit checkpoint → load FP16 as fallback
         fp16_path = Path(args.save_dir) / "mamba2_omega.pt"
         if fp16_path.exists():
             print(f"[Model] Quant: loading FP16 base → {fp16_path}")
-            checkpoint = torch.load(str(fp16_path), map_location='cpu', weights_only=False)
+            checkpoint = torch.load(str(fp16_path), map_location='cpu', weights_only=True)
             model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         else:
             print(f"[!] No checkpoint found — training from scratch")
@@ -458,7 +489,7 @@ def train(args):
     if args.pretrained_emb and os.path.exists(args.pretrained_emb):
         print(f"\n[🔗 Transfer] Загрузка предобученного эмбеддинга из MinGRU...")
         try:
-            mingru_emb = torch.load(args.pretrained_emb, map_location=device)
+            mingru_emb = torch.load(args.pretrained_emb, map_location=device, weights_only=True)
             if mingru_emb.shape[0] == actual_vocab:
                 # MinGRU dim might differ from Mamba-2 d_model
                 if mingru_emb.shape[1] == args.d_model:
@@ -651,7 +682,7 @@ def train(args):
         optimizer_aux = None
     
     # Scheduler (estimate total steps from corpus size)
-    estimated_samples = max(100, len(corpus.encode('cp1251', errors='replace')) // max(args.seq_len // 2, 1))
+    estimated_samples = max(100, len(tokenizer.encode(corpus[:100000])) * (len(corpus) // max(100000, 1) + 1) // max(args.seq_len // 2, 1))
     total_steps = (estimated_samples // args.batch + 1) * args.epochs
     warmup = total_steps // 10
     
@@ -751,19 +782,23 @@ def train(args):
     # ═══ LoRA Setup (параметр-эффективная дообучка) ═══
     if getattr(args, 'lora', False):
         try:
-            from brain.mamba2.optimizations import setup_lora
-            model, n_trainable = setup_lora(
+            from training.lora import apply_lora
+            lora_rank = getattr(args, 'lora_rank', 16)
+            lora_stats = apply_lora(
                 model,
-                rank=getattr(args, 'lora_rank', 16),
-                target_modules=["in_proj", "out_proj", "wkv_up"],
+                rank=lora_rank,
+                alpha=lora_rank * 2,
+                target_modules=['in_proj', 'out_proj', 'w_gate', 'w_value', 'w_out', 'embed', 'head'],
             )
-            print(f"  ⚡ LoRA enabled: rank={args.lora_rank}, trainable={n_trainable:,} params")
+            print(f"  ⚡ LoRA enabled: rank={lora_rank}, "
+                  f"trainable={lora_stats['trainable_params']:,} "
+                  f"({lora_stats['trainable_pct']:.2f}%)")
             # Re-create optimizer with only trainable params
             trainable_params = [p for p in model.parameters() if p.requires_grad]
             optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=0.01)
-            print(f"  ⚡ Optimizer re-created for LoRA params only")
-        except ImportError:
-            print("  ⚠ LoRA requires optimizations.py")
+            print(f"  ⚡ Optimizer re-created for {len(trainable_params)} LoRA param groups")
+        except ImportError as e:
+            print(f"  ⚠ LoRA import failed: {e}")
     
     # ═══ Curriculum Learning (skip for 1-epoch) ═══
     curriculum_schedule = None
@@ -795,17 +830,22 @@ def train(args):
         p.requires_grad = False
     print(f"  ⚡ EMA model initialized (decay={ema_decay})")
     
+    best_loss = float('inf')
+    patience_counter = 0
+    
     for epoch in range(args.epochs):
         t0 = time.time()
         model.train()
         total_loss = 0
+        train_correct = 0
+        train_total = 0
         n_batches = 0
         tokens_processed = 0
         
         # Curriculum: пересоздать данные с новым seq_len
         cur_seq_len = curriculum_schedule[epoch] if curriculum_schedule else args.seq_len
         if epoch == 0 or (curriculum_schedule and cur_seq_len != curriculum_schedule[max(0, epoch-1)]):
-            c_inputs, c_targets = prepare_byte_data(corpus, cur_seq_len, actual_vocab, max_samples=args.max_samples)
+            c_inputs, c_targets = prepare_data(corpus, cur_seq_len, actual_vocab, max_samples=args.max_samples, tokenizer=tokenizer)
             n_test_c = max(2, len(c_inputs) // 10)
             c_train_in, c_test_in = c_inputs[:-n_test_c], c_inputs[-n_test_c:]
             c_train_tgt, c_test_tgt = c_targets[:-n_test_c], c_targets[-n_test_c:]
@@ -877,6 +917,12 @@ def train(args):
             n_batches += 1
             tokens_processed += batch_in.numel()
             
+            # Track train accuracy
+            with torch.no_grad():
+                preds = logits.argmax(dim=-1)
+                train_correct += (preds.view(-1) == batch_tgt.view(-1)).sum().item()
+                train_total += batch_tgt.numel()
+            
             # Gradient accumulation step
             if n_batches % accum_steps == 0 or i + args.batch >= len(train_in_s):
                 if scaler is not None:
@@ -903,6 +949,8 @@ def train(args):
         model.eval()
         with torch.no_grad():
             eval_losses = []
+            eval_correct = 0
+            eval_total = 0
             for j in range(0, len(c_test_in), args.batch):
                 test_batch = c_test_in[j:j+args.batch].to(device, non_blocking=True)
                 test_tgt_batch = c_test_tgt[j:j+args.batch].to(device, non_blocking=True)
@@ -912,16 +960,27 @@ def train(args):
                     test_tgt_batch.view(-1)
                 ).item()
                 eval_losses.append(el)
+                # Eval accuracy
+                preds = logits.argmax(dim=-1)
+                eval_correct += (preds.view(-1) == test_tgt_batch.view(-1)).sum().item()
+                eval_total += test_tgt_batch.numel()
             eval_loss = np.mean(eval_losses)
         
         elapsed = time.time() - t0
         ppl = np.exp(min(eval_loss, 20))
         tok_per_sec = tokens_processed / max(elapsed, 0.01)
+        train_acc = 100.0 * train_correct / max(train_total, 1)
+        eval_acc = 100.0 * eval_correct / max(eval_total, 1)
+        avg_train_loss = total_loss / max(n_batches, 1)
+        
+        is_best = eval_loss < best_loss
+        marker = " ★ BEST" if is_best else ""
+        overfit_flag = " ⚠ OVERFIT" if train_acc > eval_acc + 10 else ""
         
         print(f"Epoch {epoch+1}/{args.epochs} | "
-              f"Train: {total_loss/max(n_batches,1):.4f} | "
-              f"Eval: {eval_loss:.4f} | PPL: {ppl:.1f} | "
-              f"{tok_per_sec:.0f} tok/s | {elapsed:.1f}s")
+              f"Train: {avg_train_loss:.4f} (acc {train_acc:.1f}%) | "
+              f"Eval: {eval_loss:.4f} (acc {eval_acc:.1f}%) | "
+              f"PPL: {ppl:.1f} | {tok_per_sec:.0f} tok/s | {elapsed:.1f}s{marker}{overfit_flag}")
         
         # Save checkpoint
         os.makedirs(args.save_dir, exist_ok=True)
@@ -941,6 +1000,7 @@ def train(args):
             'eval_loss': eval_loss,
             'phase': args.phase,
             'quant_mode': quant_mode,
+            'tokenizer_mode': tokenizer._mode,
         }
         
         # Per-epoch checkpoint (защита от потери прогресса при крашах)
@@ -948,15 +1008,22 @@ def train(args):
         torch.save(checkpoint, str(epoch_path))
         
         # Best checkpoint (use EMA weights — more stable for inference)
-        if eval_loss < best_loss:
+        if is_best:
             best_loss = eval_loss
+            patience_counter = 0
             # Save EMA version as the best model (more stable)
             ema_checkpoint = dict(checkpoint)
             ema_checkpoint['model_state_dict'] = ema_model.state_dict()
             torch.save(ema_checkpoint, str(save_path))
             print(f"  ✓ Best saved (EMA): {save_path} ({quant_mode})")
         else:
-            print(f"  ↺ Epoch checkpoint: {epoch_path.name}")
+            patience_counter += 1
+            print(f"  ↺ Epoch checkpoint: {epoch_path.name} (patience {patience_counter}/{args.patience})")
+        
+        # Early stopping
+        if args.patience > 0 and patience_counter >= args.patience:
+            print(f"\n  ⏹ Early stopping: {args.patience} эпох без улучшения (best={best_loss:.4f})")
+            break
     
     # ═══════════════════════════════════════════════════════════
     # Phase 5: PERSONALITY FINE-TUNING
@@ -1000,7 +1067,7 @@ def train(args):
         )
         print(f"  [P5] LR: {p_lr:.2e} | Corpus: {len(p_corpus)//1024} KB")
         
-        p_inputs, p_targets = prepare_byte_data(p_corpus, args.seq_len, actual_vocab)
+        p_inputs, p_targets = prepare_data(p_corpus, args.seq_len, actual_vocab, tokenizer=tokenizer)
         n_test_p = max(2, len(p_inputs) // 10)
         p_train_in, p_test_in = p_inputs[:-n_test_p], p_inputs[-n_test_p:]
         p_train_tgt, p_test_tgt = p_targets[:-n_test_p], p_targets[-n_test_p:]

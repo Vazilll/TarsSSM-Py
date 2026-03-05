@@ -43,15 +43,14 @@ def _clean_html(html: str) -> str:
     return text
 
 
-async def _http_get(url: str, timeout: int = 10) -> str:
-    """HTTP GET запрос (без внешних зависимостей)."""
+async def _http_get(url: str, timeout: int = 10, max_bytes: int = 1_048_576) -> str:
+    """HTTP GET запрос (без внешних зависимостей). Max response: 1MB."""
     try:
         import urllib.request
         import ssl
         
+        # Use default SSL context with certificate verification.
         ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
         
         req = urllib.request.Request(url, headers={
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -59,13 +58,14 @@ async def _http_get(url: str, timeout: int = 10) -> str:
             'Accept-Language': 'ru,en;q=0.9',
         })
         
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         response = await loop.run_in_executor(
             None,
             lambda: urllib.request.urlopen(req, timeout=timeout, context=ctx)
         )
         
-        data = response.read()
+        # ═══ Limit response size to prevent OOM ═══
+        data = response.read(max_bytes)
         # Попробовать разные кодировки
         for enc in ['utf-8', 'cp1251', 'latin-1']:
             try:

@@ -261,8 +261,9 @@ class TarsVoice:
             if frames:
                 # Сохраняем WAV и отправляем в Whisper
                 import wave
-                temp_file = "data/temp_record.wav"
-                os.makedirs("data", exist_ok=True)
+                import tempfile
+                temp_fd, temp_file = tempfile.mkstemp(suffix='.wav', prefix='tars_rec_')
+                os.close(temp_fd)
                 with wave.open(temp_file, 'wb') as wf:
                     wf.setnchannels(1)
                     wf.setsampwidth(2)  # 16-bit
@@ -347,6 +348,8 @@ class TarsVoice:
             is_speaking = False
             silence_chunks = 0
             vad_state = None
+            # ═══ Thread-safe: lock for shared state ═══
+            _buf_lock = threading.Lock()
             
             def audio_callback(indata, frames, time_info, status):
                 nonlocal speech_buffer, is_speaking, silence_chunks, vad_state
@@ -367,18 +370,19 @@ class TarsVoice:
                     energy = np.sqrt(np.mean(chunk ** 2))
                     has_speech = energy > 0.01
                 
-                if has_speech:
-                    speech_buffer.append(chunk)
-                    is_speaking = True
-                    silence_chunks = 0
-                elif is_speaking:
-                    silence_chunks += 1
-                    if silence_chunks >= 3:  # 1.5s тишины
-                        # Речь закончилась — транскрибируем
-                        audio_data = np.concatenate(speech_buffer)
-                        speech_buffer = []
-                        is_speaking = False
+                with _buf_lock:
+                    if has_speech:
+                        speech_buffer.append(chunk)
+                        is_speaking = True
                         silence_chunks = 0
+                    elif is_speaking:
+                        silence_chunks += 1
+                        if silence_chunks >= 3:  # 1.5s тишины
+                            # Речь закончилась — транскрибируем
+                            audio_data = np.concatenate(speech_buffer)
+                            speech_buffer.clear()
+                            is_speaking = False
+                            silence_chunks = 0
                         
                         # Сохраняем во временный WAV
                         with tempfile.NamedTemporaryFile(
@@ -462,8 +466,9 @@ class TarsVoice:
             logger.debug("Voice: TTS отключён (tts_enabled=False)")
             return
 
-        output_wav = "data/last_response.wav"
-        os.makedirs("data", exist_ok=True)
+        import tempfile as _tmpf
+        output_fd, output_wav = _tmpf.mkstemp(suffix='.wav', prefix='tars_tts_')
+        os.close(output_fd)
 
         # Адаптивные параметры Piper по эмоции
         # noise_scale: вариативность (выше = эмоциональнее)
@@ -500,7 +505,7 @@ class TarsVoice:
                 import subprocess
                 cmd = ["piper", "--model", tts_model_legacy, "--output_file", output_wav]
                 process = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-                process.communicate(input=text.encode('utf-8'))
+                process.communicate(input=text.encode('utf-8'), timeout=30)
 
                 if os.path.exists(output_wav):
                     self._play_audio(output_wav)

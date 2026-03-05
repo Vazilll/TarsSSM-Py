@@ -1,298 +1,282 @@
 """
 ═══════════════════════════════════════════════════════════════
-  DPO — Direct Preference Optimization для TARS
+  DPO (Direct Preference Optimization) Training for TARS
 ═══════════════════════════════════════════════════════════════
 
-Техника: DPO (Rafailov et al., 2023) — обучение без reward model.
+Trains TARS to prefer better responses WITHOUT a reward model.
 
-Вместо RLHF (PPO + reward model), DPO напрямую оптимизирует:
-  L_DPO = -log σ(β × (log π_θ(y_w|x) - log π_ref(y_w|x) 
-                      - log π_θ(y_l|x) + log π_ref(y_l|x)))
+DPO loss:
+  L = -log σ(β * (log π(y_w|x) - log π(y_l|x) 
+                  - log π_ref(y_w|x) + log π_ref(y_l|x)))
 
-Где:
-  y_w — предпочтительный ответ (winner)
-  y_l — нежелательный ответ (loser) 
-  π_θ — обучаемая модель
-  π_ref — замороженная референс-модель
-  β — temperature (0.1-0.5)
+Where:
+  y_w = preferred (winning) response
+  y_l = rejected (losing) response
+  π_ref = frozen reference policy (TARS before alignment)
+  β = temperature controlling deviation from reference
 
-Данные: пары (prompt, chosen_response, rejected_response)
+Usage:
+  python training/train_dpo.py --data data/preferences.jsonl
+                               --model models/mamba2/brain_best.pt
+                               --epochs 3 --beta 0.1
 
-Использование:
-  python training/train_dpo.py --data data/dpo_pairs.jsonl --resume
+Data format (JSONL):
+  {"prompt": "...", "chosen": "...", "rejected": "..."}
 """
 
-import argparse
-import json
 import os
 import sys
-import time
-import math
+import json
 import copy
-import numpy as np
+import time
+import logging
+import argparse
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+import random
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger("training.dpo")
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="TARS DPO Alignment Training")
-    p.add_argument('--d_model', type=int, default=2048)
-    p.add_argument('--n_layers', type=int, default=24)
-    p.add_argument('--epochs', type=int, default=1)
-    p.add_argument('--batch', type=int, default=2)
-    p.add_argument('--lr', type=float, default=5e-6,
-                   help="DPO requires very low LR (1e-6 to 1e-5)")
-    p.add_argument('--beta', type=float, default=0.1,
-                   help="DPO temperature (0.1 = strong preference, 0.5 = weak)")
-    p.add_argument('--seq_len', type=int, default=256)
-    p.add_argument('--device', type=str, default='auto')
-    p.add_argument('--data', type=str, required=True,
-                   help="Path to DPO pairs JSONL (prompt, chosen, rejected)")
-    p.add_argument('--save_dir', type=str, default='models/mamba2')
-    p.add_argument('--resume', action='store_true')
-    p.add_argument('--bf16', action='store_true')
-    p.add_argument('--grad_ckpt', action='store_true')
+    p.add_argument("--data", type=str, default="data/preferences.jsonl",
+                   help="JSONL with {prompt, chosen, rejected}")
+    p.add_argument("--model", type=str, default="models/mamba2/brain_best.pt",
+                   help="Path to pretrained TARS checkpoint")
+    p.add_argument("--save_dir", type=str, default="models/mamba2")
+    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--batch_size", type=int, default=2)
+    p.add_argument("--lr", type=float, default=5e-6, help="DPO requires low LR")
+    p.add_argument("--beta", type=float, default=0.1,
+                   help="DPO temperature (0.1=strict, 0.5=loose)")
+    p.add_argument("--max_len", type=int, default=512)
+    p.add_argument("--device", type=str, default="auto")
+    p.add_argument("--label_smoothing", type=float, default=0.0,
+                   help="Label smoothing for DPO loss (0=none, 0.1=recommended)")
     return p.parse_args()
 
 
-def get_sequence_log_probs(model, input_ids, target_ids, device):
-    """
-    Compute per-token log probabilities for a sequence.
-    
-    Returns: mean log probability of target tokens
-    """
-    input_ids = input_ids.to(device)
-    target_ids = target_ids.to(device)
-    
-    logits = model(input_ids)  # [B, L, V]
-    log_probs = F.log_softmax(logits, dim=-1)
-    
-    # Gather log probs for target tokens
-    # target_ids: [B, L]
-    target_log_probs = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
-    
-    # Mean over sequence (ignore padding if present)
-    mask = (target_ids != 0).float()
-    seq_log_prob = (target_log_probs * mask).sum(dim=-1) / mask.sum(dim=-1).clamp(min=1)
-    
-    return seq_log_prob  # [B]
-
-
-def dpo_loss(policy_chosen_logps, policy_rejected_logps,
-             ref_chosen_logps, ref_rejected_logps, beta):
-    """
-    DPO loss (Rafailov et al., 2023).
-    
-    L = -log σ(β × ((log π_θ(y_w) - log π_ref(y_w)) - (log π_θ(y_l) - log π_ref(y_l))))
-    """
-    chosen_rewards = beta * (policy_chosen_logps - ref_chosen_logps)
-    rejected_rewards = beta * (policy_rejected_logps - ref_rejected_logps)
-    
-    loss = -F.logsigmoid(chosen_rewards - rejected_rewards).mean()
-    
-    # Metrics
-    reward_margin = (chosen_rewards - rejected_rewards).mean().item()
-    accuracy = ((chosen_rewards > rejected_rewards).float().mean().item())
-    
-    return loss, reward_margin, accuracy
-
-
-def load_dpo_data(path, seq_len):
-    """
-    Load DPO pairs from JSONL.
-    
-    Expected format per line:
-    {"prompt": "...", "chosen": "...", "rejected": "..."}
-    """
-    pairs = []
+def load_preference_data(path: str) -> list:
+    """Load preference pairs from JSONL."""
+    data = []
     with open(path, 'r', encoding='utf-8') as f:
-        for line in f:
+        for line_no, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
             try:
                 item = json.loads(line)
-                # Encode as bytes (cp1251)
-                prompt = item['prompt'].encode('cp1251', errors='replace')
-                chosen = item['chosen'].encode('cp1251', errors='replace')
-                rejected = item['rejected'].encode('cp1251', errors='replace')
-                
-                # Create input/target pairs
-                chosen_full = prompt + chosen
-                rejected_full = prompt + rejected
-                
-                # Truncate to seq_len
-                if len(chosen_full) > seq_len:
-                    chosen_full = chosen_full[:seq_len]
-                if len(rejected_full) > seq_len:
-                    rejected_full = rejected_full[:seq_len]
-                
-                # Pad to seq_len
-                chosen_padded = list(chosen_full) + [0] * (seq_len - len(chosen_full))
-                rejected_padded = list(rejected_full) + [0] * (seq_len - len(rejected_full))
-                
-                pairs.append({
-                    'chosen_in': torch.tensor(chosen_padded[:-1], dtype=torch.long),
-                    'chosen_tgt': torch.tensor(chosen_padded[1:], dtype=torch.long),
-                    'rejected_in': torch.tensor(rejected_padded[:-1], dtype=torch.long),
-                    'rejected_tgt': torch.tensor(rejected_padded[1:], dtype=torch.long),
-                })
-            except (json.JSONDecodeError, KeyError) as e:
-                continue
+                if all(k in item for k in ('prompt', 'chosen', 'rejected')):
+                    data.append(item)
+                else:
+                    logger.warning(f"Line {line_no}: missing keys, skipping")
+            except json.JSONDecodeError:
+                logger.warning(f"Line {line_no}: invalid JSON, skipping")
     
-    print(f"[DPO Data] Loaded {len(pairs)} preference pairs from {path}")
-    return pairs
+    logger.info(f"Loaded {len(data)} preference pairs from {path}")
+    return data
+
+
+def encode_text(tokenizer, text: str, max_len: int) -> torch.LongTensor:
+    """Encode text to token tensor."""
+    ids = tokenizer.encode(text)[:max_len]
+    return torch.tensor([ids], dtype=torch.long)
+
+
+def get_log_probs(model, input_ids: torch.Tensor, device: str) -> torch.Tensor:
+    """
+    Get log probabilities of the sequence under the model.
+    
+    Returns: scalar log prob (sum of log p(token_i | token_{<i}))
+    """
+    input_ids = input_ids.to(device)
+    
+    # Forward
+    result = model.think(input_ids)
+    if isinstance(result, tuple):
+        logits, _ = result
+    else:
+        logits = result
+    
+    # logits: [1, L, V], shift for autoregressive
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = input_ids[:, 1:].contiguous()
+    
+    # Per-token log probs
+    log_probs = F.log_softmax(shift_logits, dim=-1)
+    token_log_probs = log_probs.gather(2, shift_labels.unsqueeze(2)).squeeze(2)
+    
+    # Average over sequence (length-normalized for fair comparison)
+    return token_log_probs.mean()
+
+
+def dpo_loss(
+    policy_chosen_logps: torch.Tensor,
+    policy_rejected_logps: torch.Tensor,
+    ref_chosen_logps: torch.Tensor,
+    ref_rejected_logps: torch.Tensor,
+    beta: float = 0.1,
+    label_smoothing: float = 0.0,
+) -> tuple:
+    """
+    DPO Loss (Rafailov et al., 2023).
+    
+    L = -log σ(β * ((log π(y_w|x) - log π_ref(y_w|x)) 
+                    - (log π(y_l|x) - log π_ref(y_l|x))))
+    """
+    # Log ratios
+    pi_logratios = policy_chosen_logps - policy_rejected_logps
+    ref_logratios = ref_chosen_logps - ref_rejected_logps
+    
+    # DPO implicit reward difference
+    logits = beta * (pi_logratios - ref_logratios)
+    
+    # Label smoothing (IPO-style)
+    if label_smoothing > 0:
+        loss = (
+            -F.logsigmoid(logits) * (1 - label_smoothing)
+            - F.logsigmoid(-logits) * label_smoothing
+        )
+    else:
+        loss = -F.logsigmoid(logits)
+    
+    # Metrics
+    with torch.no_grad():
+        chosen_rewards = beta * (policy_chosen_logps - ref_chosen_logps)
+        rejected_rewards = beta * (policy_rejected_logps - ref_rejected_logps)
+        reward_margin = chosen_rewards - rejected_rewards
+        accuracy = (logits > 0).float()
+    
+    return loss, chosen_rewards, rejected_rewards, reward_margin, accuracy
 
 
 def train(args):
-    """DPO training loop."""
-    if args.device == 'auto':
-        device_str = 'cuda' if torch.cuda.is_available() else 'cpu'
+    """Main DPO training loop."""
+    from brain.mamba2.model import TarsMamba2LM
+    from brain.tokenizer import TarsTokenizer
+    
+    # Device
+    if args.device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
     else:
-        device_str = args.device
-    device = torch.device(device_str)
+        device = args.device
+    
+    logger.info(f"Device: {device}")
     
     # Load model
-    from brain.mamba2.model import TarsMamba2LM
-    
-    actual_vocab = 256
-    policy = TarsMamba2LM(
-        d_model=args.d_model, n_layers=args.n_layers,
-        vocab_size=actual_vocab, quant_mode="fp16",
+    logger.info(f"Loading model from {args.model}...")
+    model, _ = TarsMamba2LM.load_pretrained(
+        checkpoint_path=args.model, device=device
     )
+    model.train()
     
-    save_path = Path(args.save_dir) / "mamba2_omega.pt"
-    # Prefer consolidated model (mamba2.pt) over raw training checkpoint
-    alt_path = Path(args.save_dir) / "mamba2.pt"
-    load_path = alt_path if alt_path.exists() else save_path
-    if args.resume and load_path.exists():
-        print(f"[Policy] Loading: {load_path}")
-        ckpt = torch.load(str(load_path), map_location='cpu', weights_only=False)
-        policy.load_state_dict(ckpt['model_state_dict'], strict=False)
-    
-    if args.grad_ckpt:
-        policy.use_checkpointing = True
-    policy.to(device)
-    
-    # Create frozen reference model (copy of policy at start)
-    print("[Ref] Creating frozen reference model...")
-    ref_model = copy.deepcopy(policy)
+    # Reference model (frozen copy)
+    logger.info("Creating reference model (frozen)...")
+    ref_model = copy.deepcopy(model)
     ref_model.eval()
     for p in ref_model.parameters():
         p.requires_grad = False
     
-    params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-    print(f"[Policy] {params/1e6:.1f}M trainable params")
+    # Tokenizer
+    tokenizer = TarsTokenizer()
     
     # Data
-    pairs = load_dpo_data(args.data, args.seq_len)
-    if not pairs:
-        print("[!] No DPO pairs found. Create data/dpo_pairs.jsonl first.")
+    data = load_preference_data(args.data)
+    if not data:
+        logger.error("No preference data found!")
         return
     
-    # Optimizer (very low LR for DPO)
-    optimizer = torch.optim.AdamW(policy.parameters(), lr=args.lr, weight_decay=0.01)
+    # Optimizer (low LR for alignment)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=0.01
+    )
     
-    use_amp = device.type == 'cuda'
-    amp_dtype = torch.bfloat16 if args.bf16 else torch.float16
-    # GradScaler needed for fp16 (not bf16) to prevent NaN gradients
-    use_scaler = use_amp and not args.bf16
-    scaler = torch.amp.GradScaler(device.type, enabled=use_scaler) if use_scaler else None
+    # Training
+    save_path = Path(args.save_dir) / "brain_dpo.pt"
+    os.makedirs(args.save_dir, exist_ok=True)
     
-    print(f"\n{'═'*60}")
-    print(f"  TARS DPO Alignment")
-    print(f"  β={args.beta} | LR={args.lr} | Pairs: {len(pairs)}")
-    print(f"{'═'*60}\n")
+    total_steps = 0
+    best_accuracy = 0.0
     
     for epoch in range(args.epochs):
-        t0 = time.time()
-        policy.train()
-        total_loss = total_margin = total_acc = 0
-        n = 0
+        epoch_loss = 0.0
+        epoch_acc = 0.0
+        epoch_margin = 0.0
+        n_batches = 0
         
-        indices = torch.randperm(len(pairs))
+        random.shuffle(data)
         
-        for i in range(0, len(pairs), args.batch):
-            batch_idx = indices[i:i+args.batch]
+        for i, item in enumerate(data):
+            prompt = item['prompt']
+            chosen = prompt + item['chosen']
+            rejected = prompt + item['rejected']
             
-            # Collect batch
-            chosen_in = torch.stack([pairs[j]['chosen_in'] for j in batch_idx])
-            chosen_tgt = torch.stack([pairs[j]['chosen_tgt'] for j in batch_idx])
-            rejected_in = torch.stack([pairs[j]['rejected_in'] for j in batch_idx])
-            rejected_tgt = torch.stack([pairs[j]['rejected_tgt'] for j in batch_idx])
+            chosen_ids = encode_text(tokenizer, chosen, args.max_len)
+            rejected_ids = encode_text(tokenizer, rejected, args.max_len)
             
             # Policy log probs
-            if use_amp:
-                with torch.amp.autocast(device.type, dtype=amp_dtype):
-                    pol_chosen = get_sequence_log_probs(policy, chosen_in, chosen_tgt, device)
-                    pol_rejected = get_sequence_log_probs(policy, rejected_in, rejected_tgt, device)
-            else:
-                pol_chosen = get_sequence_log_probs(policy, chosen_in, chosen_tgt, device)
-                pol_rejected = get_sequence_log_probs(policy, rejected_in, rejected_tgt, device)
+            policy_chosen_logps = get_log_probs(model, chosen_ids, device)
+            policy_rejected_logps = get_log_probs(model, rejected_ids, device)
             
-            # Reference log probs (frozen, no grad)
+            # Reference log probs (no grad)
             with torch.no_grad():
-                ref_chosen = get_sequence_log_probs(ref_model, chosen_in, chosen_tgt, device)
-                ref_rejected = get_sequence_log_probs(ref_model, rejected_in, rejected_tgt, device)
+                ref_chosen_logps = get_log_probs(ref_model, chosen_ids, device)
+                ref_rejected_logps = get_log_probs(ref_model, rejected_ids, device)
             
             # DPO loss
-            loss, margin, acc = dpo_loss(
-                pol_chosen, pol_rejected,
-                ref_chosen, ref_rejected,
-                args.beta
+            loss, chosen_r, rejected_r, margin, acc = dpo_loss(
+                policy_chosen_logps, policy_rejected_logps,
+                ref_chosen_logps, ref_rejected_logps,
+                beta=args.beta,
+                label_smoothing=args.label_smoothing,
             )
             
-            if scaler is not None:
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
-                optimizer.step()
             optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
             
-            total_loss += loss.item()
-            total_margin += margin
-            total_acc += acc
-            n += 1
+            epoch_loss += loss.item()
+            epoch_acc += acc.item()
+            epoch_margin += margin.item()
+            n_batches += 1
+            total_steps += 1
+            
+            if (i + 1) % 50 == 0:
+                avg_loss = epoch_loss / n_batches
+                avg_acc = epoch_acc / n_batches
+                logger.info(
+                    f"  [{epoch+1}/{args.epochs}] step {i+1}/{len(data)} | "
+                    f"loss={avg_loss:.4f} | acc={avg_acc:.1%}"
+                )
         
-        elapsed = time.time() - t0
-        print(f"Epoch {epoch+1}/{args.epochs} | "
-              f"Loss: {total_loss/n:.4f} | "
-              f"Margin: {total_margin/n:.3f} | "
-              f"Acc: {total_acc/n:.1%} | {elapsed:.1f}s")
+        avg_loss = epoch_loss / max(n_batches, 1)
+        avg_acc = epoch_acc / max(n_batches, 1)
+        avg_margin = epoch_margin / max(n_batches, 1)
         
-        # Save
-        os.makedirs(args.save_dir, exist_ok=True)
-        dpo_path = Path(args.save_dir) / "mamba2_omega_dpo.pt"
-        torch.save({
-            'model_state_dict': policy.state_dict(),
-            'config': {'d_model': args.d_model, 'n_layers': args.n_layers,
-                       'vocab_size': actual_vocab, 'dpo_beta': args.beta},
-            'epoch': epoch,
-        }, str(dpo_path))
-        # Also update main checkpoint
-        torch.save({
-            'model_state_dict': policy.state_dict(),
-            'config': {'d_model': args.d_model, 'n_layers': args.n_layers,
-                       'vocab_size': actual_vocab},
-        }, str(save_path))
-        print(f"  ✓ Saved: {dpo_path}")
+        logger.info(
+            f"Epoch {epoch+1}/{args.epochs}: "
+            f"loss={avg_loss:.4f} | acc={avg_acc:.1%} | margin={avg_margin:.3f}"
+        )
+        
+        if avg_acc > best_accuracy:
+            best_accuracy = avg_acc
+            checkpoint = {
+                'model_state_dict': model.state_dict(),
+                'dpo_epoch': epoch + 1,
+                'dpo_accuracy': avg_acc,
+                'dpo_beta': args.beta,
+            }
+            torch.save(checkpoint, str(save_path))
+            logger.info(f"  ✓ Best DPO saved: {save_path} (acc={avg_acc:.1%})")
     
-    # Cleanup ref model
-    del ref_model
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
-    
-    print(f"\n{'═'*60}")
-    print(f"  DPO Alignment complete!")
-    print(f"{'═'*60}")
+    logger.info(f"\nDPO complete! Best accuracy: {best_accuracy:.1%}")
 
 
 if __name__ == "__main__":

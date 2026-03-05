@@ -178,8 +178,10 @@ def train_instruct(model, tokenize_fn, texts: List[str],
     
     # Pre-tokenize (cp1251 → маленькие последовательности, быстро)
     logger.info(f"InstructTuning: Токенизация {len(texts)} примеров...")
-    answer_marker = list("### Ответ:".encode('cp1251', errors='replace'))
-    marker_len = len(answer_marker)
+    # ═══ Support both BPE and byte-level marker detection ═══
+    marker_text = "### Ответ:"
+    marker_tokens = tokenize_fn(marker_text).squeeze(0).tolist()
+    marker_len = len(marker_tokens)
     
     tokenized = []
     max_len = 512  # ограничиваем длину для скорости
@@ -198,16 +200,26 @@ def train_instruct(model, tokenize_fn, texts: List[str],
         optimizer, T_max=epochs * total_batches
     )
     
+    # Eval split (10%)
+    n_eval = max(2, len(tokenized) // 10)
+    eval_set = tokenized[-n_eval:]
+    train_set = tokenized[:-n_eval]
+    logger.info(f"InstructTuning: Train={len(train_set)}, Eval={len(eval_set)}")
+    
+    best_eval_loss = float('inf')
+    patience_counter = 0
+    patience = 3
+    
     model.train()
     
     for epoch in range(epochs):
-        random.shuffle(tokenized)
+        random.shuffle(train_set)
         total_loss = 0.0
         n_batches = 0
         t0 = time.time()
         
-        for i in range(0, len(tokenized), batch_size):
-            batch_tokens = tokenized[i:i + batch_size]
+        for i in range(0, len(train_set), batch_size):
+            batch_tokens = train_set[i:i + batch_size]
             batch_loss = torch.tensor(0.0, device=device)
             valid = 0
             
@@ -226,7 +238,7 @@ def train_instruct(model, tokenize_fn, texts: List[str],
                     token_list = tokens_1d.tolist()
                     answer_start = 0
                     for j in range(len(token_list) - marker_len):
-                        if token_list[j:j + marker_len] == answer_marker:
+                        if token_list[j:j + marker_len] == marker_tokens:
                             answer_start = j + marker_len
                             break
                     if answer_start > 0:
@@ -257,9 +269,37 @@ def train_instruct(model, tokenize_fn, texts: List[str],
                 speed = n_batches * batch_size / elapsed
                 logger.info(f"  [{n_batches}/{total_batches}] loss={total_loss/n_batches:.4f} | {speed:.0f} samples/s")
         
+        # Eval
+        model.eval()
+        eval_loss_total = 0.0
+        eval_count = 0
+        with torch.no_grad():
+            for tokens_1d in eval_set:
+                tokens = tokens_1d.unsqueeze(0).to(device)
+                input_ids = tokens[:, :-1]
+                labels = tokens[:, 1:]
+                with torch.amp.autocast(device.type, enabled=use_amp):
+                    logits = model(input_ids)
+                    el = criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+                eval_loss_total += el.item()
+                eval_count += 1
+        eval_loss = eval_loss_total / max(eval_count, 1)
+        model.train()
+        
         avg_loss = total_loss / max(1, n_batches)
         elapsed = time.time() - t0
-        logger.info(f"InstructTuning: Epoch {epoch+1}/{epochs}, loss={avg_loss:.4f}, time={elapsed:.1f}s")
+        is_best = eval_loss < best_eval_loss
+        marker = " ★ BEST" if is_best else ""
+        logger.info(f"InstructTuning: Epoch {epoch+1}/{epochs}, train={avg_loss:.4f}, eval={eval_loss:.4f}, time={elapsed:.1f}s{marker}")
+        
+        if is_best:
+            best_eval_loss = eval_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                logger.info(f"InstructTuning: ⏹ Early stopping ({patience} epochs without improvement)")
+                break
     
     logger.info("InstructTuning: ✅ Instruction tuning завершено")
     return model
@@ -359,8 +399,23 @@ if __name__ == "__main__":
     print(f"     epochs={args.epochs}, batch={args.batch}, lr={args.lr}")
     print(f"     device={device}")
     
+    # Tokenizer (BPE if trained, byte-level fallback)
+    from brain.tokenizer import TarsTokenizer
+    tokenizer = TarsTokenizer(mode="auto")
+    
+    # Read vocab_size from checkpoint if resuming
+    ckpt_vocab = 4096  # BPE default
+    if args.resume and load_path.exists():
+        try:
+            ckpt = torch.load(str(load_path), map_location='cpu', weights_only=True)
+            ckpt_vocab = ckpt.get('vocab_size', ckpt.get('config', {}).get('vocab_size', 4096))
+            del ckpt
+        except Exception:
+            pass
+    actual_vocab = max(ckpt_vocab, tokenizer.vocab_size)
+    
     model = TarsMamba2LM(
-        vocab_size=256,
+        vocab_size=actual_vocab,
         d_model=args.d_model,
         n_layers=args.n_layers,
     ).to(device)
@@ -372,7 +427,7 @@ if __name__ == "__main__":
     load_path = alt_path if alt_path.exists() else save_path
     if args.resume and load_path.exists():
         print(f"  🔄 Resuming from {load_path}")
-        ckpt = torch.load(str(load_path), map_location=device, weights_only=False)
+        ckpt = torch.load(str(load_path), map_location=device, weights_only=True)
         if 'model_state_dict' in ckpt:
             model.load_state_dict(ckpt['model_state_dict'], strict=False)
         else:
@@ -383,13 +438,8 @@ if __name__ == "__main__":
     if args.grad_ckpt and hasattr(model, 'use_checkpointing'):
         model.use_checkpointing = True
     
-    # Tokenizer (cp1251 byte-level)
     def tokenize_fn(text: str) -> torch.LongTensor:
-        try:
-            encoded = text.encode('cp1251', errors='replace')
-        except Exception:
-            encoded = text.encode('utf-8', errors='replace')
-        return torch.tensor([list(encoded)], dtype=torch.long)
+        return torch.tensor([tokenizer.encode(text)], dtype=torch.long)
     
     # Load instruction data
     texts = load_instruction_dataset(path=args.data)
@@ -416,7 +466,7 @@ if __name__ == "__main__":
         'config': {
             'd_model': args.d_model,
             'n_layers': args.n_layers,
-            'vocab_size': 256,
+            'vocab_size': actual_vocab,
             'phase': 'instruct',
         }
     }, str(save_path))

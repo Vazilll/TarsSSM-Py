@@ -132,12 +132,44 @@ _PATTERNS = {
 
 
 def classify_intent(query: str) -> str:
+    """
+    Классификация намерения с weighted scoring и tiebreaking.
+    
+    Улучшения:
+      - Приоритеты: DOC_WORK > EXECUTE > CODE > FILE_OP > WEB_SEARCH > ...
+      - Position bonus: ранние совпадения важнее
+      - Fallback: CHAT если нет совпадений
+    """
     q = query.lower()
+    
+    # Приоритеты для tiebreaking (выше = приоритетнее при равном score)
+    PRIORITY = {
+        Intent.DOC_WORK:    12,
+        Intent.EXECUTE:     10,
+        Intent.CODE:         9,
+        Intent.FILE_OP:      8,
+        Intent.WEB_SEARCH:   7,
+        Intent.ANALYZE:      6,
+        Intent.LEARN:        5,
+        Intent.SEARCH:       4,
+        Intent.REMEMBER:     3,
+        Intent.SKILL_USE:    2,
+        Intent.STATUS:       1,
+        Intent.CHAT:         0,
+    }
+    
     scores = {}
     for intent, patterns in _PATTERNS.items():
-        score = sum(len(re.findall(p, q)) for p in patterns)
+        score = 0.0
+        for p in patterns:
+            for m in re.finditer(p, q):
+                # Position bonus: совпадение в первых 30 символах = ×1.5
+                pos_bonus = 1.5 if m.start() < 30 else 1.0
+                score += pos_bonus
         scores[intent] = score
-    best = max(scores, key=scores.get)
+    
+    # Tiebreaking: при равном score выбираем по приоритету
+    best = max(scores, key=lambda k: (scores[k], PRIORITY.get(k, 0)))
     return best if scores[best] > 0 else Intent.CHAT
 
 
@@ -177,42 +209,65 @@ class AgentResult:
 def _auto_generate_tz(query: str) -> list:
     """
     Авто-генерация пунктов ТЗ из текста запроса.
-    Система ВСЕГДА сомневается — генерирует ТЗ для проверки.
+    
+    Улучшения v2:
+      - Извлекает сущности (файлы, URL, код)
+      - Генерирует измеримые пункты на основе intent + entities
+      - Контекстно-зависимые проверки
     """
     import re
     points = []
     q_lower = query.lower()
     
-    # Базовые пункты для любого запроса
-    points.append("Ответ соответствует вопросу")
-    points.append("Ответ полный и без пропусков")
+    # ═══ Извлечение сущностей ═══
+    files = re.findall(r'[\w/\\.-]+\.(?:py|txt|pdf|docx?|xlsx?|json|csv|md|html)', query)
+    urls = re.findall(r'https?://\S+', query)
+    code_keywords = re.findall(r'\b(?:функци\w*|class|def|return|import|модуль|метод)\b', q_lower)
+    numbers = re.findall(r'\b\d+(?:\.\d+)?\b', query)
+    quoted = re.findall(r'"([^"]+)"|«([^»]+)»', query)
+    quoted_flat = [q[0] or q[1] for q in quoted]
     
-    # Код
-    if any(w in q_lower for w in ["код", "функци", "класс", "code", "function", "script", "напиши"]):
+    # ═══ Базовые пункты ═══
+    points.append("Ответ непосредственно отвечает на запрос")
+    
+    if len(query) > 100:
+        points.append("Все части многосоставного запроса обработаны")
+    
+    # ═══ Контекстные пункты ═══
+    if files:
+        for f in files[:3]:
+            points.append(f"Файл '{f}' обработан корректно")
+        if any(f.endswith(('.py', '.js', '.ts')) for f in files):
+            points.append("Код из файлов синтаксически верен")
+    
+    if urls:
+        points.append("Информация из URL валидна и актуальна")
+    
+    if code_keywords:
         points.append("Код синтаксически корректен")
+        points.append("Обработаны граничные случаи (пустой вход, None, ошибки)")
         points.append("Код решает поставленную задачу")
-        points.append("Обработаны граничные случаи")
     
-    # Объяснение
     if any(w in q_lower for w in ["объясни", "расскажи", "как работает", "explain", "what is"]):
-        points.append("Объяснение понятно и структурировано")
-        points.append("Приведены примеры")
+        points.append("Объяснение структурировано (вступление → суть → пример)")
     
-    # Анализ
-    if any(w in q_lower for w in ["анализ", "сравни", "analyze", "compare", "review"]):
-        points.append("Анализ объективен")
-        points.append("Данные подкреплены фактами")
-        points.append("Есть заключение")
+    if any(w in q_lower for w in ["анализ", "сравни", "analyze", "compare"]):
+        points.append("Анализ подкреплён конкретными данными")
+        points.append("Есть финальное заключение")
     
-    # Поиск
-    if any(w in q_lower for w in ["найди", "поиск", "search", "find"]):
-        points.append("Найдены релевантные результаты")
-        points.append("Источники достоверны")
-    
-    # Действие
     if any(w in q_lower for w in ["сделай", "создай", "удали", "запусти", "create", "make", "run"]):
-        points.append("Действие выполнено корректно")
-        points.append("Результат проверен")
+        points.append("Действие выполнено и результат проверен")
+    
+    if numbers:
+        points.append("Числовые данные в ответе точны")
+    
+    if quoted_flat:
+        for q_text in quoted_flat[:2]:
+            points.append(f"Учтено упоминание: «{q_text[:50]}»")
+    
+    # Гарантируем минимум 3 пункта
+    if len(points) < 3:
+        points.append("Ответ полный и без пропусков")
     
     return points
 
@@ -279,6 +334,12 @@ class TarsAgent:
     
     async def run(self, query: str) -> AgentResult:
         """Полный цикл обработки задачи (Нервная система ТАРС)."""
+        # Input validation: cap query length to prevent abuse
+        MAX_QUERY_LEN = 4096
+        if len(query) > MAX_QUERY_LEN:
+            query = query[:MAX_QUERY_LEN]
+            logger.warning(f"Query truncated to {MAX_QUERY_LEN} chars")
+        
         start = time.time()
         steps: List[Step] = []
         
@@ -373,7 +434,8 @@ class TarsAgent:
         async def _search_leann():
             try:
                 return self.memory.search(query, top_k=5) or []
-            except Exception:
+            except Exception as e:
+                self._log(f"LEANN search error: {e}")
                 return []
         
         async def _search_skills():
@@ -684,9 +746,28 @@ class TarsAgent:
             return await self._do_search(query, ctx, steps)
         
         steps.append(Step("tool", f"Python: {code[:60]}"))
-        result = await self.tools.execute("shell", {
-            "command": f'python -c "{code}"', "cwd": self.workspace
-        })
+        
+        # Security: write code to temp file instead of embedding in shell string
+        # This prevents injection via quote escaping
+        import tempfile
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode='w', suffix='.py', dir=self.workspace,
+                delete=False, encoding='utf-8'
+            ) as tmp:
+                tmp.write(code)
+                tmp_path = tmp.name
+            
+            result = await self.tools.execute("shell", {
+                "command": f'python "{tmp_path}"', "cwd": self.workspace
+            })
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
         
         if result.is_error:
             return f"❌ Ошибка:\n```\n{result.output}\n```"

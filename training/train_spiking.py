@@ -173,8 +173,8 @@ def _get_data_limit_mb():
             elif vram_gb >= 20: return 50   # L4 / RTX 4090
             elif vram_gb >= 14: return 30   # T4
             else:               return 20   # маленький GPU
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"GPU detection error: {e}")
     return 20  # CPU
 
 
@@ -312,8 +312,8 @@ def train_spiking(args):
             model = torch.compile(model, mode="default")
             compiled = True
             logger.info("torch.compile: ON (default)")
-        except Exception:
-            logger.info("torch.compile: недоступен")
+        except Exception as e:
+            logger.info(f"torch.compile: недоступен ({e})")
     
     # ── Gradient Accumulation ──
     accum_steps = 1
@@ -333,7 +333,7 @@ def train_spiking(args):
     best_loss = float('inf')
     
     if args.resume and last_path.exists():
-        ckpt = torch.load(str(last_path), map_location=device, weights_only=False)
+        ckpt = torch.load(str(last_path), map_location=device, weights_only=True)
         _raw = getattr(model, '_orig_mod', model)
         _raw.load_state_dict(ckpt['model_state_dict'], strict=False)
         start_epoch = ckpt.get('epoch', 0)

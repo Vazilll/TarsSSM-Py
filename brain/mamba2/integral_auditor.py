@@ -378,11 +378,13 @@ class TemporalEmbedding(nn.Module):
         self.register_buffer('_start_time', torch.tensor(0.0))
         self._initialized = False
     
+    @torch.compiler.disable
     def _get_time_seconds(self) -> float:
         """Получить текущее время в секундах от начала сессии.
         
-        NOTE: Decorated to skip torch.compile — time.time() is a Python
-        side-effect that causes graph breaks on every call.
+        NOTE: Decorated with @torch.compiler.disable — time.time() is a Python
+        side-effect that causes graph breaks on every call, leading to
+        recompilation storms (hitting config.recompile_limit).
         """
         import time as _time
         if not self._initialized:
@@ -390,6 +392,7 @@ class TemporalEmbedding(nn.Module):
             self._initialized = True
         return _time.time() - self._start_time.item()
     
+    @torch.compiler.disable
     def forward(self, h: torch.Tensor, t_override: float = None) -> torch.Tensor:
         """
         Добавляет временное кодирование к hidden state.

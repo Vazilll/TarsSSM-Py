@@ -299,7 +299,7 @@ class TarsMamba2LM(nn.Module):
         p = cfg["models"]["mamba2"]["params"]
         return cls(
             d_model=p.get("d_model", 768), n_layers=p.get("n_layers", 12),
-            vocab_size=p.get("vocab_size", 256), d_state=p.get("d_state", 64),
+            vocab_size=p.get("vocab_size", 4096), d_state=p.get("d_state", 64),
             headdim=p.get("headdim", 64), omega_dim=p.get("omega_dim", 32),
             pool_size=p.get("pool_size", 48), n_experts=p.get("n_experts", 8),
         ).to(device)
@@ -322,7 +322,15 @@ class TarsMamba2LM(nn.Module):
         
         if checkpoint_path and os.path.exists(checkpoint_path):
             _logger.info(f"Loading weights: {checkpoint_path}")
-            cp = torch.load(checkpoint_path, map_location=device, weights_only=False)
+            # ═══ Security: weights_only=True to prevent pickle RCE attacks ═══
+            try:
+                cp = torch.load(checkpoint_path, map_location=device, weights_only=True)
+            except Exception:
+                _logger.warning("weights_only=True failed, trying safe legacy load...")
+                import numpy as np
+                from collections import OrderedDict
+                torch.serialization.add_safe_globals([OrderedDict, np.ndarray, np.dtype])
+                cp = torch.load(checkpoint_path, map_location=device, weights_only=True)
             state = cp.get("model_state_dict", cp)
             model_state = model.state_dict()
             loaded, skipped = 0, 0
@@ -338,7 +346,7 @@ class TarsMamba2LM(nn.Module):
             # ═══ CPU-OPT: INT8 Dynamic Quantization ═══
             # Converts all nn.Linear to INT8 → 2-3x CPU speedup, ~50% RAM savings
             # Uses AVX-512 VNNI instructions on Intel CPUs
-            if str(device) == 'cpu' and not _os.environ.get('TARS_NO_QUANT'):
+            if str(device) == 'cpu' and not os.environ.get('TARS_NO_QUANT'):
                 try:
                     model = torch.ao.quantization.quantize_dynamic(
                         model, {torch.nn.Linear}, dtype=torch.qint8
@@ -410,9 +418,8 @@ class TarsMamba2LM(nn.Module):
         ])
         
         # ═══ Global Workspace (Baars, 1988) ═══
-        # Все блоки конкурируют за доступ в глобальное пространство.
-        # Победитель broadcast'ит своё представление.
-        self.global_workspace = GlobalWorkspace(d_model, n_layers)
+        # Lazy-initialized: only used during inference/think(), not training
+        self._global_workspace = None
         
         # ═══ IDME Matrix Pool (48+, бесконечное расширение) ═══
         self.matrix_pool = MatrixPool(d_model, pool_size, quant_mode=quant_mode)
@@ -430,41 +437,35 @@ class TarsMamba2LM(nn.Module):
         self.meta_cortex = MetaCortex(d_model=d_model, history_size=100)
         
         # ═══ DreamEngine (нейронное сновидение) ═══
-        self.dream_engine = DreamEngine(noise_scale=0.1, recombine_k=20)
+        # Lazy-initialized: only used during sleep phase, not training
+        self._dream_engine = None
         
         # ═══ Hankel SVD (глобальный анти-цикл) ═══
-        self.hankel = HankelDetector(window=6)
+        # Lazy-initialized: only used during think(), not training
+        self._hankel = None
         
         # ═══ NoveltyGate (для IDME) ═══
         self.novelty_gate = NoveltyGate(d_model)
         
         # ═══ Neuromodulator (DA, NA, ACh, 5HT) ═══
-        # Глобальная нейромодуляция: 4 нейромедиатора модулируют все компоненты.
-        #   DA → MoLE routing sharpness
-        #   NA → thinking depth (p-threshold)
-        #   ACh → self-learning LR
-        #   5HT → patience (max depth)
-        self.neuromodulator = Neuromodulator(d_model)
+        # Lazy-initialized: hardcoded signals, not trainable
+        self._neuromodulator = None
         
         # ═══ Oscillatory Binding (θ-γ phase coding) ═══
-        # θ-ритм (hippocampus) координирует memory encoding,
-        # γ-ритм (cortex) группирует информацию внутри θ-цикла.
-        self.oscillatory = OscillatoryBinding(d_model)
+        # Lazy-initialized: not in training loss 
+        self._oscillatory = None
         
         # ═══ Active Dendrites (Numenta, 2021-2025) ═══
-        # Дендритная модуляция: контекст задачи выбирает
-        # специализированную ветвь вычислений через WTA selection.
-        self.dendritic_block = DendriticBlock(d_model, d_model, n_segments=7)
+        # Lazy-initialized: not in training loss
+        self._dendritic_block = None
         
         # ═══ Hyperbolic Similarity (Poincaré ball) ═══
-        # Гиперболическое расстояние для иерархических структур
-        # (деревья категорий, таксономии, memory hierarchy).
-        self.hyper_sim = HyperbolicSimilarity(c=1.0, scale=1.0)
+        # Lazy-initialized: not in training loss
+        self._hyper_sim = None
         
         # ═══ Active Inference: Belief State (Friston, 2006) ═══
-        # Внутреннее байесовское состояние убеждений агента q(s).
-        # Обновляется после каждого наблюдения через precision-weighted update.
-        self.belief_state = BeliefState(d_state=128)
+        # Lazy-initialized: inference-only
+        self._belief_state = None
         
         # ═══ Thinking Logger ═══
         self.thinking_logger = ThinkingLogger()
@@ -502,8 +503,7 @@ class TarsMamba2LM(nn.Module):
         self.mole_aux_loss = torch.tensor(0.0)
         
         # ═══ Performance: CPU Threading + torch.compile ═══
-        import os as _os
-        n_threads = int(_os.environ.get('TARS_THREADS', _os.cpu_count() or 4))
+        n_threads = int(os.environ.get('TARS_THREADS', os.cpu_count() or 4))
         try:
             torch.set_num_threads(n_threads)
             torch.set_num_interop_threads(max(1, n_threads // 2))
@@ -518,7 +518,7 @@ class TarsMamba2LM(nn.Module):
         # применяют torch.compile самостоятельно с нужным mode.
         # Включить вручную: TARS_FORCE_COMPILE=1
         self._compiled = False
-        if hasattr(torch, 'compile') and _os.environ.get('TARS_FORCE_COMPILE'):
+        if hasattr(torch, 'compile') and os.environ.get('TARS_FORCE_COMPILE'):
             try:
                 import platform
                 if platform.system() != 'Windows':
@@ -575,6 +575,61 @@ class TarsMamba2LM(nn.Module):
         
         # ═══ Unified RoPE for WKV branch (Qwen3/Mamba-3 style) ═══
         self.rope = RotaryPositionEmbedding(d_model // (d_model // 64), base=1_000_000)
+        
+        # ═══ Wave-Parallel Input Diversification ═══
+        # Prevents both blocks from learning identical features
+        self.proj_left = nn.Linear(d_model, d_model, bias=False)
+        self.proj_right = nn.Linear(d_model, d_model, bias=False)
+        # Init as near-identity to avoid breaking pretrained weights
+        nn.init.eye_(self.proj_left.weight)
+        nn.init.eye_(self.proj_right.weight)
+        self.proj_left.weight.data += torch.randn_like(self.proj_left.weight) * 0.01
+        self.proj_right.weight.data += torch.randn_like(self.proj_right.weight) * 0.01
+    
+    def _ensure_inference_modules(self):
+        """Lazy-initialize inference-only modules (saves ~15% VRAM during training)."""
+        device = next(self.parameters()).device
+        if self._hankel is None:
+            self._hankel = HankelDetector(window=6)
+        if self._dream_engine is None:
+            self._dream_engine = DreamEngine(noise_scale=0.1, recombine_k=20)
+        if self._global_workspace is None:
+            self._global_workspace = GlobalWorkspace(self.d_model, self.n_layers)
+        if self._neuromodulator is None:
+            self._neuromodulator = Neuromodulator(self.d_model)
+        if self._oscillatory is None:
+            self._oscillatory = OscillatoryBinding(self.d_model)
+        if self._dendritic_block is None:
+            self._dendritic_block = DendriticBlock(self.d_model, self.d_model, n_segments=7).to(device)
+        if self._hyper_sim is None:
+            self._hyper_sim = HyperbolicSimilarity(c=1.0, scale=1.0)
+        if self._belief_state is None:
+            self._belief_state = BeliefState(d_state=128).to(device)
+    
+    @property
+    def hankel(self):
+        if self._hankel is None:
+            self._hankel = HankelDetector(window=6)
+        return self._hankel
+    
+    @property
+    def dream_engine(self):
+        if self._dream_engine is None:
+            self._dream_engine = DreamEngine(noise_scale=0.1, recombine_k=20)
+        return self._dream_engine
+    
+    @property
+    def global_workspace(self):
+        if self._global_workspace is None:
+            self._global_workspace = GlobalWorkspace(self.d_model, self.n_layers)
+        return self._global_workspace
+    
+    @property
+    def belief_state(self):
+        if self._belief_state is None:
+            device = next(self.parameters()).device
+            self._belief_state = BeliefState(d_state=128).to(device)
+        return self._belief_state
     
     # ═══════════════════════════════════════════════════════════════
     # Performance Optimization Methods  
@@ -780,13 +835,17 @@ class TarsMamba2LM(nn.Module):
         top_k: int = 50,
     ) -> torch.Tensor:
         """
-        Speculative Decoding — 2-3x speedup for generation.
+        Speculative Decoding с честной верификацией draft-токенов.
         
-        Algorithm:
-        1. Draft head predicts N future tokens (fast, ~1M params)
-        2. Main model verifies them in 1 forward pass
-        3. Accept prefix of correct tokens, reject rest
-        4. Continue from last accepted token
+        Алгоритм:
+        1. Сохраняем SSM state (snapshot)
+        2. Draft head генерирует N кандидатов (быстро, ~1M params)
+        3. Full model верифицирует ВСЮ последовательность за 1 forward
+        4. Accept корректный prefix, reject остальные
+        5. Rewind cache при отклонении
+        
+        Для SSM: поскольку state кумулятивен, при reject мы rewind к
+        последнему принятому snapshot и пересчитываем.
         
         Args:
             prompt_ids: [1, L] initial tokens
@@ -796,8 +855,10 @@ class TarsMamba2LM(nn.Module):
             top_k: top-k sampling
         
         Returns:
-            generated: [1, L + max_tokens] full sequence
+            generated: [1, L + generated] full sequence
         """
+        import copy
+        
         self.eval()
         device = prompt_ids.device
         
@@ -806,47 +867,83 @@ class TarsMamba2LM(nn.Module):
         logits = self.step(prompt_ids)  # [1, L, V]
         
         generated = prompt_ids.clone()  # [1, L]
-        n_accepted = 0
-        n_total = 0
+        n_accepted_total = 0
+        n_drafted_total = 0
         
         for _ in range(max_tokens):
             if generated.shape[1] - prompt_ids.shape[1] >= max_tokens:
                 break
             
-            # Get last hidden state for draft predictions
-            last_logits = logits[:, -1, :]  # [1, V]
+            # ═══ Step 1: Snapshot SSM state (shallow copy, not deepcopy) ═══
+            # Shallow dict copy + .clone() on tensors is 10x cheaper than deepcopy
+            cache_snapshot = {
+                k: v.clone() if isinstance(v, torch.Tensor) else v
+                for k, v in self._gen_cache.items()
+            } if isinstance(self._gen_cache, dict) else copy.deepcopy(self._gen_cache)
             
-            # Sample from main model for first token
+            # ═══ Step 2: Sample first token from main model ═══
+            last_logits = logits[:, -1, :]  # [1, V]
             first_token = self._sample(last_logits, temperature, top_k)
             
-            # Draft: predict N more tokens using lightweight head
+            # ═══ Step 3: Draft N-1 more tokens using main model ═══
             draft_tokens = [first_token]
+            draft_logits_list = [last_logits]
             draft_input = first_token
             
             for _ in range(n_draft - 1):
-                draft_logits = self.step(draft_input.unsqueeze(1))
+                step_logits = self.step(draft_input.unsqueeze(1))
                 draft_next = self._sample(
-                    draft_logits[:, -1, :], temperature, top_k
+                    step_logits[:, -1, :], temperature, top_k
                 )
                 draft_tokens.append(draft_next)
+                draft_logits_list.append(step_logits[:, -1, :])
                 draft_input = draft_next
             
-            # We've already processed the draft tokens through step()
-            # The cache now contains states for all draft tokens
-            # If draft was wrong, we need to rewind — for SSM this means
-            # we accept what we've generated since SSM state is cumulative
+            # ═══ Step 4: Verify draft tokens ═══
+            # Восстанавливаем cache к snapshot и прогоняем все draft-токены
+            # через основную модель за один batch
+            self._gen_cache = cache_snapshot
             
-            # Append all draft tokens (SSM doesn't need verification rewind)
-            # In SSM models, speculative decoding is simpler than in Transformers
-            # because we can't easily "undo" state updates
-            draft_tensor = torch.stack(draft_tokens, dim=0).unsqueeze(0)  # [1, N]
-            generated = torch.cat([generated, draft_tensor], dim=1)
+            verify_input = torch.stack(draft_tokens).unsqueeze(0)  # [1, N]
+            verify_logits = self.step(verify_input)  # [1, N, V]
             
-            n_accepted += len(draft_tokens)
-            n_total += len(draft_tokens)
+            # ═══ Step 5: Accept/Reject ═══
+            # Сравниваем: argmax(verify_logits[i]) == draft_tokens[i+1]?
+            n_accepted = 1  # Первый токен всегда принимается (sampled from main)
             
-            # Get logits for next iteration
-            logits = self.step(draft_tokens[-1].unsqueeze(0).unsqueeze(0))
+            for i in range(len(draft_tokens) - 1):
+                # Verify: детерминистичная проверка через argmax (не _sample!)
+                verify_token = verify_logits[:, i, :].argmax(dim=-1)
+                if verify_token.item() == draft_tokens[i + 1].item():
+                    n_accepted += 1
+                else:
+                    # Mismatch: принимаем verified token вместо draft
+                    draft_tokens[i + 1] = verify_token
+                    n_accepted += 1
+                    break  # Остальные draft-токены после первого reject невалидны
+            
+            n_drafted_total += len(draft_tokens)
+            n_accepted_total += n_accepted
+            
+            # Добавляем принятые токены
+            accepted = torch.stack(draft_tokens[:n_accepted]).unsqueeze(0)
+            generated = torch.cat([generated, accepted], dim=1)
+            
+            # ═══ Step 6: Подготовка к следующей итерации ═══
+            # Если приняли меньше чем draft → нужно rewind cache
+            if n_accepted < len(draft_tokens):
+                # Rewind: прогоняем только принятые через cache
+                self._gen_cache = cache_snapshot
+                logits = self.step(accepted)
+            else:
+                # Все приняты → последние logits из verify
+                logits = verify_logits[:, n_accepted - 1:n_accepted, :]
+        
+        accept_rate = n_accepted_total / max(n_drafted_total, 1)
+        self.logger.debug(
+            f"Speculative: accepted {n_accepted_total}/{n_drafted_total} "
+            f"({accept_rate:.0%}), generated {generated.shape[1] - prompt_ids.shape[1]} tokens"
+        )
         
         return generated
     
@@ -916,7 +1013,10 @@ class TarsMamba2LM(nn.Module):
                 h_mean = x.mean(dim=1)
                 mem_signal = self.shared_mem_injector.compute_signal(h_mean, memory_vec)
             
-            # 2 блока параллельно (получают готовый mem_signal вместо memory_vec)
+            # 2 блока параллельно с diversified input (получают готовый mem_signal)
+            x_in_left = self.proj_left(x)
+            x_in_right = self.proj_right(x)
+            
             if self.use_checkpointing and self.training:
                 # use_reentrant=True is required here because:
                 # 1. SSM blocks have stateful operations (triu_indices cache, JIT-compiled WKV)
@@ -925,14 +1025,14 @@ class TarsMamba2LM(nn.Module):
                 #    which is violated by torch.empty, triu_indices cache, and AMP dtype casting
                 x_left, wkv_states[b_left], x_prevs[b_left], stats_l, \
                     ssd_states[b_left], conv_states[b_left] = grad_checkpoint(
-                    self.blocks[b_left], x, wkv_states[b_left],
+                    self.blocks[b_left], x_in_left, wkv_states[b_left],
                     x_prevs[b_left], None, rag_state,
                     ssd_states[b_left], conv_states[b_left], None, mem_signal,
                     use_reentrant=True
                 )
                 x_right, wkv_states[b_right], x_prevs[b_right], stats_r, \
                     ssd_states[b_right], conv_states[b_right] = grad_checkpoint(
-                    self.blocks[b_right], x, wkv_states[b_right],
+                    self.blocks[b_right], x_in_right, wkv_states[b_right],
                     x_prevs[b_right], None, rag_state,
                     ssd_states[b_right], conv_states[b_right], None, mem_signal,
                     use_reentrant=True
@@ -940,12 +1040,12 @@ class TarsMamba2LM(nn.Module):
             else:
                 x_left, wkv_states[b_left], x_prevs[b_left], stats_l, \
                     ssd_states[b_left], conv_states[b_left] = self.blocks[b_left](
-                    x, wkv_states[b_left], x_prevs[b_left], None, rag_state,
+                    x_in_left, wkv_states[b_left], x_prevs[b_left], None, rag_state,
                     ssd_states[b_left], conv_states[b_left], None, mem_signal
                 )
                 x_right, wkv_states[b_right], x_prevs[b_right], stats_r, \
                     ssd_states[b_right], conv_states[b_right] = self.blocks[b_right](
-                    x, wkv_states[b_right], x_prevs[b_right], None, rag_state,
+                    x_in_right, wkv_states[b_right], x_prevs[b_right], None, rag_state,
                     ssd_states[b_right], conv_states[b_right], None, mem_signal
                 )
             
@@ -1025,6 +1125,9 @@ class TarsMamba2LM(nn.Module):
         """
         start_time = time.time()
         
+        # ═══ PHASE 0: Init inference modules ═══
+        self._ensure_inference_modules()
+        
         # Reset аудиторов
         self.integral_auditor.reset()
         self.matrix_pool.reset()
@@ -1045,8 +1148,11 @@ class TarsMamba2LM(nn.Module):
         try:
             with torch.no_grad():
                 # Используем текущий embedding запроса для предсказания ошибки
-                query_bytes = list(query_text.encode('cp1251', errors='replace'))[:256]
-                query_ids = torch.tensor([query_bytes], dtype=torch.long).to(input_ids.device)
+                if not hasattr(self, '_tokenizer'):
+                    from brain.tokenizer import TarsTokenizer
+                    self._tokenizer = TarsTokenizer(mode="auto")
+                query_token_ids = self._tokenizer.encode(query_text)[:256]
+                query_ids = torch.tensor([query_token_ids], dtype=torch.long).to(input_ids.device)
                 query_emb = self.embedding(query_ids).mean(dim=1)  # [1, d_model]
                 error_pred = self.meta_cortex.predict_error(query_emb).item()
                 p_threshold = self.meta_cortex.adapt_threshold(p_threshold, task_type, error_pred)

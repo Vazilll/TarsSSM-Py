@@ -123,8 +123,8 @@ def create_whisper_config(data_dir: str = None, output_path: str = None):
                 text = fh.read()
             all_text += " " + text
             logger.info(f"  📄 {f.name}: {len(text):,} символов")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Skipped {f.name}: {e}")
     
     if not all_text:
         logger.warning("⚠ Нет данных для анализа")

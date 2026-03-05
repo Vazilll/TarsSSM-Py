@@ -56,6 +56,12 @@ class FileHelper:
         if not folder_path.exists():
             return f"❌ Папка не найдена: {folder_path}"
         
+        # ═══ Path traversal guard: only allow folders under home ═══
+        try:
+            folder_path.resolve().relative_to(self.home)
+        except ValueError:
+            return f"❌ Доступ запрещён: {folder_path} (только папки в {self.home})"
+        
         moves = defaultdict(list)
         
         for f in folder_path.iterdir():
@@ -106,13 +112,20 @@ class FileHelper:
     def search(self, query: str, folder: str = None, 
                search_content: bool = False) -> str:
         """Поиск файлов по имени (и содержимому)."""
-        search_dirs = [Path(folder)] if folder else [self.home]
+        # ═══ Default to Downloads instead of home (performance) ═══
+        search_dirs = [Path(folder)] if folder else [self.downloads]
         results = []
         query_lower = query.lower()
+        max_depth = 4  # ═══ Limit walk depth ═══
         
         for search_dir in search_dirs:
             try:
                 for root, dirs, files in os.walk(str(search_dir)):
+                    # Limit depth
+                    depth = str(root).count(os.sep) - str(search_dir).count(os.sep)
+                    if depth >= max_depth:
+                        dirs.clear()
+                        continue
                     # Пропускаем системные папки
                     dirs[:] = [d for d in dirs if not d.startswith('.') 
                               and d not in ('node_modules', '__pycache__', '.git', 'venv')]
@@ -171,7 +184,7 @@ class FileHelper:
             hashes = defaultdict(list)
             for f in files:
                 try:
-                    h = hashlib.md5(f.read_bytes()[:8192]).hexdigest()
+                    h = hashlib.sha256(f.read_bytes()[:65536]).hexdigest()
                     hashes[h].append(f)
                 except (OSError, PermissionError):
                     pass

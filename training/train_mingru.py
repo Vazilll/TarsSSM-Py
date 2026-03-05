@@ -45,8 +45,8 @@ sys.path.insert(0, str(ROOT))
 
 from brain.min_gru.mingru_lm import MinGRU_LM
 from training.train_corpus import get_training_text
-from brain.min_gru.utils import tokenize_text, decode_tokens
 from brain.min_gru.generate import generate_text
+from brain.tokenizer import TarsTokenizer, reset_tokenizer
 from training.train_utils import (
     TrainLogger, GradientMonitor, ThroughputTracker,
     CurriculumSchedule, make_optimizer, make_lr_schedule,
@@ -65,6 +65,7 @@ def parse_args():
     p.add_argument('--layers', type=int, default=6, help="Количество слоёв MinGRU (4/6/8)")
     p.add_argument('--context_dim', type=int, default=1024, help="Размерность контекста Ω-SSM")
     p.add_argument('--seq_len', type=int, default=512, help="Длина контекстного окна")
+    p.add_argument('--vocab_size', type=int, default=4096, help="Размер словаря BPE (0=byte-level 256)")
     p.add_argument('--batch', type=int, default=32, help="Стартовый размер батча (авто-увеличится)")
     p.add_argument('--epochs', type=int, default=100, help="Количество эпох")
     p.add_argument('--lr', type=float, default=1e-3, help="Начальная скорость обучения")
@@ -72,7 +73,10 @@ def parse_args():
     p.add_argument('--label_smoothing', type=float, default=0.1, help="Label smoothing (0=off)")
     p.add_argument('--dropout', type=float, default=0.1, help="Dropout rate")
     p.add_argument('--patience', type=int, default=7, help="Early stopping patience (0=off)")
-    p.add_argument('--augment', action='store_true', help="Скачать доп. данные с HuggingFace")
+    p.add_argument('--augment', action='store_true', default=True,
+                   help="Скачать доп. данные с HuggingFace (включено по умолч., 50KB корпуса мало)")
+    p.add_argument('--no_augment', action='store_true',
+                   help="НЕ скачивать доп. данные (только встроенный корпус)")
     p.add_argument('--max_samples', type=int, default=0, help="Макс. примеров (0 = без ограничений)")
     p.add_argument('--resume', action='store_true', help="Продолжить обучение с чекпоинта")
     p.add_argument('--save_every', type=int, default=10, help="Сохранять чекпоинт каждые N эпох")
@@ -108,7 +112,7 @@ def _get_gpu_data_limits():
             else:               # маленький GPU
                 return 20, 100_000
     except Exception:
-        pass
+        pass  # GPU detection fallback — logged intentionally silent
     return 20, 100_000  # CPU fallback
 
 
@@ -116,14 +120,17 @@ def _get_gpu_data_limits():
 # Подготовка данных
 # ═══════════════════════════════════════════
 
-def prepare_data(text: str, seq_length: int, max_samples: int = 0):
-    """Нарезает текст на пары (input, target) для next-byte prediction."""
-    tokens = tokenize_text(text)
+def prepare_data(text: str, seq_length: int, max_samples: int = 0, tokenizer: TarsTokenizer = None):
+    """Нарезает текст на пары (input, target) для next-token prediction."""
+    if tokenizer is not None:
+        tokens = tokenizer.encode(text)
+    else:
+        tokens = list(text.encode('cp1251', errors='replace'))
     
     if max_samples > 0:
-        max_chars = max_samples * seq_length
-        if len(tokens) > max_chars:
-            tokens = tokens[:max_chars]
+        max_toks = max_samples * seq_length
+        if len(tokens) > max_toks:
+            tokens = tokens[:max_toks]
             
     inputs = []
     targets = []
@@ -190,8 +197,8 @@ def augment_with_huggingface():
                     total_bytes += text_bytes
                     size_kb = text_bytes / 1024
                     print(f"[Augment] Кэш: {hf_file.name} ({size_kb:.0f} KB)")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Augment cache read error: {e}")
     
     if cached_texts:
         result = "\n\n".join(cached_texts)
@@ -267,14 +274,16 @@ def _find_max_batch(model, device, seq_len):
     """
     was_training = model.training
     model.train()
+    # Get actual vocab size from model embedding
+    vocab = model.embedding.num_embeddings
     lo, hi = 32, 4096
     best = 32
     while lo <= hi:
         mid = (lo + hi) // 2
         try:
             torch.cuda.empty_cache()
-            dummy_in = torch.randint(0, 256, (mid, seq_len), device=device)
-            dummy_tgt = torch.randint(0, 256, (mid, seq_len), device=device)
+            dummy_in = torch.randint(0, vocab, (mid, seq_len), device=device)
+            dummy_tgt = torch.randint(0, vocab, (mid, seq_len), device=device)
             with torch.amp.autocast(device.type):
                 logits = model(dummy_in)
                 loss = F.cross_entropy(
@@ -335,6 +344,9 @@ def train(args):
     if tars_mem:
         corpus_parts.append(tars_mem)
     
+    if hasattr(args, 'no_augment') and args.no_augment:
+        args.augment = False
+    
     if args.augment:
         hf_text = augment_with_huggingface()
         if hf_text:
@@ -342,27 +354,53 @@ def train(args):
     
     corpus = "\n\n".join(corpus_parts)
     
-    corpus_bytes = len(corpus.encode('cp1251', errors='replace'))
+    corpus_bytes = len(corpus.encode('utf-8', errors='replace'))
     if corpus_bytes < 100_000:
         repeat = max(1, 100_000 // corpus_bytes)
         corpus = ("\n\n" + corpus) * repeat
         print(f"[Data] Корпус повторён {repeat}x для стабильности")
-        corpus_bytes = len(corpus.encode('cp1251', errors='replace'))
+        corpus_bytes = len(corpus.encode('utf-8', errors='replace'))
     
     corpus_mb = corpus_bytes / (1024 * 1024)
     print(f"[Data] Итоговый корпус: {len(corpus)} символов, {corpus_mb:.1f} MB")
     
+    # ═══ Tokenizer: обучить BPE или использовать byte-level ═══
+    vocab_size = args.vocab_size
+    reset_tokenizer()  # сбросить singleton
+    if vocab_size > 0:
+        print(f"\n[Tokenizer] Обучение SentencePiece BPE (vocab={vocab_size})...")
+        try:
+            tokenizer = TarsTokenizer.train(
+                corpus_text=corpus,
+                vocab_size=vocab_size,
+            )
+            print(f"[Tokenizer] ✅ BPE обучен: vocab={tokenizer.vocab_size}")
+            # Test compression
+            sample = "Привет! Я ТАРС, готов помочь."
+            sample_toks = tokenizer.encode(sample)
+            sample_bytes = len(sample.encode('utf-8'))
+            print(f"[Tokenizer] Компрессия: '{sample}' → {len(sample_toks)} токенов "
+                  f"(было бы {sample_bytes} байтов, {sample_bytes / len(sample_toks):.1f}x сжатие)")
+        except Exception as e:
+            print(f"[Tokenizer] ⚠ BPE не удалось ({e}), fallback на byte-level")
+            tokenizer = TarsTokenizer(mode="byte")
+            vocab_size = 256
+    else:
+        print(f"[Tokenizer] Byte-level режим (vocab=256)")
+        tokenizer = TarsTokenizer(mode="byte")
+        vocab_size = 256
+    
+    actual_vocab = tokenizer.vocab_size
+    
     # ═══ RAM Safety: авто-лимит по GPU ═══
-    # T4: 200K samples, L4: 500K, A100: без лимита
     _, gpu_max_samples = _get_gpu_data_limits()
     max_samples = args.max_samples
     if max_samples == 0 and gpu_max_samples > 0 and corpus_mb > 60:
         max_samples = gpu_max_samples
         print(f"[Data] ⚠ GPU авто-лимит: {max_samples:,} samples (корпус {corpus_mb:.0f} MB)")
-        print(f"[Data]   MinGRU System 1 — полный корпус обрабатывает Mamba-2")
     
     # ═══ Подготовка тензоров ═══
-    inputs, targets = prepare_data(corpus, args.seq_len, max_samples=max_samples)
+    inputs, targets = prepare_data(corpus, args.seq_len, max_samples=max_samples, tokenizer=tokenizer)
     print(f"[Data] Создано {len(inputs)} обучающих примеров (seq_len={args.seq_len})")
     
     # Освобождаем корпус из RAM
@@ -386,7 +424,7 @@ def train(args):
     # ═══ Модель ═══
     model = MinGRU_LM(
         dim=args.dim, 
-        num_tokens=256,
+        num_tokens=actual_vocab,
         num_layers=args.layers,
         context_dim=args.context_dim,
         dropout=args.dropout,
@@ -396,7 +434,7 @@ def train(args):
     start_epoch = 0
     if args.resume and weights_path.exists():
         print(f"[Model] Загрузка чекпоинта: {weights_path}")
-        checkpoint = torch.load(str(weights_path), map_location='cpu', weights_only=False)
+        checkpoint = torch.load(str(weights_path), map_location='cpu', weights_only=True)
         cp_dim = checkpoint.get('dim', 256)
         cp_layers = checkpoint.get('num_layers', 4)
         if cp_dim == args.dim and cp_layers == args.layers:
@@ -429,8 +467,8 @@ def train(args):
             model = torch.compile(model, mode="default")
             compiled = True
             print("[Model] torch.compile: ON (default)")
-        except Exception:
-            print("[Model] torch.compile: недоступен, пропуск")
+        except Exception as e:
+            print(f"[Model] torch.compile: недоступен ({e}), пропуск")
     
     # ═══ Gradient Accumulation ═══
     accum_steps = 1
@@ -729,7 +767,8 @@ def train(args):
         with torch.no_grad():  # Защита от утечки VRAM при генерации
             for prompt in prompts:
                 sample = generate_text(model, start_text=prompt, max_length=80, 
-                                       temperature=0.7, device=device)
+                                       temperature=0.7, device=device,
+                                       tokenizer=tokenizer)
                 answer = sample.split("Ответ:")[-1].strip() if "Ответ:" in sample else sample
                 q = prompt.split(chr(10))[0].replace('Вопрос: ', '')
                 print(f"    Q: {q}")
@@ -746,10 +785,11 @@ def train(args):
                 'model_state_dict': ema_state,
                 'model_state_dict_raw': {k: v.clone() for k, v in getattr(model, '_orig_mod', model).state_dict().items()},
                 'dim': args.dim,
-                'num_tokens': 256,
+                'num_tokens': actual_vocab,
                 'num_layers': args.layers,
                 'context_dim': args.context_dim,
                 'dropout': args.dropout,
+                'tokenizer_mode': tokenizer._mode,
                 'epoch': epoch,
                 'eval_loss': eval_loss,
                 'train_loss': avg_train_loss,
@@ -767,10 +807,11 @@ def train(args):
             torch.save({
                 'model_state_dict': getattr(model, '_orig_mod', model).state_dict(),
                 'dim': args.dim,
-                'num_tokens': 256,
+                'num_tokens': actual_vocab,
                 'num_layers': args.layers,
                 'context_dim': args.context_dim,
                 'dropout': args.dropout,
+                'tokenizer_mode': tokenizer._mode,
                 'epoch': epoch,
                 'eval_loss': eval_loss,
             }, str(cp_path))
@@ -800,9 +841,9 @@ def train(args):
         from brain.mamba2.bitnet import convert_model_to_158bit, model_stats
         
         # Загружаем лучшие веса
-        best_ckpt = torch.load(str(weights_path), map_location='cpu', weights_only=False)
+        best_ckpt = torch.load(str(weights_path), map_location='cpu', weights_only=True)
         quant_model = MinGRU_LM(
-            dim=args.dim, num_tokens=256,
+            dim=args.dim, num_tokens=actual_vocab,
             num_layers=args.layers, context_dim=args.context_dim
         )
         # Для квантизации используем raw (не-EMA) веса — ключи совпадают
@@ -854,7 +895,8 @@ def train(args):
     with torch.no_grad():
         for prompt in test_prompts:
             result = generate_text(model, start_text=prompt, max_length=100, 
-                                   temperature=0.7, device=device)
+                                   temperature=0.7, device=device,
+                                   tokenizer=tokenizer)
             answer = result.split("Ответ:")[-1].strip() if "Ответ:" in result else result
             q = prompt.split("\n")[0].replace("Вопрос: ", "")
             print(f"  Q: {q}")

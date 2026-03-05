@@ -385,6 +385,7 @@ def get_config(level, hw):
     # ── Общие поля для всех уровней ──
     common = {
         "d_model": d, "n_layers": nl,
+        "vocab_size": 4096,  # BPE default (TarsTokenizer)
         "batch": batch, "accum": accum,
         "use_muon": use_muon, "use_wsd": use_wsd,
         "use_compile": use_compile,
@@ -728,31 +729,36 @@ def quick_validate(cfg, device):
     try:
         import torch
         from brain.mamba2.model import TarsMamba2LM
+        from brain.tokenizer import TarsTokenizer
         mp = TARS_V3 / "mamba2.pt"
         if not mp.exists():
             mp = TARS_V3 / "mamba2_omega.pt"
         if not mp.exists():
             print("     ⚠ Нет модели для валидации")
             return
+        ckpt = torch.load(str(mp), map_location='cpu', weights_only=True)
+        # Определяем vocab_size из чекпоинта
+        ckpt_vocab = ckpt.get('vocab_size', ckpt.get('config', {}).get('vocab_size', 256))
         model = TarsMamba2LM(d_model=cfg["d_model"], n_layers=cfg["n_layers"],
-                             vocab_size=256, quant_mode="fp16")
-        ckpt = torch.load(str(mp), map_location='cpu', weights_only=False)
+                             vocab_size=ckpt_vocab, quant_mode="fp16")
         model.load_state_dict(ckpt['model_state_dict'], strict=False)
         model.eval()
         dev = torch.device(device)
         model.to(dev)
+        # Инициализируем токенизатор (BPE если обучен, иначе byte)
+        tokenizer = TarsTokenizer(mode="auto")
         for prompt in ["Привет!", "Что такое Python?", "2+2="]:
-            tokens = list(prompt.encode('cp1251', errors='replace'))
+            tokens = tokenizer.encode(prompt)
             x = torch.tensor([tokens], dtype=torch.long, device=dev)
             with torch.no_grad():
                 for _ in range(60):
                     logits = model(x)
-                    probs = torch.softmax(logits[:, -1, :] / 0.7, dim=-1)
+                    probs = torch.softmax(logits[:, -1, :ckpt_vocab] / 0.7, dim=-1)
                     nt = torch.multinomial(probs, 1)
                     x = torch.cat([x, nt], dim=1)
-                    if nt.item() == 0 or x.shape[1] > 200:
+                    if nt.item() == tokenizer.eos_token_id or x.shape[1] > 200:
                         break
-            out = bytes(x[0].cpu().tolist()).decode('cp1251', errors='replace')
+            out = tokenizer.decode(x[0].cpu().tolist())
             print(f"     Q: {prompt}")
             print(f"     A: {out[len(prompt):].strip()[:80]}")
         del model
@@ -782,21 +788,21 @@ def consolidate_models(cfg, results, total_time):
             print(f"  ⏭ {name}: не найден")
 
     # config.json
-    mc = {"d_model": cfg["d_model"], "n_layers": cfg["n_layers"], "vocab_size": 256,
-          "d_state": 64, "headdim": 64, "omega_dim": 32, "pool_size": 48, "n_experts": 8}
+    mc = {"d_model": cfg["d_model"], "n_layers": cfg["n_layers"],
+          "d_state": 64, "headdim": 64, "omega_size": 32, "pool_size": 48, "n_experts": 8}
     for pt_name in ["mamba2.pt", "mamba2_158bit.pt"]:
         pt = TARS_V3 / pt_name
         if pt.exists():
             try:
                 import torch
-                ck = torch.load(str(pt), map_location="cpu", weights_only=False)
+                ck = torch.load(str(pt), map_location="cpu", weights_only=True)
                 c = ck.get("config", {})
                 mc.update({k: c[k] for k in ["d_model", "n_layers", "vocab_size"] if k in c})
                 del ck
                 break
             except Exception:
                 pass
-    cj = {"name": "tars_v3", "version": "3.0", "encoding": "cp1251",
+    cj = {"name": "tars_v3", "version": "3.0",
           "models": {"mamba2": {"params": mc}}}
     (TARS_V3 / "config.json").write_text(json.dumps(cj, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -974,7 +980,7 @@ def main():
         cmd = [PYTHON, str(TRAINING / "train_mamba2.py"),
                "--d_model", str(cfg["d_model"]),
                "--n_layers", str(cfg["n_layers"]),
-               "--vocab_size", "256",
+               "--vocab_size", str(cfg["vocab_size"]),
                "--batch", str(cfg["batch"]),
                "--accum_steps", str(cfg["accum"]),
                "--epochs", str(cfg["mamba_ep"][mp-1]),
@@ -1009,7 +1015,7 @@ def main():
             if mingru_path.exists() and not emb_path.exists():
                 try:
                     import torch
-                    ck = torch.load(str(mingru_path), map_location='cpu', weights_only=False)
+                    ck = torch.load(str(mingru_path), map_location='cpu', weights_only=True)
                     if 'model_state_dict' in ck:
                         for k, v in ck['model_state_dict'].items():
                             if 'token_emb' in k or 'embedding' in k:
@@ -1027,8 +1033,8 @@ def main():
         if ok:
             mark_done(state, pk)
         else:
-            print(f"  ⚠️ Phase 4.{mp} failed → --resume для повтора")
-            break
+            print(f"  ⚠️ Phase 4.{mp} failed — продолжаем следующие фазы")
+            # НЕ останавливаем: personality/second_pass могут работать с тем что есть
 
     # Drive backup after Mamba-2
     if drive_ok: drive_backup(drive_mode)
@@ -1038,7 +1044,8 @@ def main():
         print(f"\n  🎭 Phase 4.5: PersonalityAdapter ({cfg['personality_ep']} epochs)...")
         cmd = [PYTHON, str(TRAINING / "train_mamba2.py"),
                "--d_model", str(cfg["d_model"]), "--n_layers", str(cfg["n_layers"]),
-               "--vocab_size", "256", "--batch", str(cfg["batch"]),
+               "--vocab_size", str(cfg["vocab_size"]),
+               "--batch", str(cfg["batch"]),
                "--accum_steps", str(cfg["accum"]),
                "--epochs", str(cfg["personality_ep"]),
                "--lr", "5e-5", "--seq_len", str(cfg["seq_mid"]),
@@ -1056,7 +1063,8 @@ def main():
         print(f"\n  🔄 Phase 4.6: Second Pass (seq={cfg['seq_max']}, {cfg['second_pass_ep']}ep)...")
         cmd = [PYTHON, str(TRAINING / "train_mamba2.py"),
                "--d_model", str(cfg["d_model"]), "--n_layers", str(cfg["n_layers"]),
-               "--vocab_size", "256", "--batch", str(cfg["batch"]),
+               "--vocab_size", str(cfg["vocab_size"]),
+               "--batch", str(cfg["batch"]),
                "--accum_steps", str(cfg["accum"]),
                "--epochs", str(cfg["second_pass_ep"]),
                "--lr", "5e-5", "--seq_len", str(cfg["seq_max"]),
@@ -1078,7 +1086,7 @@ def main():
         if fp16.exists():
             try:
                 import torch
-                ck = torch.load(str(fp16), map_location="cpu", weights_only=False)
+                ck = torch.load(str(fp16), map_location="cpu", weights_only=True)
                 c = ck.get("config", {})
                 dm = str(c.get("d_model", cfg["d_model"]))
                 nl = str(c.get("n_layers", cfg["n_layers"]))
@@ -1086,7 +1094,7 @@ def main():
             except Exception:
                 dm, nl = str(cfg["d_model"]), str(cfg["n_layers"])
             ok = run([PYTHON, str(TRAINING / "train_mamba2.py"),
-                      "--d_model", dm, "--n_layers", nl, "--vocab_size", "256",
+                      "--d_model", dm, "--n_layers", nl,
                       "--batch", str(cfg["batch"]), "--accum_steps", str(cfg["accum"]),
                       "--epochs", "3", "--lr", "5e-5", "--phase", "1",
                       "--quant", "--resume", "--device", device,

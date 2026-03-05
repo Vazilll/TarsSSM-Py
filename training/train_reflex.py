@@ -237,7 +237,7 @@ def build_dataset(max_len=64, augment=True):
       - Mined from LEANN index (до 50 фраз)
     """
     from brain.tokenizer import TarsTokenizer
-    tokenizer = TarsTokenizer()
+    tokenizer = TarsTokenizer(mode="byte")  # ReflexClassifier = byte-level (vocab=256)
     
     inputs = []
     conf_labels = []

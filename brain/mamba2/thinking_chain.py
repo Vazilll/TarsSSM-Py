@@ -502,7 +502,7 @@ class ThinkingChain(nn.Module):
       VERIFY    — "проверяю"          → RAG: противоречия
     """
     
-    def __init__(self, d_model, d_memory=384, n_max_waves=12, vocab_size=256):
+    def __init__(self, d_model, d_memory=384, n_max_waves=12, vocab_size=4096):
         super().__init__()
         self.projector = ThinkingStepProjector(d_model, d_memory, n_max_waves)
         self.multi_memory = MultiScaleMemory(d_memory)

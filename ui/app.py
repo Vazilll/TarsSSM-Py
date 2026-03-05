@@ -58,10 +58,15 @@ def index():
 @app.route("/api/chat", methods=["POST"])
 def chat():
     data = request.json
+    if not data or not isinstance(data, dict):
+        return jsonify({"error": "invalid request body"}), 400
     message = data.get("message", "")
     
-    if not message:
-        return jsonify({"error": "empty message"})
+    if not message or not isinstance(message, str):
+        return jsonify({"error": "empty message"}), 400
+    
+    # Limit message length
+    message = message[:2000]
     
     gie = get_gie()
     thinking = []
@@ -97,15 +102,14 @@ def chat():
         thinking.append("no local handler found")
         thinking.append("routing to brain...")
         try:
-            loop = asyncio.new_event_loop()
-            result = loop.run_until_complete(gie.execute_goal(message))
-            loop.close()
-            response = result.get("text", "")
-            if response:
-                tier = result.get("tier", "brain")
+            response = asyncio.run(gie.execute_goal(message))
+            response_text = response.get("text", "")
+            if response_text:
+                tier = response.get("tier", "brain")
                 thinking.append(f"tier: {tier}")
-                thinking.append(f"tokens: {result.get('tokens', '?')}")
+                thinking.append(f"tokens: {response.get('tokens', '?')}")
                 thinking.append("response ready")
+                response = response_text
             else:
                 response = "Не понял. Попробуй ещё раз."
         except Exception:
@@ -353,4 +357,5 @@ if __name__ == "__main__":
     print("  TARS v3 - Web Interface")
     print("  http://localhost:7860")
     print("=" * 50)
-    app.run(host="0.0.0.0", port=7860, debug=False)
+    # ═══ Security: bind to localhost only (not 0.0.0.0) ═══
+    app.run(host="127.0.0.1", port=7860, debug=False)

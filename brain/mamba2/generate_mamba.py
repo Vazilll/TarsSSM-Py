@@ -22,6 +22,13 @@ from typing import Optional, List, Callable
 
 logger = logging.getLogger("TarsGenerator")
 
+# Optional: speculative decoding
+try:
+    from brain.speculative import SpeculativeDecoder, SpecResult
+    _HAS_SPECULATIVE = True
+except ImportError:
+    _HAS_SPECULATIVE = False
+
 
 @dataclass
 class GenerationResult:
@@ -74,6 +81,25 @@ class TarsGenerator:
         self.omega_core = omega_core
         self._inject_queue: List[str] = []  # For interactive knowledge inject
         self._tool_handler: Optional[Callable] = None
+        self._spec_decoder: Optional[object] = None   # SpeculativeDecoder
+    
+    def enable_speculative(self, draft_model, draft_k: int = 5):
+        """Enable speculative decoding with a draft model (e.g., MinGRU).
+        
+        Args:
+            draft_model: faster model (MinGRU_LM) for drafting tokens
+            draft_k: number of tokens to draft per step (4-8 optimal)
+        """
+        if _HAS_SPECULATIVE:
+            self._spec_decoder = SpeculativeDecoder(
+                draft_model=draft_model,
+                target_model=self.model,
+                tokenizer=self.tokenizer,
+                draft_k=draft_k,
+            )
+            logger.info(f"Speculative decoding enabled (K={draft_k})")
+        else:
+            logger.warning("Speculative decoding not available (import failed)")
 
     def set_tool_handler(self, handler: Callable):
         """Register a callback for <tool> commands.
@@ -261,6 +287,31 @@ class TarsGenerator:
             idme_rounds=idme_rounds,
             tokens_generated=len(generated_tokens),
             time_ms=elapsed
+        )
+    
+    def generate_fast(self, prompt: str, max_tokens: int = 256,
+                      on_token: Optional[Callable] = None,
+                      temperature: float = 0.7) -> GenerationResult:
+        """
+        Fast generation using speculative decoding (1.5-2.5x speedup).
+        
+        Requires enable_speculative() to be called first.
+        Falls back to normal generate() if speculative not available.
+        """
+        if self._spec_decoder is None:
+            logger.warning("Speculative not enabled, using standard generate()")
+            config = GenerationConfig(max_tokens=max_tokens, temperature=temperature)
+            return self.generate(prompt, config=config, on_token=on_token)
+        
+        result = self._spec_decoder.generate(
+            prompt, max_tokens=max_tokens,
+            on_token=on_token, temperature=temperature
+        )
+        
+        return GenerationResult(
+            text=result.text,
+            tokens_generated=result.tokens_generated,
+            time_ms=result.time_ms,
         )
 
     @staticmethod

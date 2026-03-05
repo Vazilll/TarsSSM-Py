@@ -73,7 +73,7 @@ def quantize_to_158bit(weight: torch.Tensor) -> np.ndarray:
 def export_model(model_path: str, output_path: str, quantize: bool = True):
     """Export PyTorch .pt model to .tars format."""
     print(f"Loading {model_path}...")
-    ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
+    ckpt = torch.load(model_path, map_location='cpu', weights_only=True)
     
     # Extract state dict
     if 'model_state_dict' in ckpt:

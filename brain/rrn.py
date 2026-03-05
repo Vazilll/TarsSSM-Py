@@ -391,7 +391,7 @@ class RrnCore:
             # Загрузить обученные веса если есть
             weights_path = Path(__file__).parent.parent / "models" / "mingru" / "mingru_best.pt"
             if weights_path.exists():
-                ckpt = torch.load(str(weights_path), map_location='cpu', weights_only=False)
+                ckpt = torch.load(str(weights_path), map_location='cpu', weights_only=True)
                 self.mingru_lm.load_state_dict(ckpt['model_state_dict'], strict=False)
                 self.logger.info(f"Spine: MinGRU weights loaded (epoch {ckpt.get('epoch', '?')})")
             
@@ -420,7 +420,7 @@ class RrnCore:
             # Load trained weights if available
             snn_weights = Path(__file__).parent.parent / "models" / "spiking" / "spiking_best.pt"
             if snn_weights.exists():
-                ckpt = torch.load(str(snn_weights), map_location='cpu', weights_only=False)
+                ckpt = torch.load(str(snn_weights), map_location='cpu', weights_only=True)
                 snn_state = ckpt.get('model_state_dict', {})
                 # Extract only the snn_block weights (skip embedding/head)
                 block_state = {}
@@ -736,7 +736,8 @@ class RrnCore:
         # ═══ Способ 1: Семантический (через обученный MinGRU embedding) ═══
         if self.has_mingru:
             try:
-                text_bytes = list(text.encode('cp1251', errors='replace'))[:256]
+                # MinGRU — byte-level модель (num_tokens=256), используем UTF-8 байты
+                text_bytes = list(text.encode('utf-8', errors='replace'))[:256]
                 tokens = torch.tensor([text_bytes], dtype=torch.long).to(self.device)
                 with torch.no_grad():
                     # Используем обученную таблицу embedding MinGRU

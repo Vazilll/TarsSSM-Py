@@ -237,7 +237,8 @@ class SmartScanner:
             try:
                 self._processed = json.loads(cache.read_text(encoding='utf-8'))
                 logger.debug(f"DocumentSense: загружен кеш ({len(self._processed)} файлов)")
-            except Exception:
+            except Exception as e:
+                logger.debug(f"DocumentSense: cache load error: {e}")
                 self._processed = {}
     
     def _save_cache(self):
@@ -478,8 +479,8 @@ class DocumentSense:
         if added > 0:
             try:
                 self.memory.save()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"DocumentSense: save failed after ingest: {e}")
             logger.info(f"DocumentSense: +{added} чанков из {doc.name} → LEANN")
         
         return added

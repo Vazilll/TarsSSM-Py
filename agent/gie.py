@@ -1,7 +1,9 @@
 import asyncio
 import logging
+import json
 from typing import Optional, Dict, Any, List
 from datetime import datetime
+from pathlib import Path
 import torch
 import os
 try:
@@ -49,6 +51,11 @@ class GieAgent:
       Router:  MoIRA          — маршрутизация к инструменту
       Exec:    ActionEngine   — выполнение действия
     """
+    
+    MAX_CONVERSATION = 50  # Cap conversation history to prevent unbounded growth
+    MAX_QUERY_LEN = 4096   # Input validation
+    CONVERSATION_FILE = "data/tars_conversation.json"
+    
     def __init__(self, brain=None, moira: MoIRA = None, 
                  memory: Any = None, titans: TitansMemory = None):
         self.brain = brain
@@ -61,16 +68,20 @@ class GieAgent:
         self.executor = ActionEngine()
         self.logger = logging.getLogger("Tars.GIE")
         
+        # Ембеддинг модель для _text_to_vec (ленивая инициализация)
+        self._embedding_model = None
+        
         # ═══ Active Inference (Friston, 2006-2026) ═══
-        # Байесовское обновление internal beliefs после каждого наблюдения.
-        # Free Energy = complexity + surprise → минимизация определяет поведение.
         self.belief_state = BeliefState(d_state=128) if BeliefState else None
         
         # ═══ Proactive Systems ═══
         self.learning_helper = LearningHelper() if LearningHelper else None
         self.knowledge_graph = KnowledgeGraph() if KnowledgeGraph else None
         self.file_helper = FileHelper() if FileHelper else None
-        self.notifier = None  # Removed: standalone mini-apps deleted
+        # Explicit None for removed subsystems (replaces dangerous __getattr__)
+        self.notifier = None
+        self.pomodoro = None
+        self.schedule = None
         
         # Состояние сессии
         self.state = {
@@ -79,17 +90,19 @@ class GieAgent:
             "session_goals": [],
             "total_processed": 0,
             "cumulative_free_energy": 0.0,
-            # ═══ Fix #4: Полная история диалога (Total Memory) ═══
-            # Каждый элемент: {"user": str, "tars": str, "time": str, "tier": str}
             "conversation": [],
         }
-    
-    def __getattr__(self, name):
-        """Return None for removed subsystem attributes (pomodoro, schedule, etc.)."""
-        return None
+        
+        # Load persisted conversation
+        self._load_conversation()
 
     async def execute_goal(self, goal: str, fast_callback=None):
         """Главный цикл обработки цели."""
+        # Input validation
+        if len(goal) > self.MAX_QUERY_LEN:
+            goal = goal[:self.MAX_QUERY_LEN]
+            self.logger.warning(f"Goal truncated to {self.MAX_QUERY_LEN} chars")
+        
         self.state["total_processed"] += 1
         self.state["session_goals"].append(goal)
         self.logger.info(f"GIE: Цель #{self.state['total_processed']} → {goal[:60]}...")
@@ -102,8 +115,8 @@ class GieAgent:
                 reflex_ctx = self.reflex.dispatch(goal)
                 if reflex_ctx.can_handle_fast and reflex_ctx.fast_response:
                     reflex_result = {"response": reflex_ctx.fast_response, "action": reflex_ctx.intent}
-            except Exception:
-                pass
+            except Exception as e:
+                self.logger.debug(f"Reflex dispatch error: {e}")
         if reflex_result:
             response = reflex_result["response"]
             self.logger.info(f"GIE: Рефлекс [{reflex_result['action']}]: {response[:40]}...")
@@ -185,7 +198,8 @@ class GieAgent:
                     goal_vec = self._text_to_vec(goal)
                     rv = await self.titans.get_recall(goal_vec)
                     return {"memory_vec": rv, "rag_state": None}
-                except Exception:
+                except Exception as e:
+                    self.logger.debug(f"RAG prefetch error: {e}")
                     return None
             rag_future = asyncio.create_task(_prefetch_rag())
         
@@ -201,8 +215,8 @@ class GieAgent:
                         self.logger.info("GIE: 🔍 Высокий surprise → автоматический RAG search")
                         from tools import web_search_sync
                         return web_search_sync(goal, max_results=3)
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.logger.debug(f"Auto-RAG error: {e}")
                 return None
             auto_rag_future = asyncio.create_task(_auto_rag())
 
@@ -220,8 +234,8 @@ class GieAgent:
                     recall_vec = rag_result.get("memory_vec")
             except asyncio.TimeoutError:
                 self.logger.debug("GIE: RAG prefetch timeout (2s) — model proceeds without")
-            except Exception:
-                pass
+            except Exception as e:
+                self.logger.debug(f"RAG gather error: {e}")
         
         if auto_rag_future is not None:
             try:
@@ -231,8 +245,8 @@ class GieAgent:
                     self.logger.info(f"GIE: RAG добавил {len(rag_result)} символов контекста")
             except asyncio.TimeoutError:
                 self.logger.debug("GIE: Auto-RAG timeout (3s) — skipped")
-            except Exception:
-                pass
+            except Exception as e:
+                self.logger.debug(f"Auto-RAG gather error: {e}")
 
         total_tokens = 0
         total_duration = 0.0
@@ -248,10 +262,13 @@ class GieAgent:
             try:
                 if self.brain is not None:
                     # ═══ Fix #3: full_context передаётся мозгу (не только goal) ═══
-                    # Кодируем ПОЛНЫЙ контекст в токены (cp1251 byte-level)
+                    # Кодируем ПОЛНЫЙ контекст в токены (BPE через TarsTokenizer)
                     brain_input = f"{full_context}\n\nОтветь: {goal}"
+                    from brain.tokenizer import TarsTokenizer
+                    _gie_tok = TarsTokenizer(mode="auto")
+                    brain_token_ids = _gie_tok.encode(brain_input)[:1024]
                     goal_tokens = torch.tensor(
-                        [list(brain_input.encode('cp1251', errors='replace')[:1024])],
+                        [brain_token_ids],
                         dtype=torch.long
                     )
                     logits, think_stats = self.brain.think(goal_tokens, memory_vec=recall_vec)
@@ -304,12 +321,17 @@ class GieAgent:
             if tool == "FinalAnswer" or (confidence < 0.3 and step > 1):
                 # Проверка сходимости OmegaCore. Если не сошёлся (p <= 1.0) и это не последний шаг, рекурсируем.
                 if p_value <= 1.0 and step < MAX_LOOPS - 1:
-                    if "Re-evaluate" in goal:
+                    # Fix: use a retry counter instead of mutating goal string.
+                    # Previous approach prepended "Re-evaluate:" on each loop,
+                    # filling the context window with garbage prefixes.
+                    retry_key = f"_retry_count_{id(goal)}"
+                    retry_count = getattr(self, retry_key, 0)
+                    if retry_count >= 1:
                         self.logger.warning(f"GIE: Повторная сходимость не достигнута. Принимаю текущий результат.")
                     else:
+                        setattr(self, retry_key, retry_count + 1)
                         self.logger.warning(f"GIE: Сходимость не достигнута (p={p_value:.2f}). Инициирую 1 дополнительный цикл размышления...")
                         full_context += "\nSystem-Hint: Предыдущая итерация не сошлась. Уточни параметры и попробуй снова."
-                        goal = f"Re-evaluate: {goal}" # Force recursion
                         continue # Skip FinalAnswer and action execution, just think again
                     
                 # Обучение Titans
@@ -337,15 +359,15 @@ class GieAgent:
                             f"GIE: BeliefState F={belief_result['free_energy'].item():.3f} "
                             f"(surprise={belief_result['surprise'].item():.3f})"
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self.logger.debug(f"BeliefState update error: {e}")
                 
                 # ═══ Knowledge Graph: авто-наполнение ═══
                 if self.knowledge_graph:
                     try:
                         self.knowledge_graph.add_from_dialog(goal, thought_text)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self.logger.debug(f"KnowledgeGraph add error: {e}")
                 
                 # Добавляем проактивные подсказки к ответу
                 final_text = thought_text
@@ -399,7 +421,19 @@ class GieAgent:
             "Type": "type",
         }
         
+        # ═══ Sanitize params: whitelist per tool ═══
+        allowed_keys = {
+            "execute_script": {"code"},
+            "run_command": {"command"},
+            "open_url": {"url"},
+            "analyze_workspace": set(),
+            "click": {"x", "y", "element"},
+            "type": {"text", "element"},
+        }
         cmd = action_map.get(tool, tool.lower())
+        if cmd in allowed_keys:
+            params = {k: v for k, v in params.items() if k in allowed_keys[cmd]}
+        
         try:
             result = await self.executor.execute(cmd, params)
             return result
@@ -407,15 +441,67 @@ class GieAgent:
             return f"Error: {e}"
 
 
-    @staticmethod
-    def _text_to_vec(text: str) -> torch.Tensor:
-        """Детерминированное преобразование текста в вектор [1, 1024]."""
+    def _text_to_vec(self, text: str) -> torch.Tensor:
+        """
+        Семантическое преобразование текста в вектор.
+        
+        Uses LEANN's embedding model (MiniLM/384d) when available.
+        Falls back to deterministic char-hash only if no model loaded.
+        """
+        # Try real embedding via LEANN's model
+        if self.memory is not None:
+            try:
+                leann = self.memory if hasattr(self.memory, '_get_embedding') else getattr(self.memory, 'leann', None)
+                if leann is not None and hasattr(leann, '_get_embedding'):
+                    emb_result = leann._get_embedding(text)
+                    # _get_embedding returns (int8_vec, scale) or np.ndarray
+                    import numpy as np
+                    if isinstance(emb_result, tuple):
+                        int8_vec, scale = emb_result
+                        vec_np = int8_vec.astype(np.float32) * scale
+                    else:
+                        vec_np = np.array(emb_result, dtype=np.float32)
+                    # Pad or truncate to 1024 for compatibility with MoIRA
+                    target_dim = 1024
+                    if len(vec_np) < target_dim:
+                        vec_np = np.pad(vec_np, (0, target_dim - len(vec_np)))
+                    else:
+                        vec_np = vec_np[:target_dim]
+                    return torch.tensor(vec_np, dtype=torch.float32).unsqueeze(0)
+            except Exception as e:
+                self.logger.debug(f"_text_to_vec embedding fallback: {e}")
+        
+        # Deterministic char-hash fallback (when no embedding model available)
         vec = torch.zeros(1, 1024)
         for i, ch in enumerate(text[:512]):
             idx = ord(ch) % 1024
             vec[0, idx] += (ord(ch) / 255.0) * ((-1) ** i) * 0.1
         norm = vec.norm()
         return vec / norm if norm > 0 else vec
+    
+    def _load_conversation(self):
+        """Load persisted conversation from disk."""
+        try:
+            conv_path = Path(self.CONVERSATION_FILE)
+            if conv_path.exists():
+                with open(conv_path, 'r', encoding='utf-8') as f:
+                    self.state["conversation"] = json.load(f)
+                self.logger.info(f"GIE: Loaded {len(self.state['conversation'])} conversation entries")
+        except Exception as e:
+            self.logger.warning(f"GIE: Could not load conversation: {e}")
+            self.state["conversation"] = []
+    
+    def _save_conversation(self):
+        """Persist conversation to disk (last 500 entries)."""
+        try:
+            conv_path = Path(self.CONVERSATION_FILE)
+            conv_path.parent.mkdir(parents=True, exist_ok=True)
+            # ═══ Rolling window: keep last 500 entries ═══
+            conversation = self.state["conversation"][-500:]
+            with open(conv_path, 'w', encoding='utf-8') as f:
+                json.dump(conversation, f, ensure_ascii=False, indent=1)
+        except Exception as e:
+            self.logger.warning(f"GIE: Could not save conversation: {e}")
 
 
 if __name__ == "__main__":

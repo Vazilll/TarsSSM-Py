@@ -13,7 +13,7 @@ os.chdir(ROOT)
 
 if hasattr(sys.stdout, 'reconfigure'):
     try: sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-    except: pass
+    except Exception: pass
 
 import torch
 
@@ -35,7 +35,7 @@ try:
     
     reflex_path = ROOT / "models" / "reflex" / "reflex_classifier.pt"
     if reflex_path.exists():
-        model_reflex.load_state_dict(torch.load(str(reflex_path), map_location='cpu', weights_only=False))
+        model_reflex.load_state_dict(torch.load(str(reflex_path), map_location='cpu', weights_only=True))
         model_reflex.eval()
         print(f"  ✅ Loaded ({sum(p.numel() for p in model_reflex.parameters()):,} params)")
         
@@ -82,14 +82,15 @@ try:
     import json
     config_path = ROOT / "models" / "tars_v3" / "config.json"
     if config_path.exists():
-        cfg = json.load(open(config_path))
+        with open(config_path, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
         d_model = cfg.get("models", {}).get("mamba2", {}).get("params", {}).get("d_model", 768)
     else:
         d_model = 768
     
     mingru_path = ROOT / "models" / "tars_v3" / "mingru.pt"
     if mingru_path.exists():
-        ckpt = torch.load(str(mingru_path), map_location='cpu', weights_only=False)
+        ckpt = torch.load(str(mingru_path), map_location='cpu', weights_only=True)
         
         # Detect model config from checkpoint
         state = ckpt if isinstance(ckpt, dict) and 'model_state_dict' not in ckpt else ckpt.get('model_state_dict', ckpt)
@@ -113,9 +114,14 @@ try:
                     layer_ids.add(int(parts[i+1]))
         n_layers = max(layer_ids) + 1 if layer_ids else 4
         
-        print(f"  Config: dim={dim}, layers={n_layers}")
+        # Detect vocab_size from checkpoint
+        ckpt_vocab = 256
+        if isinstance(ckpt, dict):
+            ckpt_vocab = ckpt.get('vocab_size', ckpt.get('config', {}).get('vocab_size', 256))
         
-        model = MinGRU_LM(dim=dim, num_tokens=256, num_layers=n_layers).to(device)
+        print(f"  Config: dim={dim}, layers={n_layers}, vocab={ckpt_vocab}")
+        
+        model = MinGRU_LM(dim=dim, num_tokens=ckpt_vocab, num_layers=n_layers).to(device)
         model.load_state_dict(state, strict=False)
         model.eval()
         
@@ -126,8 +132,11 @@ try:
         # Generate text
         prompts = ["Привет, меня зовут", "Сегодня я хочу", "Как работает"]
         
+        from brain.tokenizer import TarsTokenizer
+        demo_tokenizer = TarsTokenizer(mode="auto")
+        
         for prompt in prompts:
-            tokens = list(prompt.encode('cp1251', errors='replace'))
+            tokens = demo_tokenizer.encode(prompt)
             x = torch.tensor([tokens], dtype=torch.long, device=device)
             
             generated = list(tokens)
@@ -135,8 +144,7 @@ try:
                 hidden = None
                 for _ in range(80):
                     logits, hidden = model(x, prev_hiddens=hidden, return_hiddens=True)
-                    # Top-k sampling
-                    logits_last = logits[0, -1] / 0.8  # temperature
+                    logits_last = logits[0, -1] / 0.8
                     top_k = 40
                     vals, idxs = logits_last.topk(top_k)
                     probs = torch.softmax(vals, dim=0)
@@ -144,11 +152,7 @@ try:
                     generated.append(idx)
                     x = torch.tensor([[idx]], dtype=torch.long, device=device)
             
-            # Decode
-            try:
-                text = bytes(generated).decode('cp1251', errors='replace')
-            except:
-                text = bytes(generated).decode('utf-8', errors='replace')
+            text = demo_tokenizer.decode(generated)
             
             print(f"\n  📝 \"{prompt}\":")
             print(f"     {text[:120]}...")
@@ -199,7 +203,7 @@ try:
     
     mamba_path = ROOT / "models" / "tars_v3" / "mamba2.pt"
     if mamba_path.exists():
-        ckpt = torch.load(str(mamba_path), map_location='cpu', weights_only=False)
+        ckpt = torch.load(str(mamba_path), map_location='cpu', weights_only=True)
         state = ckpt.get('model_state_dict', ckpt)
         
         # Auto-detect d_model from checkpoint embedding weight
@@ -220,17 +224,23 @@ try:
         
         print(f"  Config (from checkpoint): d_model={ckpt_d_model}, n_layers={ckpt_n_layers}")
         
-        model = TarsMamba2LM(d_model=ckpt_d_model, n_layers=ckpt_n_layers, vocab_size=256)
+        # Detect vocab_size
+        ckpt_vocab = ckpt.get('vocab_size', ckpt.get('config', {}).get('vocab_size', 256))
+        
+        model = TarsMamba2LM(d_model=ckpt_d_model, n_layers=ckpt_n_layers, vocab_size=ckpt_vocab)
         model.load_state_dict(state, strict=False)
         model.eval()
         
         params = sum(p.numel() for p in model.parameters())
         mb = sum(p.numel() * p.element_size() for p in model.parameters()) / 1024 / 1024
-        print(f"  ✅ Loaded ({params:,} params, {mb:.1f} MB)")
+        print(f"  ✅ Loaded ({params:,} params, {mb:.1f} MB, vocab={ckpt_vocab})")
         
         # Quick inference
+        from brain.tokenizer import TarsTokenizer
+        mamba_tokenizer = TarsTokenizer(mode="auto")
+        
         prompt = "Я — ТАРС"
-        tokens = list(prompt.encode('cp1251', errors='replace'))
+        tokens = mamba_tokenizer.encode(prompt)
         x = torch.tensor([tokens], dtype=torch.long)
         
         with torch.no_grad():
@@ -244,13 +254,13 @@ try:
             for _ in range(60):
                 x_in = torch.tensor([generated[-128:]], dtype=torch.long)
                 logits = model(x_in)
-                logits_last = logits[0, -1] / 0.7
+                logits_last = logits[0, -1, :ckpt_vocab] / 0.7
                 vals, idxs = logits_last.topk(30)
                 probs = torch.softmax(vals, dim=0)
                 idx = idxs[torch.multinomial(probs, 1)].item()
                 generated.append(idx)
         
-        text = bytes(generated).decode('cp1251', errors='replace')
+        text = mamba_tokenizer.decode(generated)
         print(f"\n  📝 \"{prompt}\":")
         print(f"     {text[:150]}...")
     else:

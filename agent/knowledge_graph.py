@@ -106,6 +106,7 @@ class KnowledgeGraph:
     """
     
     def __init__(self):
+        self._conn = None  # ═══ Persistent connection ═══
         self._init_db()
         self._keyword_index: Dict[str, Set[str]] = {}  # keyword → set(node_ids)
         self._rebuild_index()
@@ -199,8 +200,7 @@ class KnowledgeGraph:
         
         # 2. Full-text search в SQLite
         try:
-            conn = sqlite3.connect(str(_KG_DB))
-            c = conn.cursor()
+            c = self._conn.cursor()
             for kw in query_keywords:
                 c.execute(
                     "SELECT id FROM nodes WHERE title LIKE ? OR content LIKE ? OR tags LIKE ?",
@@ -208,9 +208,8 @@ class KnowledgeGraph:
                 )
                 for (node_id,) in c.fetchall():
                     results[node_id] = results.get(node_id, 0) + 1.0
-            conn.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"KG search SQLite error: {e}")
         
         if not results:
             return f"🔍 Ничего не найдено по запросу «{query}». Попробуй другие слова."
@@ -404,7 +403,8 @@ class KnowledgeGraph:
                       ((datetime.now() - timedelta(days=7)).isoformat(),))
             week = c.fetchone()[0]
             conn.close()
-        except Exception:
+        except Exception as e:
+            logger.warning(f"KG stats error: {e}")
             return "❌ Ошибка статистики"
         
         lines = [
@@ -430,8 +430,10 @@ class KnowledgeGraph:
     
     def _init_db(self):
         """Инициализация SQLite базы."""
-        conn = sqlite3.connect(str(_KG_DB))
-        c = conn.cursor()
+        self._conn = sqlite3.connect(str(_KG_DB), check_same_thread=False)
+        # ═══ WAL mode for concurrent reads ═══
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        c = self._conn.cursor()
         c.execute("""
             CREATE TABLE IF NOT EXISTS nodes (
                 id TEXT PRIMARY KEY,
@@ -449,12 +451,10 @@ class KnowledgeGraph:
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_type ON nodes(node_type)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_created ON nodes(created)")
-        conn.commit()
-        conn.close()
+        self._conn.commit()
     
     def _save_node(self, node: KnowledgeNode):
-        conn = sqlite3.connect(str(_KG_DB))
-        c = conn.cursor()
+        c = self._conn.cursor()
         c.execute(
             "INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (node.id, node.title, node.content, node.node_type,
@@ -462,8 +462,7 @@ class KnowledgeGraph:
              json.dumps(node.links), json.dumps(node.auto_links),
              node.source, json.dumps(node.keywords))
         )
-        conn.commit()
-        conn.close()
+        self._conn.commit()
     
     def _update_node(self, node: KnowledgeNode):
         node.modified = datetime.now().isoformat()
@@ -471,28 +470,24 @@ class KnowledgeGraph:
     
     def _load_node(self, node_id: str) -> Optional[KnowledgeNode]:
         try:
-            conn = sqlite3.connect(str(_KG_DB))
-            c = conn.cursor()
+            c = self._conn.cursor()
             c.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
             row = c.fetchone()
-            conn.close()
             if row:
                 return self._row_to_node(row)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"KG load_node error for {node_id}: {e}")
         return None
     
     def _load_all_nodes(self, limit: int = 100) -> List[KnowledgeNode]:
         nodes = []
         try:
-            conn = sqlite3.connect(str(_KG_DB))
-            c = conn.cursor()
+            c = self._conn.cursor()
             c.execute("SELECT * FROM nodes ORDER BY modified DESC LIMIT ?", (limit,))
             for row in c.fetchall():
                 nodes.append(self._row_to_node(row))
-            conn.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"KG load_all_nodes error: {e}")
         return nodes
     
     def _row_to_node(self, row) -> KnowledgeNode:
@@ -541,8 +536,8 @@ class KnowledgeGraph:
             for (nid,) in c.fetchall():
                 result.add(nid)
             conn.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"KG find_by_keyword SQLite error: {e}")
         
         return list(result)
     
@@ -553,7 +548,8 @@ class KnowledgeGraph:
             c = conn.cursor()
             c.execute("SELECT id FROM nodes WHERE title = ?", (title,))
             return [r[0] for r in c.fetchall()]
-        except Exception:
+        except Exception as e:
+            logger.debug(f"KG find_by_title error: {e}")
             return []
     
     def _add_auto_link(self, node_id: str, link_to: str):

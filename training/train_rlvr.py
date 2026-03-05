@@ -142,6 +142,10 @@ def parse_args():
                    help="Reward baseline (moving average)")
     p.add_argument('--kl_coeff', type=float, default=0.01,
                    help="KL penalty coefficient to avoid collapse")
+    p.add_argument('--entropy_coeff', type=float, default=0.01,
+                   help="Entropy bonus coefficient (prevents deterministic collapse)")
+    p.add_argument('--reward_clip', type=float, default=2.0,
+                   help="Clip rewards to [-clip, clip] for stability")
     return p.parse_args()
 
 
@@ -149,8 +153,9 @@ def generate_answer(model, prompt_ids, max_len, device):
     """Generate answer tokens from the model (with gradients for REINFORCE)."""
     generated = prompt_ids.clone()
     all_log_probs = []
+    all_entropies = []
     
-    for _ in range(max_len):
+    for step_i in range(max_len):
         # Forward pass on full sequence (autoregressive)
         logits = model(generated)  # [B, L, V]
         
@@ -163,18 +168,29 @@ def generate_answer(model, prompt_ids, max_len, device):
         selected_log_prob = log_prob.gather(-1, token)  # [B, 1]
         all_log_probs.append(selected_log_prob)
         
+        # ═══ Entropy bonus (prevent policy collapse) ═══
+        entropy = -(probs * log_prob).sum(dim=-1, keepdim=True)  # [B, 1]
+        all_entropies.append(entropy)
+        
         generated = torch.cat([generated, token.detach()], dim=1)
         
-        # Stop if newline or period
-        if token.item() in [10, 46, 0]:  # \n, '.', \0
+        # ═══ Fixed stop tokens: only stop on \n or \0, NOT on '.' ═══
+        # '.' (46) was causing early stop on decimal numbers like "32.5"
+        tok_val = token.item()
+        if tok_val in [10, 0]:  # \n, \0
+            break
+        # Stop on double-newline or after long enough answer
+        if step_i >= 3 and tok_val == 10:
             break
     
     if all_log_probs:
         total_log_prob = torch.cat(all_log_probs, dim=1).sum(dim=1)  # [B]
+        total_entropy = torch.cat(all_entropies, dim=1).mean(dim=1)  # [B]
     else:
         total_log_prob = torch.zeros(1, device=device, requires_grad=True)
+        total_entropy = torch.zeros(1, device=device)
     
-    return generated, total_log_prob
+    return generated, total_log_prob, total_entropy
 
 
 def train(args):
@@ -199,7 +215,7 @@ def train(args):
     load_path = alt_path if alt_path.exists() else save_path
     if args.resume and load_path.exists():
         print(f"[Model] Loading: {load_path}")
-        ckpt = torch.load(str(load_path), map_location='cpu', weights_only=False)
+        ckpt = torch.load(str(load_path), map_location='cpu', weights_only=True)
         model.load_state_dict(ckpt['model_state_dict'], strict=False)
     
     if args.grad_ckpt:
@@ -211,7 +227,7 @@ def train(args):
     print(f"\n{'═'*60}")
     print(f"  TARS RLVR — Reinforcement Learning from Verifiable Rewards")
     print(f"  Tasks/epoch: {args.tasks_per_epoch} | Epochs: {args.epochs}")
-    print(f"  KL coeff: {args.kl_coeff} | LR: {args.lr}")
+    print(f"  KL coeff: {args.kl_coeff} | Entropy: {args.entropy_coeff} | LR: {args.lr}")
     print(f"{'═'*60}\n")
     
     baseline = args.baseline
@@ -227,45 +243,56 @@ def train(args):
             # Generate task
             prompt, correct_answer = generate_task()
             
-            # Encode prompt as bytes
-            prompt_bytes = list(prompt.encode('cp1251', errors='replace'))
+            # ═══ Fixed: utf-8 instead of cp1251 ═══
+            prompt_bytes = list(prompt.encode('utf-8', errors='replace'))
             prompt_ids = torch.tensor([prompt_bytes], dtype=torch.long, device=device)
             
-            # Generate answer
+            # Generate answer (now returns entropy too)
             model.train()
-            generated, log_prob = generate_answer(model, prompt_ids, args.max_gen_len, device)
+            generated, log_prob, entropy = generate_answer(
+                model, prompt_ids, args.max_gen_len, device
+            )
             
             # Decode answer
             answer_ids = generated[0, len(prompt_bytes):].cpu().tolist()
             try:
-                answer_text = bytes(answer_ids).decode('cp1251', errors='replace')
-            except Exception:
+                answer_text = bytes(answer_ids).decode('utf-8', errors='replace')
+            except Exception as e:
+                logger.debug(f"Answer decode error: {e}") if 'logger' in dir() else None
                 answer_text = ""
             
             # Verify and get reward
             reward = verify_answer(answer_text, correct_answer)
             
-            # REINFORCE loss: -R × log π(a|s) (with baseline)
+            # ═══ Reward clipping for stability ═══
+            reward = max(-args.reward_clip, min(args.reward_clip, reward))
+            
+            # REINFORCE loss with entropy bonus:
+            # L = -(R - b) * logπ(a|s) - α_H * H[π]
             advantage = reward - baseline
-            loss = -advantage * log_prob.mean()
+            policy_loss = -advantage * log_prob.mean()
+            entropy_loss = -args.entropy_coeff * entropy.mean()
+            loss = policy_loss + entropy_loss
             
-            # Backward
+            # ═══ Normalized gradient accumulation ═══
+            loss = loss / args.batch  # Normalize by accumulation steps
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             
-            # Update every batch
+            # Update every batch (clip AFTER accumulation, not per-step)
             if (task_i + 1) % args.batch == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 optimizer.zero_grad()
             
             total_reward += reward
-            total_loss += loss.item()
+            total_loss += loss.item() * args.batch  # undo normalization for logging
             if reward > 0:
                 correct += 1
             n += 1
             
-            # Update baseline (exponential moving average)
-            baseline = 0.95 * baseline + 0.05 * reward
+            # Update baseline (slow EMA, especially early)
+            alpha = 0.01 if epoch == 0 and task_i < 100 else 0.05
+            baseline = (1 - alpha) * baseline + alpha * reward
         
         # Flush remaining gradients
         optimizer.step()

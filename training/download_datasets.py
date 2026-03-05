@@ -28,6 +28,7 @@ import hashlib
 import argparse
 import re
 import time
+import subprocess
 from pathlib import Path
 from typing import List, Optional, Dict
 
@@ -296,7 +297,10 @@ def download_dataset(config: dict, data_dir: Path, max_samples: int = 0) -> int:
     
     try:
         # Load with streaming for large datasets
-        kwargs = {"trust_remote_code": True}
+        # ═══ Security: only trust_remote_code for datasets that need it ═══
+        kwargs = {}
+        if config.get("trust_remote_code", False):
+            kwargs["trust_remote_code"] = True
         if subset:
             kwargs["name"] = subset
         
@@ -331,8 +335,8 @@ def download_dataset(config: dict, data_dir: Path, max_samples: int = 0) -> int:
                 n_filtered += 1
                 continue
             
-            # Dedup
-            h = hashlib.md5(clean_text[:200].encode('utf-8', errors='replace')).hexdigest()
+            # ═══ Fixed: SHA256 on full text (not MD5 on first 200 chars) ═══
+            h = hashlib.sha256(clean_text.encode('utf-8', errors='replace')).hexdigest()
             if h in seen_hashes:
                 n_filtered += 1
                 continue
@@ -411,7 +415,7 @@ def main():
         print("  ✓ `datasets` library available\n")
     except ImportError:
         print("  ✗ `datasets` library not found. Installing...")
-        os.system(f"{sys.executable} -m pip install datasets")
+        subprocess.run([sys.executable, "-m", "pip", "install", "datasets"], check=True)
         from datasets import load_dataset
         print("  ✓ `datasets` installed\n")
     

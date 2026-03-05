@@ -14,17 +14,51 @@
   8. Health monitoring (самодиагностика)
 """
 
-import asyncio
-import hashlib
+import json
 import time
-import logging
+import asyncio
 import re
-from typing import List, Dict, Any, Optional, Set
+import logging
+import hashlib
+import ipaddress
+from typing import Dict, List, Any, Set, Optional
 from dataclasses import dataclass, field
-from collections import defaultdict
+from collections import OrderedDict
 from enum import Enum
+from urllib.parse import urlparse
 
 logger = logging.getLogger("Tars.SubAgents")
+
+# ═══ SSRF Protection: blocked IP ranges ═══
+_BLOCKED_NETWORKS = [
+    ipaddress.ip_network('127.0.0.0/8'),
+    ipaddress.ip_network('10.0.0.0/8'),
+    ipaddress.ip_network('172.16.0.0/12'),
+    ipaddress.ip_network('192.168.0.0/16'),
+    ipaddress.ip_network('169.254.0.0/16'),  # AWS metadata
+    ipaddress.ip_network('::1/128'),
+    ipaddress.ip_network('fc00::/7'),
+]
+
+def _is_safe_url(url: str) -> bool:
+    """Validate URL against SSRF: only http/https, no internal IPs."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ('http', 'https'):
+            return False
+        host = parsed.hostname
+        if not host:
+            return False
+        # Block known metadata hostnames
+        if host in ('metadata.google.internal', 'metadata', 'localhost'):
+            return False
+        try:
+            ip = ipaddress.ip_address(host)
+            return not any(ip in net for net in _BLOCKED_NETWORKS)
+        except ValueError:
+            return True  # hostname, not IP — OK
+    except Exception:
+        return False
 
 
 # ═══════════════════════════════════════════
@@ -41,7 +75,6 @@ class RateLimiter:
     
     def _get_domain(self, url: str) -> str:
         try:
-            from urllib.parse import urlparse
             return urlparse(url).netloc
         except Exception:
             return url
@@ -58,32 +91,31 @@ class RateLimiter:
 
 
 class ContentCache:
-    """LRU кэш загруженных страниц — не скачивать одно дважды."""
+    """LRU кэш загруженных страниц — не скачивать одно дважды.
+    
+    Uses OrderedDict for O(1) get/put/eviction (replaces previous O(n) list).
+    """
     
     def __init__(self, max_size: int = 200):
         self.max_size = max_size
-        self._cache: Dict[str, str] = {}
-        self._access_order: List[str] = []
+        self._cache: OrderedDict = OrderedDict()
         self.hits = 0
         self.misses = 0
     
     def get(self, url: str) -> Optional[str]:
         if url in self._cache:
             self.hits += 1
-            self._access_order.remove(url)
-            self._access_order.append(url)
+            self._cache.move_to_end(url)  # O(1) LRU update
             return self._cache[url]
         self.misses += 1
         return None
     
     def put(self, url: str, content: str):
         if url in self._cache:
-            self._access_order.remove(url)
+            self._cache.move_to_end(url)  # O(1)
         elif len(self._cache) >= self.max_size:
-            oldest = self._access_order.pop(0)
-            del self._cache[oldest]
+            self._cache.popitem(last=False)  # O(1) evict oldest
         self._cache[url] = content
-        self._access_order.append(url)
     
     @property
     def hit_rate(self) -> float:
@@ -162,8 +194,11 @@ class MessageBus:
     
     async def send(self, channel: str, msg: AgentMessage):
         if channel in self._queues:
-            await self._queues[channel].put(msg)
-            self._log.append(msg)
+            self._queues[channel].put_nowait(msg)
+        self._log.append(msg)
+        # ═══ Bounded log: evict oldest when over 5K ═══
+        if len(self._log) > 5000:
+            self._log = self._log[-2500:]
     
     async def receive(self, channel: str, timeout: float = 30) -> Optional[AgentMessage]:
         if channel not in self._queues:
@@ -203,7 +238,7 @@ class SubAgent:
         raise NotImplementedError
     
     async def run_with_retry(self, task: dict) -> SubAgentResult:
-        """Выполнить с retry и exponential backoff."""
+        """Выполнить с smart retry: transient errors → backoff, permanent → fail fast."""
         self.busy = True
         last_error = ""
         
@@ -217,8 +252,18 @@ class SubAgent:
                 return result
             except Exception as e:
                 last_error = str(e)
+                err_lower = last_error.lower()
+                # ═══ Smart retry: skip retries for permanent errors ═══
+                permanent = any(p in err_lower for p in [
+                    '404', '403', '401', 'not found', 'forbidden',
+                    'name resolution', 'no such host', 'dns',
+                ])
+                if permanent:
+                    logger.debug(f"{self.name}: permanent error, no retry: {e}")
+                    break
                 if attempt < self.max_retries - 1:
                     wait = (2 ** attempt) * 0.5  # 0.5s, 1s, 2s
+                    logger.debug(f"{self.name}: transient error, retry in {wait}s: {e}")
                     await asyncio.sleep(wait)
         
         self.busy = False
@@ -248,6 +293,7 @@ class SearchAgent(SubAgent):
     def __init__(self):
         super().__init__("search", max_retries=2)
         self._seen_urls: Set[str] = set()
+        self._MAX_SEEN = 10000  # ═══ Bounded: evict when over limit ═══
     
     async def run(self, task: dict) -> SubAgentResult:
         start = time.time()
@@ -263,6 +309,12 @@ class SearchAgent(SubAgent):
             if r.url not in self._seen_urls:
                 self._seen_urls.add(r.url)
                 unique.append({"title": r.title, "url": r.url, "snippet": r.snippet})
+        
+        # ═══ Evict oldest when over limit ═══
+        if len(self._seen_urls) > self._MAX_SEEN:
+            to_remove = len(self._seen_urls) - self._MAX_SEEN // 2
+            for _ in range(to_remove):
+                self._seen_urls.pop()
         
         return SubAgentResult(
             self.name, True,
@@ -283,6 +335,11 @@ class FetchAgent(SubAgent):
     
     async def _fetch_one(self, url: str, max_chars: int = 5000) -> dict:
         async with self.semaphore:
+            # ═══ SSRF Protection ═══
+            if not _is_safe_url(url):
+                return {"url": url, "content": "", "ok": False,
+                        "reason": "blocked by SSRF filter"}
+            
             # Проверить кэш
             cached = self.cache.get(url)
             if cached is not None:

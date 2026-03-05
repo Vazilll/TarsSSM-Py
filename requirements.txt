@@ -2,36 +2,39 @@
 # Install: pip install -r requirements.txt
 
 # ═══ Ядро (обучение мозга) ═══
-torch
-numpy
-einops
-tqdm
-psutil
+torch>=2.0.0,<3.0.0
+numpy>=1.24.0,<3.0.0
+einops>=0.6.0,<1.0.0
+tqdm>=4.64.0,<5.0.0
+psutil>=5.9.0,<6.0.0
 
 # ═══ Токенайзеры ═══
-sentencepiece
-tokenizers
+sentencepiece>=0.1.97,<0.3.0
+tokenizers>=0.13.0,<1.0.0
 
 # ═══ RAG и память (LEANN) ═══
-sentence-transformers
+sentence-transformers>=2.2.0,<4.0.0
 
 # ═══ Датасеты HuggingFace ═══
-datasets
+datasets>=2.14.0,<3.0.0
 
 # ═══ Голос — STT (Whisper LoRA, фаза 8) ═══
-transformers
-peft
-jiwer
-faster-whisper
+transformers>=4.30.0,<5.0.0
+peft>=0.4.0,<1.0.0
+jiwer>=3.0.0,<4.0.0
+faster-whisper>=0.9.0,<2.0.0
 
 # ═══ Голос — TTS (Piper, фаза 9) ═══
-sounddevice
+sounddevice>=0.4.6,<1.0.0
 # piper-tts          # Устанавливается автоматически в train_piper.py
 
 # ═══ Голос — Квантизация ONNX (фаза 10) ═══
-onnxruntime
+onnxruntime>=1.15.0,<2.0.0
 
 # ═══ Hub API сервер ═══
-fastapi
-uvicorn
-websockets
+fastapi>=0.100.0,<1.0.0
+uvicorn>=0.22.0,<1.0.0
+websockets>=11.0,<14.0
+
+# ═══ Тестирование ═══
+pytest>=7.0.0,<9.0.0

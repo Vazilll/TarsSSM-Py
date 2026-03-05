@@ -158,8 +158,22 @@ def train(args):
     
     # Load student model (TARS)
     from brain.mamba2.model import TarsMamba2LM
+    from brain.tokenizer import TarsTokenizer
+    tars_tok = TarsTokenizer(mode="auto")
     
-    actual_vocab = 256
+    # Read vocab from checkpoint
+    save_path = Path(args.save_dir) / "mamba2_omega.pt"
+    alt_path = Path(args.save_dir) / "mamba2.pt"
+    load_path = alt_path if alt_path.exists() else save_path
+    actual_vocab = tars_tok.vocab_size  # BPE=4096, byte=256
+    if args.resume and load_path.exists():
+        try:
+            ckpt_tmp = torch.load(str(load_path), map_location='cpu', weights_only=True)
+            actual_vocab = max(actual_vocab, ckpt_tmp.get('vocab_size', ckpt_tmp.get('config', {}).get('vocab_size', 4096)))
+            del ckpt_tmp
+        except Exception:
+            pass
+    
     student = TarsMamba2LM(
         d_model=args.d_model,
         n_layers=args.n_layers,
@@ -174,7 +188,7 @@ def train(args):
     load_path = alt_path if alt_path.exists() else save_path
     if args.resume and load_path.exists():
         print(f"[Student] Loading checkpoint: {load_path}")
-        ckpt = torch.load(str(load_path), map_location='cpu', weights_only=False)
+        ckpt = torch.load(str(load_path), map_location='cpu', weights_only=True)
         student.load_state_dict(ckpt['model_state_dict'], strict=False)
     
     if args.grad_ckpt:
@@ -191,7 +205,7 @@ def train(args):
     
     if args.teacher_logits and os.path.exists(args.teacher_logits):
         print(f"[Teacher] Loading pre-computed logits: {args.teacher_logits}")
-        teacher_logits_cache = torch.load(args.teacher_logits, map_location='cpu')
+        teacher_logits_cache = torch.load(args.teacher_logits, map_location='cpu', weights_only=True)
         print(f"[Teacher] {len(teacher_logits_cache)} samples loaded")
     elif args.teacher_model:
         teacher, tokenizer = load_teacher_hf(args.teacher_model, device)
@@ -253,7 +267,7 @@ def train(args):
                     for row in batch_in:
                         byte_list = row.cpu().tolist()
                         try:
-                            text = bytes(byte_list).decode('cp1251', errors='replace')
+                            text = tars_tok.decode(byte_list)
                         except Exception:
                             text = ""
                         batch_texts.append(text)

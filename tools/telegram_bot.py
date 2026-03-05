@@ -182,6 +182,13 @@ class TarsTelegram:
             await update.message.reply_text("Использование: /learn <url>")
             return
         
+        # ═══ URL validation ═══
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+            await update.message.reply_text("❌ Только HTTP/HTTPS URL")
+            return
+        
         await update.message.reply_text(f"📚 Загружаю: {url}")
         
         try:
@@ -232,8 +239,8 @@ class TarsTelegram:
         if self.on_message:
             try:
                 self.on_message(text, update.effective_user.id)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"on_message callback error: {e}")
         
         # Ответить подтверждением (каждое 10-е)
         if self.messages_collected % 10 == 0:
@@ -259,7 +266,9 @@ class TarsTelegram:
         
         try:
             file = await context.bot.get_file(doc.file_id)
-            file_path = self._data_dir / name
+            # ═══ Sanitize filename to prevent path traversal ═══
+            safe_name = Path(name).name  # strip directory components
+            file_path = self._data_dir / safe_name
             await file.download_to_drive(str(file_path))
             
             text = file_path.read_text(encoding='utf-8', errors='replace')

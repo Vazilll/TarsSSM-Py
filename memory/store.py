@@ -35,14 +35,16 @@ class TarsMemoryHub:
     
     def __init__(self, storage_path="data/tars_memories.json"):
         self.storage_path = storage_path
-        self._fact_log = []
+        self._facts = []
         
         # Ленивая инициализация компонентов
         self._leann = None
         self._memo = None
         self._titans = None
+        self._sqlite_conn = None  # ═══ Persistent connection ═══
         
         self._load_facts()
+        self._init_sqlite()
     
     @property
     def leann(self):
@@ -116,13 +118,19 @@ class TarsMemoryHub:
             "surprised": titans_result.get("surprised", False),
         })
         
-        # SQLite архив для бесконечного хранения
-        self._archive_to_sqlite(self._fact_log[-1])
+        # SQLite archive + JSON cache — transactional boundary
+        try:
+            self._archive_to_sqlite(self._fact_log[-1])
+        except Exception as e:
+            logger.warning(f"SQLite archive failed: {e}")
         
-        # JSON сохраняем последние 50000 (горячий кэш)
+        # JSON: save last 50000 as hot cache (only after SQLite SUCCESS)
         if len(self._fact_log) > 50000:
             self._fact_log = self._fact_log[-50000:]
-        self._save_facts()
+        try:
+            self._save_facts()
+        except Exception as e:
+            logger.warning(f"JSON facts save failed: {e}")
         
         logger.debug(f"Memory: '{text[:50]}...' (surprise={titans_result.get('surprised', False)})")
         
@@ -163,16 +171,14 @@ class TarsMemoryHub:
         
         return results
     
-    def _archive_to_sqlite(self, fact: dict):
-        """
-        SQLite архив для бесконечного хранения (Total Memory).
-        Каждый факт сохраняется навсегда — ничего не удаляется.
-        """
+    def _init_sqlite(self):
+        """Initialize persistent SQLite connection."""
         import sqlite3
         db_path = self.storage_path.replace('.json', '.db')
         try:
-            conn = sqlite3.connect(db_path)
-            conn.execute("""
+            self._sqlite_conn = sqlite3.connect(db_path, check_same_thread=False)
+            self._sqlite_conn.execute("PRAGMA journal_mode=WAL")
+            self._sqlite_conn.execute("""
                 CREATE TABLE IF NOT EXISTS facts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     text TEXT NOT NULL,
@@ -181,13 +187,25 @@ class TarsMemoryHub:
                     surprised INTEGER DEFAULT 0
                 )
             """)
-            conn.execute(
+            self._sqlite_conn.commit()
+        except Exception as e:
+            logger.warning(f"SQLite init error: {e}")
+            self._sqlite_conn = None
+
+    def _archive_to_sqlite(self, fact: dict):
+        """
+        SQLite архив для бесконечного хранения (Total Memory).
+        Каждый факт сохраняется навсегда — ничего не удаляется.
+        """
+        if not self._sqlite_conn:
+            return
+        try:
+            self._sqlite_conn.execute(
                 "INSERT INTO facts (text, user_id, timestamp, surprised) VALUES (?, ?, ?, ?)",
                 (fact["text"], fact.get("user", "tars_user"), 
                  fact.get("time", ""), int(fact.get("surprised", False)))
             )
-            conn.commit()
-            conn.close()
+            self._sqlite_conn.commit()
         except Exception as e:
             logger.warning(f"SQLite archive error: {e}")
     
@@ -195,22 +213,18 @@ class TarsMemoryHub:
         """
         Full-text поиск по SQLite архиву (для старых фактов за пределами JSON).
         """
-        import sqlite3
-        db_path = self.storage_path.replace('.json', '.db')
-        if not os.path.exists(db_path):
+        if not self._sqlite_conn:
             return []
         try:
-            conn = sqlite3.connect(db_path)
             # Простой LIKE-поиск по ключевым словам
             keywords = query.split()[:3]  # первые 3 слова
             conditions = " OR ".join([f"text LIKE ?" for _ in keywords])
             params = [f"%{kw}%" for kw in keywords]
-            cursor = conn.execute(
+            cursor = self._sqlite_conn.execute(
                 f"SELECT text FROM facts WHERE {conditions} ORDER BY id DESC LIMIT ?",
                 params + [top_k]
             )
             results = [row[0] for row in cursor.fetchall()]
-            conn.close()
             return results
         except Exception as e:
             logger.warning(f"SQLite recall error: {e}")

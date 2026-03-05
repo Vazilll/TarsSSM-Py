@@ -270,9 +270,12 @@ def parse_args():
     return p.parse_args()
 
 
-def create_samples(text, seq_len):
+def create_samples(text, seq_len, tokenizer=None):
     """Create training samples from CoT text."""
-    encoded = list(text.encode('cp1251', errors='replace'))
+    if tokenizer is not None:
+        encoded = tokenizer.encode(text)
+    else:
+        encoded = list(text.encode('cp1251', errors='replace'))
     if len(encoded) < 2:
         return []
     
@@ -327,6 +330,11 @@ def train_cot(args):
         device_str = args.device
     device = torch.device(device_str)
     
+    # Tokenizer BEFORE data loading (BPE нужен для create_samples)
+    from brain.mamba2.model import TarsMamba2LM
+    from brain.tokenizer import TarsTokenizer
+    tokenizer = TarsTokenizer(mode="auto")
+    
     # Load CoT data
     if not os.path.exists(args.cot_data):
         print(f"[!] No CoT data found. Generating {args.n_samples} samples...")
@@ -338,25 +346,31 @@ def train_cot(args):
     print(f"[Data] {len(corpus)/1e6:.1f}M chars from {args.cot_data}")
     
     # Create samples
-    all_samples = create_samples(corpus, args.seq_len)
+    all_samples = create_samples(corpus, args.seq_len, tokenizer=tokenizer)
     random.shuffle(all_samples)
     print(f"[Data] {len(all_samples)} training samples (seq_len={args.seq_len})")
     
-    # Load model
-    from brain.mamba2.model import TarsMamba2LM
+    # Read vocab from checkpoint
+    save_path = Path(args.save_dir) / "mamba2_omega.pt"
+    alt_path = Path(args.save_dir) / "mamba2.pt"
+    load_path = alt_path if alt_path.exists() else save_path
+    ckpt_vocab = 4096  # BPE default
+    if args.resume and load_path.exists():
+        try:
+            ckpt = torch.load(str(load_path), map_location='cpu', weights_only=True)
+            ckpt_vocab = ckpt.get('vocab_size', ckpt.get('config', {}).get('vocab_size', 4096))
+            del ckpt
+        except Exception:
+            pass
+    actual_vocab = max(ckpt_vocab, tokenizer.vocab_size)
     
     model = TarsMamba2LM(
         d_model=args.d_model, n_layers=args.n_layers,
-        vocab_size=256, quant_mode="fp16",
+        vocab_size=actual_vocab, quant_mode="fp16",
     )
-    
-    save_path = Path(args.save_dir) / "mamba2_omega.pt"
-    # Prefer consolidated model (mamba2.pt) over raw training checkpoint
-    alt_path = Path(args.save_dir) / "mamba2.pt"
-    load_path = alt_path if alt_path.exists() else save_path
     if args.resume and load_path.exists():
         print(f"[Model] Loading: {load_path}")
-        ckpt = torch.load(str(load_path), map_location='cpu', weights_only=False)
+        ckpt = torch.load(str(load_path), map_location='cpu', weights_only=True)
         model.load_state_dict(ckpt['model_state_dict'], strict=False)
     
     if args.grad_ckpt:
@@ -379,14 +393,25 @@ def train_cot(args):
     print(f"  Format: <think>reasoning</think><answer>result</answer>")
     print(f"{'═'*60}\n")
     
+    # Eval split (10%)
+    n_eval = max(2, len(all_samples) // 10)
+    eval_samples = all_samples[-n_eval:]
+    train_samples = all_samples[:-n_eval]
+    print(f"  Train: {len(train_samples)}, Eval: {len(eval_samples)}")
+    
+    best_eval_loss = float('inf')
+    patience_counter = 0
+    patience = 3  # CoT is short fine-tune
+    
     for epoch in range(args.epochs):
-        random.shuffle(all_samples)
+        random.shuffle(train_samples)
         t0 = time.time()
         total_loss = 0
         n_batches = 0
         
-        for i in range(0, len(all_samples), args.batch):
-            batch_data = all_samples[i:i + args.batch]
+        model.train()
+        for i in range(0, len(train_samples), args.batch):
+            batch_data = train_samples[i:i + args.batch]
             if not batch_data:
                 continue
             
@@ -420,18 +445,52 @@ def train_cot(args):
             total_loss += loss.item()
             n_batches += 1
         
+        # Eval
+        model.eval()
+        eval_loss_total = 0
+        eval_batches = 0
+        with torch.no_grad():
+            for i in range(0, len(eval_samples), args.batch):
+                batch_data = eval_samples[i:i + args.batch]
+                if not batch_data:
+                    continue
+                max_len = max(len(s) for s in batch_data)
+                padded = [s + [0] * (max_len - len(s)) for s in batch_data]
+                x = torch.tensor(padded, dtype=torch.long, device=device)
+                inputs = x[:, :-1]
+                targets = x[:, 1:]
+                with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
+                    logits = model(inputs)
+                    el = torch.nn.functional.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)), targets.reshape(-1)
+                    ).item()
+                eval_loss_total += el
+                eval_batches += 1
+        eval_loss = eval_loss_total / max(eval_batches, 1)
+        
         elapsed = time.time() - t0
         avg_loss = total_loss / max(n_batches, 1)
-        print(f"Epoch {epoch+1}/{args.epochs} | Loss: {avg_loss:.4f} | {elapsed:.1f}s")
+        is_best = eval_loss < best_eval_loss
+        marker = " ★ BEST" if is_best else ""
+        print(f"Epoch {epoch+1}/{args.epochs} | Train: {avg_loss:.4f} | Eval: {eval_loss:.4f} | {elapsed:.1f}s{marker}")
         
         # Save
         os.makedirs(args.save_dir, exist_ok=True)
-        torch.save({
-            'model_state_dict': model.state_dict(),
-            'config': {'d_model': args.d_model, 'n_layers': args.n_layers,
-                       'vocab_size': 256, 'cot_trained': True},
-        }, str(save_path))
-        print(f"  ✓ Saved (CoT fine-tuned, epoch {epoch+1})")
+        if is_best:
+            best_eval_loss = eval_loss
+            patience_counter = 0
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'config': {'d_model': args.d_model, 'n_layers': args.n_layers,
+                           'vocab_size': actual_vocab, 'cot_trained': True},
+            }, str(save_path))
+            print(f"  ✓ Best saved (CoT fine-tuned, epoch {epoch+1})")
+        else:
+            patience_counter += 1
+            print(f"  ↺ No improvement (patience {patience_counter}/{patience})")
+            if patience_counter >= patience:
+                print(f"\n  ⏹ Early stopping: {patience} эпох без улучшения (best_eval={best_eval_loss:.4f})")
+                break
     
     if args.epochs > 0:
         print(f"\n✓ CoT training complete! Loss: {avg_loss:.4f}")

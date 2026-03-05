@@ -143,6 +143,11 @@ class FileSynapse(Synapse):
         
         if action == "read":
             path = Path(target)
+            # ═══ Path traversal guard: only allow files under ROOT ═══
+            try:
+                path.resolve().relative_to(ROOT)
+            except ValueError:
+                return f"Blocked: {target} (only project files allowed)"
             if path.exists() and path.is_file():
                 text = path.read_text(encoding="utf-8", errors="replace")
                 return text[:5000]
@@ -185,14 +190,24 @@ class ExecSynapse(Synapse):
         if not cmd:
             return "Empty command"
         
-        # Security: только разрешённые команды
-        first_word = cmd.strip().split()[0].lower()
+        # Security: parse into argv (no shell interpretation)
+        import shlex
+        try:
+            argv = shlex.split(cmd)
+        except ValueError as e:
+            return f"Invalid command syntax: {e}"
+        
+        if not argv:
+            return "Empty command"
+        
+        first_word = argv[0].lower()
         if first_word not in self.ALLOWED:
             return f"Blocked: '{first_word}' not in allowed commands"
         
         try:
-            proc = await asyncio.create_subprocess_shell(
-                cmd, stdout=asyncio.subprocess.PIPE,
+            # ═══ Use exec (not shell) to prevent injection via &&/;/| ═══
+            proc = await asyncio.create_subprocess_exec(
+                *argv, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(ROOT),
             )

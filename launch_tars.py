@@ -49,7 +49,7 @@ OPTIONAL_PACKAGES = {
 
 
 def auto_install():
-    """Проверяет и устанавливает недостающие pip-пакеты."""
+    """Проверяет и устанавливает недостающие pip-зависимости из requirements.txt."""
     missing = []
     for imp_name, pkg_name in REQUIRED_PACKAGES.items():
         try:
@@ -62,17 +62,37 @@ def auto_install():
         return True
 
     logger.info(f"📦 Установка {len(missing)} недостающих пакетов...")
-    for imp_name, pkg_name in missing:
-        logger.info(f"   pip install {pkg_name}...")
+    # Use requirements.txt for pinned versions
+    req_file = os.path.join(ROOT, "requirements.txt")
+    if os.path.exists(req_file):
+        logger.info(f"   pip install -r requirements.txt (version-pinned)...")
         try:
             subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", pkg_name, "-q"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                [sys.executable, "-m", "pip", "install", "-r", req_file, "-q"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=300,
             )
-            logger.info(f"   ✅ {pkg_name}")
-        except Exception as e:
-            logger.error(f"   ❌ {pkg_name}: {e}")
+            logger.info("   ✅ Все зависимости установлены")
+        except subprocess.TimeoutExpired:
+            logger.error("   ❌ Установка превысила таймаут 5 мин")
             return False
+        except Exception as e:
+            logger.error(f"   ❌ pip install: {e}")
+            return False
+    else:
+        # Fallback: install individually
+        for imp_name, pkg_name in missing:
+            logger.info(f"   pip install {pkg_name}...")
+            try:
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install", pkg_name, "-q"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=120,
+                )
+                logger.info(f"   ✅ {pkg_name}")
+            except Exception as e:
+                logger.error(f"   ❌ {pkg_name}: {e}")
+                return False
 
     # Опциональные — ставим молча, не блокируем
     for imp_name, pkg_name in OPTIONAL_PACKAGES.items():
@@ -82,7 +102,8 @@ def auto_install():
             try:
                 subprocess.check_call(
                     [sys.executable, "-m", "pip", "install", pkg_name, "-q"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=60,
                 )
             except Exception:
                 pass  # Не критично
