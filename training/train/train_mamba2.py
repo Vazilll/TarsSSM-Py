@@ -280,7 +280,11 @@ def load_corpus(data_path=None, download_wiki=True, data_dir=None,
     print(f"[Data] Итого: {len(corpus):,} символов ({corpus_bytes / 1024:.0f} KB)")
     
     # ═══ TRAINING-OPT: Quality filter (dedup + min_len + alpha) ═══
-    corpus = filter_corpus_quality(corpus)
+    # Skip filter for small corpora — filter is too aggressive and removes everything
+    if corpus_bytes > 500_000:
+        corpus = filter_corpus_quality(corpus)
+    else:
+        print(f"[Data] Пропускаем quality filter (корпус < 500KB)")
     
     return corpus
 

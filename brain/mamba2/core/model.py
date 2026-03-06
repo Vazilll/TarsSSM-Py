@@ -2405,9 +2405,10 @@ class TarsMamba2LM(nn.Module):
         block = self.blocks[0]
         block_detail = {
             "tars_core (ssd+wkv+fusion)": count(block.core),
-            "omega_ssm": count(block.omega),
             "mole": count(block.mole),
         }
+        if hasattr(block, 'omega'):
+            block_detail["omega_ssm"] = count(block.omega)
         
         return {
             "embedding": count(self.embedding),
