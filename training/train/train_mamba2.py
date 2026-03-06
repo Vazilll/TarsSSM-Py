@@ -41,7 +41,7 @@ from pathlib import Path
 
 logger = logging.getLogger("training.mamba2")
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
 from brain.mamba2.model import TarsMamba2LM
