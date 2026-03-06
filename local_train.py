@@ -56,6 +56,9 @@ sys.path.insert(0, str(ROOT))
 
 PYTHON = sys.executable
 TRAINING = ROOT / "training"
+TRAIN_DIR = TRAINING / "train"
+DATA_DIR = TRAINING / "data"
+EVAL_DIR = TRAINING / "eval"
 DATA = ROOT / "data"
 MODELS = ROOT / "models"
 TARS_V3 = MODELS / "tars_v3"
@@ -641,7 +644,7 @@ def download_all_data(cfg):
     hf_files = list(data_dir.glob("hf_*.txt"))
     if not hf_files or sum(f.stat().st_size for f in hf_files) < 1024:
         print(f"\n  📦 HuggingFace datasets (preset: {args.data_preset})...")
-        run([PYTHON, str(TRAINING / "download_hf_dataset.py"),
+        run([PYTHON, str(DATA_DIR / "download_hf_dataset.py"),
              "--preset", args.data_preset, "--output", str(data_dir)], label="HF")
     else:
         print(f"  ✓ HuggingFace: {len(hf_files)} файлов (кеш)")
@@ -650,7 +653,7 @@ def download_all_data(cfg):
     pers = data_dir / "identity" / "tars_personality_mega.txt"
     if not pers.exists() or pers.stat().st_size < 100_000:
         print("\n  🧠 Generating personality corpus...")
-        run([PYTHON, str(TRAINING / "generate_tars_corpus.py")], label="Personality")
+        run([PYTHON, str(DATA_DIR / "generate_tars_corpus.py")], label="Personality")
     else:
         print(f"  ✓ Personality: {pers.stat().st_size // 1024} KB (кеш)")
 
@@ -658,7 +661,7 @@ def download_all_data(cfg):
     stem = data_dir / "synthetic_stem.jsonl"
     if not stem.exists():
         print("\n  🔬 Generating STEM data...")
-        run([PYTHON, str(TRAINING / "generate_synthetic.py")], label="STEM")
+        run([PYTHON, str(DATA_DIR / "generate_synthetic.py")], label="STEM")
 
     # HF pretrained Mamba-2 weights
     pret = MODELS / "pretrained" / "mamba2-130m"
@@ -920,46 +923,66 @@ def main():
 
     # ═══ Phase 2: Reflex ═══
     if should_run(2) and not is_done(state, "reflex"):
-        print(f"\n  🔁 Phase 2: Рефлекс-классификатор ({cfg['reflex_ep']} epochs)...")
-        ok = run([PYTHON, str(TRAINING / "train_reflex.py"),
-                  "--epochs", str(cfg["reflex_ep"]), "--lr", "0.002"], label="Reflex")
-        results["reflex"] = ok
-        if ok: mark_done(state, "reflex")
+        reflex_script = TRAIN_DIR / "train_reflex.py"
+        if reflex_script.exists():
+            print(f"\n  🔁 Phase 2: Рефлекс-классификатор ({cfg['reflex_ep']} epochs)...")
+            ok = run([PYTHON, str(reflex_script),
+                      "--epochs", str(cfg["reflex_ep"]), "--lr", "0.002"], label="Reflex")
+            results["reflex"] = ok
+            if ok: mark_done(state, "reflex")
+        else:
+            print(f"\n  ⏭ Phase 2: train_reflex.py не найден — пропуск")
+            results["reflex"] = False
 
     # ═══ Phase 2.5: RRN ═══
     if should_run(2) and not is_done(state, "rrn"):
-        print(f"\n  🦴 Phase 2.5: RRN маршрутизация ({cfg['rrn_ep']} epochs)...")
-        ok = run([PYTHON, str(TRAINING / "train_rrn.py"),
-                  "--epochs", str(cfg["rrn_ep"]),
-                  "--brain_dim", str(cfg["d_model"]),
-                  "--lr", "0.002", "--batch", "32"], label="RRN")
-        results["rrn"] = ok
-        if ok: mark_done(state, "rrn")
+        rrn_script = TRAIN_DIR / "train_rrn.py"
+        if rrn_script.exists():
+            print(f"\n  🦴 Phase 2.5: RRN маршрутизация ({cfg.get('rrn_ep', 10)} epochs)...")
+            ok = run([PYTHON, str(rrn_script),
+                      "--epochs", str(cfg.get("rrn_ep", 10)),
+                      "--brain_dim", str(cfg["d_model"]),
+                      "--lr", "0.002", "--batch", "32"], label="RRN")
+            results["rrn"] = ok
+            if ok: mark_done(state, "rrn")
+        else:
+            print(f"\n  ⏭ Phase 2.5: train_rrn.py не найден — пропуск")
+            mark_done(state, "rrn")  # не блокировать pipeline
 
     # ═══ Phase 3: MinGRU ═══
     if should_run(3) and not is_done(state, "mingru"):
-        print(f"\n  🧪 Phase 3: MinGRU ({cfg['mingru_dim']}d×{cfg['mingru_layers']}L, {cfg['mingru_ep']}ep)...")
-        ok = run([PYTHON, str(TRAINING / "train_mingru.py"),
-                  "--dim", str(cfg["mingru_dim"]),
-                  "--layers", str(cfg["mingru_layers"]),
-                  "--epochs", str(cfg["mingru_ep"]), "--augment"], label="MinGRU")
-        results["mingru"] = ok
-        if ok: mark_done(state, "mingru")
+        mingru_script = TRAIN_DIR / "train_mingru.py"
+        if mingru_script.exists():
+            print(f"\n  🧪 Phase 3: MinGRU ({cfg.get('mingru_dim', 256)}d×{cfg.get('mingru_layers', 4)}L, {cfg.get('mingru_ep', 5)}ep)...")
+            ok = run([PYTHON, str(mingru_script),
+                      "--dim", str(cfg.get("mingru_dim", 256)),
+                      "--layers", str(cfg.get("mingru_layers", 4)),
+                      "--epochs", str(cfg.get("mingru_ep", 5)), "--augment"], label="MinGRU")
+            results["mingru"] = ok
+            if ok: mark_done(state, "mingru")
+        else:
+            print(f"\n  ⏭ Phase 3: train_mingru.py не найден — пропуск")
+            mark_done(state, "mingru")
 
     # ═══ Phase 3.5: SNN ═══
     if (should_run(3) or args.phase is None) and not is_done(state, "spiking"):
-        print(f"\n  ⚡ Phase 3.5: SNN ({cfg['snn_dim']}d×{cfg['snn_heads']}H, {cfg['snn_ep']}ep)...")
-        snn_cmd = [PYTHON, str(TRAINING / "train_spiking.py"),
-                   "--dim", str(cfg["snn_dim"]), "--heads", str(cfg["snn_heads"]),
-                   "--beta", "0.9", "--epochs", str(cfg["snn_ep"]),
-                   "--batch", str(cfg["snn_batch"]), "--seq_len", str(cfg["snn_seq"]),
-                   "--lr", "3e-4", "--device", device,
-                   "--max_bytes", str(cfg.get("snn_max_mb", 20))]
-        if args.data_dir: snn_cmd += ["--data_dir", args.data_dir]
-        if args.resume: snn_cmd += ["--resume"]
-        ok = run(snn_cmd, label="SNN")
-        results["spiking"] = ok
-        if ok: mark_done(state, "spiking")
+        snn_script = TRAIN_DIR / "train_spiking.py"
+        if snn_script.exists():
+            print(f"\n  ⚡ Phase 3.5: SNN ({cfg.get('snn_dim', 256)}d×{cfg.get('snn_heads', 4)}H, {cfg.get('snn_ep', 5)}ep)...")
+            snn_cmd = [PYTHON, str(snn_script),
+                       "--dim", str(cfg.get("snn_dim", 256)), "--heads", str(cfg.get("snn_heads", 4)),
+                       "--beta", "0.9", "--epochs", str(cfg.get("snn_ep", 5)),
+                       "--batch", str(cfg.get("snn_batch", 32)), "--seq_len", str(cfg.get("snn_seq", 128)),
+                       "--lr", "3e-4", "--device", device,
+                       "--max_bytes", str(cfg.get("snn_max_mb", 20))]
+            if args.data_dir: snn_cmd += ["--data_dir", args.data_dir]
+            if args.resume: snn_cmd += ["--resume"]
+            ok = run(snn_cmd, label="SNN")
+            results["spiking"] = ok
+            if ok: mark_done(state, "spiking")
+        else:
+            print(f"\n  ⏭ Phase 3.5: train_spiking.py не найден — пропуск")
+            mark_done(state, "spiking")
 
     # ═══ Phase 4: Mamba-2 Brain ═══
     mamba_seq = [cfg["seq_start"], cfg["seq_mid"], cfg["seq_max"], cfg["seq_max"]]
@@ -978,7 +1001,7 @@ def main():
               f"batch={cfg['batch']}×{cfg['accum']}, "
               f"{cfg['mamba_ep'][mp-1]} epochs")
 
-        cmd = [PYTHON, str(TRAINING / "train_mamba2.py"),
+        cmd = [PYTHON, str(TRAIN_DIR / "train_mamba2.py"),
                "--d_model", str(cfg["d_model"]),
                "--n_layers", str(cfg["n_layers"]),
                "--vocab_size", str(cfg["vocab_size"]),
@@ -1043,7 +1066,7 @@ def main():
     # ═══ Phase 4.5: Personality ═══
     if should_run(4) and not is_done(state, "personality"):
         print(f"\n  🎭 Phase 4.5: PersonalityAdapter ({cfg['personality_ep']} epochs)...")
-        cmd = [PYTHON, str(TRAINING / "train_mamba2.py"),
+        cmd = [PYTHON, str(TRAIN_DIR / "train_mamba2.py"),
                "--d_model", str(cfg["d_model"]), "--n_layers", str(cfg["n_layers"]),
                "--vocab_size", str(cfg["vocab_size"]),
                "--batch", str(cfg["batch"]),
@@ -1073,7 +1096,7 @@ def main():
     # ═══ Phase 7: Validate ═══
     if should_run(7) and not is_done(state, "validate"):
         print("\n  ✅ Phase 7: Валидация...")
-        qt = TRAINING / "quick_test.py"
+        qt = EVAL_DIR / "quick_test.py"
         if qt.exists():
             ok = run([PYTHON, str(qt)], label="Validate", timeout=120)
         else:
@@ -1086,7 +1109,7 @@ def main():
     if not args.skip_voice and (should_run(8) or should_run(9)):
         print("\n  🎙 Phase 8-9: Голосовые модули...")
         if should_run(8) and not is_done(state, "whisper"):
-            whisper_script = TRAINING / "train_whisper.py"
+            whisper_script = TRAIN_DIR / "train_whisper.py"
             if whisper_script.exists():
                 ok = run([PYTHON, str(whisper_script),
                           "--device", device, "--epochs", "3", "--batch", "16"], label="Whisper")
@@ -1096,7 +1119,7 @@ def main():
                 print("  ⚠ train_whisper.py не найден — пропуск")
                 results["whisper"] = False
         if should_run(9) and not is_done(state, "piper"):
-            piper_script = TRAINING / "train_piper.py"
+            piper_script = TRAIN_DIR / "train_piper.py"
             if piper_script.exists():
                 ok = run([PYTHON, str(piper_script),
                           "--epochs", "1000", "--batch", "16"], label="Piper")
@@ -1111,7 +1134,7 @@ def main():
     # ═══ Phase 11: Instruction Tuning ═══
     if (should_run(11) or args.phase is None) and not is_done(state, "instruct"):
         print(f"\n  📖 Phase 11: Instruction Tuning ({cfg['instruct_ep']} epochs)...")
-        ok = run([PYTHON, str(TRAINING / "train_instruct.py"),
+        ok = run([PYTHON, str(TRAIN_DIR / "train_instruct.py"),
                   "--d_model", str(cfg["d_model"]), "--n_layers", str(cfg["n_layers"]),
                   "--epochs", str(cfg["instruct_ep"]), "--batch", str(cfg["batch"]),
                   "--device", device, "--save_dir", str(TARS_V3),
@@ -1132,11 +1155,11 @@ def main():
             cot_data = data_dir / "cot_reasoning.txt"
             if not cot_data.exists() or cot_data.stat().st_size < 1000:
                 print(f"\n  📝 Phase 12a: Генерация CoT данных...")
-                run([PYTHON, str(TRAINING / "train_cot.py"),
+                run([PYTHON, str(TRAIN_DIR / "train_cot.py"),
                      "--generate", "--n_samples", "20000",
                      "--cot_data", str(cot_data)], label="CoT-Gen")
             print(f"\n  🧩 Phase 12b: CoT Training ({cfg['cot_ep']} epochs)...")
-            ok = run([PYTHON, str(TRAINING / "train_cot.py"),
+            ok = run([PYTHON, str(TRAIN_DIR / "train_cot.py"),
                       "--d_model", str(cfg["d_model"]), "--n_layers", str(cfg["n_layers"]),
                       "--epochs", str(cfg["cot_ep"]), "--batch", str(cfg["batch"]),
                       "--device", device, "--save_dir", str(TARS_V3),
@@ -1154,7 +1177,7 @@ def main():
                 generate_dpo_pairs(dpo_data)
             if dpo_data.exists() and dpo_data.stat().st_size > 100:
                 print(f"\n  ⚖️ Phase 13b: DPO ({cfg['dpo_ep']} epochs)...")
-                ok = run([PYTHON, str(TRAINING / "train_dpo.py"),
+                ok = run([PYTHON, str(TRAIN_DIR / "train_dpo.py"),
                           "--d_model", str(cfg["d_model"]), "--n_layers", str(cfg["n_layers"]),
                           "--epochs", str(cfg["dpo_ep"]), "--batch", str(cfg["batch"]),
                           "--device", device, "--save_dir", str(TARS_V3),
@@ -1167,7 +1190,7 @@ def main():
         # Phase 14: RLVR
         if (should_run(14) or args.phase is None) and not is_done(state, "rlvr"):
             print(f"\n  🎯 Phase 14: RLVR ({cfg['rlvr_ep']} epochs)...")
-            ok = run([PYTHON, str(TRAINING / "train_rlvr.py"),
+            ok = run([PYTHON, str(TRAIN_DIR / "train_rlvr.py"),
                       "--d_model", str(cfg["d_model"]), "--n_layers", str(cfg["n_layers"]),
                       "--epochs", str(cfg["rlvr_ep"]), "--batch", str(cfg["batch"]),
                       "--device", device, "--save_dir", str(TARS_V3),
