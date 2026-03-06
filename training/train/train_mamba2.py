@@ -868,6 +868,14 @@ def train(args):
     best_loss = float('inf')
     patience_counter = 0
     
+    # ═══ Prepare initial data BEFORE calculating steps ═══
+    cur_seq_len = curriculum_schedule[0] if curriculum_schedule else args.seq_len
+    c_inputs, c_targets = prepare_data(corpus, cur_seq_len, actual_vocab, max_samples=args.max_samples, tokenizer=tokenizer)
+    n_test_c = max(2, len(c_inputs) // 10)
+    c_train_in, c_test_in = c_inputs[:-n_test_c], c_inputs[-n_test_c:]
+    c_train_tgt, c_test_tgt = c_targets[:-n_test_c], c_targets[-n_test_c:]
+    print(f"  seq_len={cur_seq_len}, samples={len(c_train_in)}")
+    
     # ═══ T18: Total steps for adaptive aux loss decay ═══
     steps_per_epoch = max(1, len(c_train_in) // args.batch)
     total_steps = steps_per_epoch * args.epochs
@@ -881,9 +889,10 @@ def train(args):
         n_batches = 0
         tokens_processed = 0
         
-        # Curriculum: пересоздать данные с новым seq_len
-        cur_seq_len = curriculum_schedule[epoch] if curriculum_schedule else args.seq_len
-        if epoch == 0 or (curriculum_schedule and cur_seq_len != curriculum_schedule[max(0, epoch-1)]):
+        # Curriculum: пересоздать данные с новым seq_len (skip epoch 0 — already done)
+        if curriculum_schedule:
+            cur_seq_len = curriculum_schedule[epoch]
+        if epoch > 0 and curriculum_schedule and cur_seq_len != curriculum_schedule[max(0, epoch-1)]:
             c_inputs, c_targets = prepare_data(corpus, cur_seq_len, actual_vocab, max_samples=args.max_samples, tokenizer=tokenizer)
             n_test_c = max(2, len(c_inputs) // 10)
             c_train_in, c_test_in = c_inputs[:-n_test_c], c_inputs[-n_test_c:]
