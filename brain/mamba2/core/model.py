@@ -218,8 +218,8 @@ class WaveConsolidation(nn.Module):
         x_left, x_right: [B, L, d_model]
         Returns: (x_merged [B, L, d_model], alpha_mean: float)
         """
-        h_left = x_left.mean(dim=1)   # [B, d_model]
-        h_right = x_right.mean(dim=1)  # [B, d_model]
+        h_left = x_left.clone().mean(dim=1)   # [B, d_model] — clone for CUDAGraph safety
+        h_right = x_right.clone().mean(dim=1)  # [B, d_model]
         h_cat = torch.cat([h_left, h_right], dim=-1)  # [B, 2*d_model]
         
         # 1. Dimension-wise gate
