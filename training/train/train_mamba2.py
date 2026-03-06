@@ -267,6 +267,10 @@ def load_corpus(data_path=None, download_wiki=True, data_dir=None,
     
     # Повторяем маленький корпус
     corpus_bytes = len(corpus.encode('utf-8'))
+    if corpus_bytes == 0:
+        print("[Data] ⚠ Корпус пуст! Проверьте data/datasets/")
+        corpus = "ТАРС — нейросетевой ассистент.\n" * 1000
+        corpus_bytes = len(corpus.encode('utf-8'))
     if corpus_bytes < 200_000:
         repeat = max(1, 200_000 // corpus_bytes)
         corpus = ("\n\n" + corpus) * repeat

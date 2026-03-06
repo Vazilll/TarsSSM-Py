@@ -224,7 +224,7 @@ class MoLELayer(nn.Module):
                 mask = (expert_idx == eidx)  # [B] bool
                 if mask.any():
                     expert_out = self.experts[eidx](h_mean[mask])  # [N_selected, d_model]
-                    delta[mask] = delta[mask] + weight[mask] * expert_out
+                    delta[mask] = delta[mask] + (weight[mask] * expert_out).to(delta.dtype)
         
         # Добавляем delta ко всем позициям (broadcast)
         return self.norm(x + delta.unsqueeze(1)), aux_loss
