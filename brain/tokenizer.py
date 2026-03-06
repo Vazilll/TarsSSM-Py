@@ -59,29 +59,40 @@ class TarsTokenizer:
 
         if mode == "byte":
             self._init_byte()
+        elif mode == "utf8":
+            self._init_utf8()
         elif mode == "bpe":
             self._init_bpe()
         elif mode == "auto":
-            # Try BPE first, fall back to byte
+            # Try BPE first, fall back to UTF-8 byte, then CP1251 byte
             if self._model_path.exists():
                 try:
                     self._init_bpe()
                 except Exception as e:
-                    _logger.warning(f"SentencePiece load failed ({e}), fallback to byte")
-                    self._init_byte()
+                    _logger.warning(f"SentencePiece load failed ({e}), fallback to utf8")
+                    self._init_utf8()
             else:
-                self._init_byte()
+                self._init_utf8()
         else:
             raise ValueError(f"Unknown tokenizer mode: {mode!r}")
 
     def _init_byte(self):
-        """CP1251 byte-level fallback."""
+        """CP1251 byte-level fallback. Legacy mode for backward compat."""
         self._mode = "byte"
         self.vocab_size = 256
         self.pad_token_id = 0
         self.eos_token_id = 3   # ETX
         self.bos_token_id = 2   # STX
-        _logger.info(f"TarsTokenizer: byte mode (vocab={self.vocab_size})")
+        _logger.info(f"TarsTokenizer: byte mode CP1251 (vocab={self.vocab_size})")
+    
+    def _init_utf8(self):
+        """UTF-8 byte-level mode. Supports ALL Unicode losslessly."""
+        self._mode = "utf8"
+        self.vocab_size = 256
+        self.pad_token_id = 0
+        self.eos_token_id = 3   # ETX
+        self.bos_token_id = 2   # STX
+        _logger.info(f"TarsTokenizer: utf8 byte mode (vocab={self.vocab_size})")
 
     def _init_bpe(self):
         """SentencePiece BPE mode."""
@@ -124,6 +135,8 @@ class TarsTokenizer:
         """
         if self._mode == "bpe":
             return self._sp.EncodeAsIds(text)
+        elif self._mode == "utf8":
+            return list(text.encode('utf-8'))
         else:
             return list(text.encode('cp1251', errors='replace'))
 
@@ -135,6 +148,10 @@ class TarsTokenizer:
             # Filter invalid IDs
             valid = [i for i in ids if 0 <= i < self.vocab_size]
             return self._sp.DecodeIds(valid)
+        elif self._mode == "utf8":
+            clean = [b for b in ids if 0 <= b < 256
+                     and b not in (self.pad_token_id, self.eos_token_id, self.bos_token_id)]
+            return bytes(clean).decode('utf-8', errors='replace')
         else:
             clean = [b for b in ids if 0 <= b < 256
                      and b not in (self.pad_token_id, self.eos_token_id, self.bos_token_id)]

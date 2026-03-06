@@ -10,6 +10,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import logging
+import os
+import glob
+from datetime import datetime
+from pathlib import Path
 
 
 class LongTermMemory(nn.Module):
@@ -48,7 +52,8 @@ class TitansMemory:
       - Если вход из Mamba-2 (768d+) → проецируется через brain_proj
       - get_recall() возвращает 384d вектор для инъекции в TarsBlock
     """
-    def __init__(self, dim=384, brain_dim=768, learning_rate=2e-4):
+    def __init__(self, dim=384, brain_dim=768, learning_rate=2e-4,
+                 snapshot_dir=None, max_snapshots=7):
         self.dim = dim
         self.ltm = LongTermMemory(dim)
         self.optimizer = optim.Adam(self.ltm.parameters(), lr=learning_rate)
@@ -65,6 +70,11 @@ class TitansMemory:
         # Статистика
         self.total_updates = 0
         self.total_surprises = 0
+        
+        # ═══ Snapshot versioning ═══
+        _root = Path(__file__).resolve().parent.parent
+        self.snapshot_dir = Path(snapshot_dir) if snapshot_dir else _root / "models" / "titans"
+        self.max_snapshots = max_snapshots
 
     def project_from_brain(self, brain_vec: torch.Tensor) -> torch.Tensor:
         """Проецирует вектор из Mamba-2 (768d) → память (384d)."""
@@ -110,6 +120,12 @@ class TitansMemory:
                 f"(loss={loss_val:.3f} > {self.surprise_threshold}). Консолидация..."
             )
             
+            # 1.5. Snapshot BEFORE SGD (protect against catastrophic forgetting)
+            try:
+                self.snapshot()
+            except Exception as e:
+                self.logger.warning(f"Titans: Snapshot failed: {e}")
+            
             # 2. Fast Weight Update (3 итерации)
             for _ in range(3):
                 self.optimizer.zero_grad()
@@ -130,7 +146,115 @@ class TitansMemory:
             "total_surprises": self.total_surprises,
             "surprise_rate": self.total_surprises / max(1, self.total_updates),
             "ltm_params": sum(p.numel() for p in self.ltm.parameters()),
+            "snapshots": len(self._list_snapshots()),
         }
+    
+    async def consolidate(self, leann_index, recent_embeddings: list = None,
+                          min_surprise_rate: float = 0.3):
+        """
+        Hippocampal → Neocortical consolidation.
+        
+        During "sleep phase": high-surprise Titans activations are
+        replayed and indexed into LEANN for permanent storage.
+        
+        Args:
+            leann_index: LeannIndex instance to consolidate into
+            recent_embeddings: list of (text, embedding_384d, surprise_score) tuples
+            min_surprise_rate: minimum surprise rate to trigger consolidation
+        
+        Returns:
+            Number of memories consolidated
+        """
+        if self.total_updates == 0:
+            return 0
+        
+        # Only consolidate if surprise rate is meaningful
+        if (self.total_surprises / max(1, self.total_updates)) < min_surprise_rate:
+            return 0
+        
+        consolidated = 0
+        if recent_embeddings:
+            for text, emb, surprise_score in recent_embeddings:
+                if surprise_score > self.surprise_threshold:
+                    # High-surprise → worthy of permanent LEANN storage
+                    importance = min(1.0, surprise_score / self.surprise_threshold)
+                    leann_index.add_document(
+                        text, importance=importance
+                    )
+                    consolidated += 1
+        
+        if consolidated > 0:
+            self.logger.info(
+                f"Titans: Consolidated {consolidated} memories "
+                f"(hippocampus → neocortex / LEANN)"
+            )
+        
+        return consolidated
+    
+    # ═══ Snapshot versioning ═══
+    
+    def _list_snapshots(self):
+        """List snapshot files sorted by time (oldest first)."""
+        pattern = str(self.snapshot_dir / "titans_snapshot_*.pt")
+        files = glob.glob(pattern)
+        files.sort()  # lexicographic = chronological (ISO format)
+        return files
+    
+    def snapshot(self):
+        """
+        Save LTM state + optimizer before surprise SGD.
+        File: titans_snapshot_{ISO_timestamp}.pt
+        Auto-rotates to max_snapshots.
+        """
+        self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%dT%H%M%S")
+        path = self.snapshot_dir / f"titans_snapshot_{ts}.pt"
+        torch.save({
+            "ltm_state_dict": self.ltm.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "total_updates": self.total_updates,
+            "total_surprises": self.total_surprises,
+            "timestamp": ts,
+        }, str(path))
+        self.logger.info(f"Titans: Snapshot saved → {path.name}")
+        self.rotate_snapshots()
+        return str(path)
+    
+    def restore_snapshot(self, path=None):
+        """
+        Restore LTM from a snapshot.
+        Args:
+            path: specific snapshot path. None = latest.
+        """
+        if path is None:
+            snapshots = self._list_snapshots()
+            if not snapshots:
+                self.logger.warning("Titans: No snapshots found")
+                return False
+            path = snapshots[-1]  # latest
+        
+        if not os.path.exists(path):
+            self.logger.warning(f"Titans: Snapshot not found: {path}")
+            return False
+        
+        cp = torch.load(path, map_location="cpu", weights_only=True)
+        self.ltm.load_state_dict(cp["ltm_state_dict"])
+        self.optimizer.load_state_dict(cp["optimizer_state_dict"])
+        self.total_updates = cp.get("total_updates", 0)
+        self.total_surprises = cp.get("total_surprises", 0)
+        self.logger.info(f"Titans: Restored from {os.path.basename(path)}")
+        return True
+    
+    def rotate_snapshots(self):
+        """Keep only max_snapshots newest files, delete the rest."""
+        snapshots = self._list_snapshots()
+        while len(snapshots) > self.max_snapshots:
+            oldest = snapshots.pop(0)
+            try:
+                os.remove(oldest)
+                self.logger.debug(f"Titans: Rotated old snapshot: {os.path.basename(oldest)}")
+            except OSError as e:
+                self.logger.warning(f"Titans: Failed to remove {oldest}: {e}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,1173 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TARS — Thinking Dashboard</title>
+<meta name="description" content="Real-time visualization of TARS brain thinking process: wave pipeline, DoubtEngine, CriticHead, IntegralAuditor, ThinkingChain">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* ═══════════════════════════════════════════════════
+   TARS Thinking Dashboard — Design System
+   Theme: Dark Glassmorphism (#0a0a0f / #1a1a2e)
+   ═══════════════════════════════════════════════════ */
+
+:root {
+  --bg-primary: #0a0a0f;
+  --bg-card: rgba(26, 26, 46, 0.75);
+  --bg-card-hover: rgba(26, 26, 46, 0.92);
+  --bg-inner: rgba(15, 52, 96, 0.25);
+  --border-card: rgba(233, 69, 96, 0.15);
+  --border-dim: rgba(255,255,255,0.06);
+
+  --accent-red: #e94560;
+  --accent-cyan: #00d2ff;
+  --accent-blue: #0f3460;
+  --accent-green: #00e676;
+  --accent-yellow: #ffd740;
+  --accent-purple: #b388ff;
+  --accent-orange: #ff9100;
+
+  --text-primary: #e0e0e0;
+  --text-secondary: rgba(224,224,224,0.55);
+  --text-dim: rgba(224,224,224,0.3);
+
+  --font-body: 'Inter', -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Consolas', monospace;
+
+  --blur: blur(14px);
+  --radius: 14px;
+  --radius-sm: 8px;
+  --transition: 0.3s cubic-bezier(.4,0,.2,1);
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: var(--font-body);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  min-height: 100vh;
+  line-height: 1.5;
+  overflow-x: hidden;
+}
+
+/* Animated gradient background */
+body::before {
+  content: '';
+  position: fixed; inset: 0;
+  background:
+    radial-gradient(ellipse 600px 400px at 20% 30%, rgba(15,52,96,.35) 0%, transparent 70%),
+    radial-gradient(ellipse 500px 350px at 80% 70%, rgba(233,69,96,.12) 0%, transparent 70%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* ── Layout ── */
+.dashboard {
+  position: relative; z-index: 1;
+  max-width: 1320px;
+  margin: 0 auto;
+  padding: 24px 20px 48px;
+  display: grid;
+  gap: 20px;
+  grid-template-columns: 1fr 1fr;
+  grid-template-areas:
+    "hdr hdr"
+    "predict predict"
+    "waves waves"
+    "heatmap heatmap"
+    "ia tc"
+    "doubt critic"
+    "memory memory"
+    "idme idme"
+    "sleep sleep"
+    "summary summary";
+}
+
+/* ── Glass Card ── */
+.card {
+  background: var(--bg-card);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+  border: 1px solid var(--border-card);
+  border-radius: var(--radius);
+  padding: 20px 22px;
+  transition: border-color var(--transition), box-shadow var(--transition);
+}
+.card:hover {
+  border-color: rgba(233,69,96,0.35);
+  box-shadow: 0 0 30px rgba(233,69,96,0.07);
+}
+.card-title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1.8px;
+  color: var(--text-secondary);
+  margin-bottom: 14px;
+  display: flex; align-items: center; gap: 8px;
+}
+.card-title .icon { font-size: 14px; }
+
+/* ── Header ── */
+.header { grid-area: hdr; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; padding: 16px 22px; }
+.header h1 {
+  font-size: 20px; font-weight: 700; letter-spacing: -0.3px;
+  background: linear-gradient(135deg, var(--accent-cyan), var(--accent-red));
+  -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+}
+.header-controls { display: flex; align-items: center; gap: 12px; }
+.conn-status {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; font-family: var(--font-mono); color: var(--text-secondary);
+}
+.conn-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent-red);
+  box-shadow: 0 0 6px var(--accent-red);
+  transition: background var(--transition), box-shadow var(--transition);
+}
+.conn-dot.connected { background: var(--accent-green); box-shadow: 0 0 8px var(--accent-green); }
+
+.btn {
+  padding: 7px 16px;
+  font-size: 12px; font-weight: 500; font-family: var(--font-body);
+  border: 1px solid var(--border-card);
+  border-radius: var(--radius-sm);
+  background: var(--bg-inner);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: all var(--transition);
+}
+.btn:hover { border-color: var(--accent-cyan); color: var(--accent-cyan); }
+.btn.active { border-color: var(--accent-cyan); background: rgba(0,210,255,0.1); color: var(--accent-cyan); }
+
+/* ── Wave Pipeline ── */
+.wave-pipeline { grid-area: waves; overflow-x: auto; }
+.wave-pipeline .card-body {
+  display: flex; gap: 14px; padding-bottom: 6px;
+  min-height: 180px; align-items: stretch;
+}
+.wave-card {
+  min-width: 195px; flex-shrink: 0;
+  background: var(--bg-inner);
+  border: 1px solid var(--border-dim);
+  border-radius: var(--radius-sm);
+  padding: 14px;
+  transition: all var(--transition);
+  position: relative;
+  overflow: hidden;
+}
+.wave-card.active {
+  border-color: var(--accent-cyan);
+  box-shadow: 0 0 20px rgba(0,210,255,0.12);
+}
+.wave-card.active::before {
+  content: '';
+  position: absolute; top: 0; left: 0; right: 0; height: 2px;
+  background: linear-gradient(90deg, var(--accent-cyan), var(--accent-red));
+  animation: shimmer 2s ease-in-out infinite;
+}
+@keyframes shimmer {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}
+.wave-label {
+  font-size: 11px; font-weight: 600; color: var(--accent-cyan);
+  font-family: var(--font-mono); margin-bottom: 10px;
+}
+.block-pair {
+  display: flex; align-items: center; gap: 6px; margin-bottom: 8px;
+}
+.block-pill {
+  padding: 3px 10px;
+  font-size: 10px; font-weight: 600; font-family: var(--font-mono);
+  border-radius: 4px;
+  background: rgba(15,52,96,0.5);
+  border: 1px solid var(--border-dim);
+  color: var(--text-secondary);
+  transition: all var(--transition);
+}
+.block-pill.active-block {
+  background: rgba(0,210,255,0.15);
+  border-color: var(--accent-cyan);
+  color: var(--accent-cyan);
+  box-shadow: 0 0 8px rgba(0,210,255,0.2);
+}
+.block-separator {
+  font-size: 10px; color: var(--text-dim); font-family: var(--font-mono);
+}
+.merge-bar {
+  height: 4px; border-radius: 2px;
+  background: rgba(255,255,255,0.06);
+  margin: 6px 0;
+  overflow: hidden;
+}
+.merge-bar-fill {
+  height: 100%; border-radius: 2px;
+  background: linear-gradient(90deg, var(--accent-cyan), var(--accent-purple));
+  transition: width 0.6s ease;
+}
+.expert-pills {
+  display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px;
+}
+.expert-pill {
+  font-size: 9px; font-weight: 500; padding: 2px 7px;
+  border-radius: 3px; font-family: var(--font-mono);
+  background: rgba(179,136,255,0.15);
+  color: var(--accent-purple);
+  border: 1px solid rgba(179,136,255,0.25);
+}
+.expert-pill.code { background: rgba(0,230,118,0.12); color: var(--accent-green); border-color: rgba(0,230,118,0.25); }
+.expert-pill.math { background: rgba(0,210,255,0.12); color: var(--accent-cyan); border-color: rgba(0,210,255,0.25); }
+.expert-pill.action { background: rgba(255,145,0,0.12); color: var(--accent-orange); border-color: rgba(255,145,0,0.25); }
+
+.wave-empty {
+  display: flex; align-items: center; justify-content: center;
+  height: 160px; color: var(--text-dim); font-size: 13px;
+  font-style: italic;
+}
+
+/* ── Integral Auditor ── */
+.ia-section { grid-area: ia; }
+.ia-body { display: flex; align-items: center; gap: 28px; }
+.gauge-wrap {
+  position: relative; width: 120px; height: 120px;
+}
+.gauge-svg { width: 120px; height: 120px; transform: rotate(-90deg); }
+.gauge-bg { fill: none; stroke: rgba(255,255,255,0.06); stroke-width: 8; }
+.gauge-fill {
+  fill: none; stroke: var(--accent-cyan); stroke-width: 8;
+  stroke-linecap: round;
+  transition: stroke-dashoffset 0.7s ease, stroke 0.4s ease;
+}
+.gauge-fill.warning { stroke: var(--accent-yellow); }
+.gauge-fill.danger { stroke: var(--accent-red); }
+.gauge-fill.converged { stroke: var(--accent-green); }
+.gauge-value {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  font-family: var(--font-mono);
+}
+.gauge-value .big { font-size: 22px; font-weight: 700; }
+.gauge-value .label { font-size: 9px; color: var(--text-secondary); margin-top: 2px; }
+.ia-stats { flex: 1; }
+.ia-row {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border-dim);
+  font-size: 13px;
+}
+.ia-row:last-child { border-bottom: none; }
+.ia-row .label { color: var(--text-secondary); }
+.ia-row .value { font-family: var(--font-mono); font-weight: 500; }
+.ia-row .value.good { color: var(--accent-green); }
+.ia-row .value.mid { color: var(--accent-yellow); }
+.ia-row .value.bad { color: var(--accent-red); }
+
+/* ── ThinkingChain ── */
+.tc-section { grid-area: tc; }
+.phase-breadcrumb {
+  display: flex; gap: 4px; margin-bottom: 16px; flex-wrap: wrap;
+}
+.phase-step {
+  display: flex; align-items: center; gap: 5px;
+  padding: 5px 12px;
+  border-radius: 20px;
+  font-size: 11px; font-weight: 500;
+  background: var(--bg-inner);
+  border: 1px solid var(--border-dim);
+  color: var(--text-dim);
+  transition: all var(--transition);
+}
+.phase-step.active {
+  border-color: var(--accent-cyan);
+  color: var(--accent-cyan);
+  background: rgba(0,210,255,0.1);
+  box-shadow: 0 0 10px rgba(0,210,255,0.1);
+}
+.phase-step.done {
+  border-color: rgba(0,230,118,0.3);
+  color: var(--accent-green);
+  background: rgba(0,230,118,0.08);
+}
+.phase-arrow { color: var(--text-dim); font-size: 10px; display: flex; align-items: center; }
+.confidence-bar-wrap {
+  margin-top: 12px;
+}
+.confidence-label {
+  font-size: 11px; color: var(--text-secondary); margin-bottom: 5px;
+  display: flex; justify-content: space-between;
+}
+.confidence-bar {
+  height: 6px; border-radius: 3px;
+  background: rgba(255,255,255,0.06);
+  overflow: hidden;
+}
+.confidence-bar-fill {
+  height: 100%; border-radius: 3px;
+  background: linear-gradient(90deg, var(--accent-yellow), var(--accent-green));
+  transition: width 0.5s ease;
+}
+
+/* ── DoubtEngine ── */
+.doubt-section { grid-area: doubt; }
+.doubt-bars { display: flex; flex-direction: column; gap: 12px; }
+.doubt-row { margin-bottom: 2px; }
+.doubt-head {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 12px; margin-bottom: 5px;
+}
+.doubt-head .name { color: var(--text-secondary); }
+.doubt-head .val { font-family: var(--font-mono); font-weight: 600; }
+.doubt-bar {
+  height: 6px; border-radius: 3px;
+  background: rgba(255,255,255,0.06);
+  overflow: hidden;
+}
+.doubt-bar-fill {
+  height: 100%; border-radius: 3px;
+  transition: width 0.5s ease;
+}
+.doubt-bar-fill.coherence { background: linear-gradient(90deg, var(--accent-red), var(--accent-green)); }
+.doubt-bar-fill.safety { background: linear-gradient(90deg, var(--accent-red), var(--accent-cyan)); }
+.doubt-bar-fill.repeat { background: linear-gradient(90deg, var(--accent-green), var(--accent-red)); }
+.doubt-verdict {
+  margin-top: 14px;
+  padding: 8px 14px;
+  border-radius: var(--radius-sm);
+  font-size: 13px; font-weight: 600;
+  text-align: center;
+}
+.doubt-verdict.pass { background: rgba(0,230,118,0.1); color: var(--accent-green); border: 1px solid rgba(0,230,118,0.2); }
+.doubt-verdict.flag { background: rgba(255,215,64,0.1); color: var(--accent-yellow); border: 1px solid rgba(255,215,64,0.2); }
+.doubt-verdict.block { background: rgba(233,69,96,0.15); color: var(--accent-red); border: 1px solid rgba(233,69,96,0.25); }
+.doubt-verdict.pending { background: var(--bg-inner); color: var(--text-dim); border: 1px solid var(--border-dim); }
+
+/* ── CriticHead ── */
+.critic-section { grid-area: critic; }
+.critic-score-wrap { text-align: center; margin-bottom: 14px; }
+.critic-score-big {
+  font-size: 42px; font-weight: 700; font-family: var(--font-mono);
+  color: var(--accent-cyan);
+  line-height: 1;
+}
+.critic-score-big.low { color: var(--accent-red); }
+.critic-score-big.mid { color: var(--accent-yellow); }
+.critic-label { font-size: 11px; color: var(--text-secondary); margin-top: 4px; }
+.critic-details { display: flex; flex-direction: column; gap: 4px; }
+.critic-detail-row {
+  display: flex; justify-content: space-between;
+  font-size: 12px; color: var(--text-secondary);
+  padding: 3px 0;
+}
+.critic-detail-row .v { font-family: var(--font-mono); color: var(--text-primary); }
+
+/* ── IDME Timeline ── */
+.idme-section { grid-area: idme; }
+.idme-timeline { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 4px; }
+.idme-round {
+  min-width: 110px; flex-shrink: 0;
+  padding: 10px 14px;
+  background: var(--bg-inner);
+  border: 1px solid var(--border-dim);
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  transition: all var(--transition);
+}
+.idme-round.winner {
+  border-color: var(--accent-green);
+  box-shadow: 0 0 10px rgba(0,230,118,0.08);
+}
+.idme-round-label {
+  font-weight: 600; color: var(--accent-purple);
+  font-family: var(--font-mono); margin-bottom: 6px;
+}
+.idme-stat { display: flex; justify-content: space-between; color: var(--text-secondary); padding: 2px 0; }
+.idme-stat .v { color: var(--text-primary); font-family: var(--font-mono); }
+.idme-empty { color: var(--text-dim); font-size: 13px; font-style: italic; padding: 12px 0; }
+
+/* ── Predictive Complexity ── */
+.predict-section { grid-area: predict; }
+.predict-body { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+.predict-chip {
+  display: flex; flex-direction: column; align-items: center;
+  padding: 10px 18px;
+  background: var(--bg-inner);
+  border: 1px solid var(--border-dim);
+  border-radius: var(--radius-sm);
+  min-width: 100px;
+}
+.predict-chip .pval { font-size: 20px; font-weight: 700; font-family: var(--font-mono); color: var(--accent-cyan); }
+.predict-chip .plbl { font-size: 9px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 1px; margin-top: 3px; }
+.predict-query { flex: 1; min-width: 200px; font-size: 12px; color: var(--text-secondary); font-style: italic; padding: 8px 12px; background: var(--bg-inner); border-radius: var(--radius-sm); border: 1px solid var(--border-dim); word-break: break-word; }
+.predict-chip .pval.high { color: var(--accent-red); }
+.predict-chip .pval.mid { color: var(--accent-yellow); }
+.predict-chip .pval.low { color: var(--accent-green); }
+
+/* ── Block Heatmap ── */
+.heatmap-section { grid-area: heatmap; }
+.heatmap-grid { display: flex; gap: 4px; flex-wrap: wrap; }
+.heatmap-cell {
+  width: 42px; height: 42px;
+  border-radius: 6px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  font-size: 9px; font-weight: 600; font-family: var(--font-mono);
+  border: 1px solid var(--border-dim);
+  transition: all var(--transition);
+  cursor: default;
+  position: relative;
+}
+.heatmap-cell .blk-id { font-size: 8px; color: var(--text-dim); }
+.heatmap-cell .blk-val { font-size: 10px; }
+
+/* ── Memory Flow ── */
+.memory-section { grid-area: memory; }
+.mem-flow { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.mem-node {
+  padding: 8px 14px;
+  background: var(--bg-inner);
+  border: 1px solid var(--border-dim);
+  border-radius: var(--radius-sm);
+  font-size: 11px; text-align: center;
+  min-width: 80px;
+  transition: all var(--transition);
+}
+.mem-node.active-mem { border-color: var(--accent-cyan); box-shadow: 0 0 10px rgba(0,210,255,0.1); }
+.mem-node.skipped { opacity: 0.35; }
+.mem-node .mem-name { font-weight: 600; color: var(--text-secondary); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }
+.mem-node .mem-weight { font-family: var(--font-mono); font-size: 14px; font-weight: 700; color: var(--accent-cyan); margin-top: 2px; }
+.mem-arrow { color: var(--text-dim); font-size: 14px; }
+.cache-hit-badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 4px 12px; border-radius: 12px;
+  font-size: 11px; font-weight: 600; font-family: var(--font-mono);
+}
+.cache-hit-badge.hit { background: rgba(0,230,118,0.12); color: var(--accent-green); border: 1px solid rgba(0,230,118,0.25); }
+.cache-hit-badge.miss { background: var(--bg-inner); color: var(--text-dim); border: 1px solid var(--border-dim); }
+
+/* ── Sleep / Circadian ── */
+.sleep-section { grid-area: sleep; }
+.sleep-body { display: flex; gap: 16px; flex-wrap: wrap; }
+.sleep-chip {
+  padding: 8px 16px;
+  background: var(--bg-inner);
+  border: 1px solid var(--border-dim);
+  border-radius: var(--radius-sm);
+  font-size: 11px; display: flex; align-items: center; gap: 8px;
+}
+.sleep-chip .sv { font-family: var(--font-mono); font-weight: 600; color: var(--accent-purple); }
+
+/* ── Summary Card ── */
+.summary-section { grid-area: summary; }
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 14px;
+}
+.summary-item {
+  text-align: center;
+  padding: 14px 10px;
+  background: var(--bg-inner);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-dim);
+}
+.summary-item .val {
+  font-size: 26px; font-weight: 700;
+  font-family: var(--font-mono);
+  color: var(--accent-cyan);
+  line-height: 1.1;
+}
+.summary-item .val.red { color: var(--accent-red); }
+.summary-item .val.green { color: var(--accent-green); }
+.summary-item .val.yellow { color: var(--accent-yellow); }
+.summary-item .lbl {
+  font-size: 10px; color: var(--text-secondary);
+  text-transform: uppercase; letter-spacing: 1px;
+  margin-top: 5px;
+}
+
+/* ── Responsive ── */
+@media (max-width: 768px) {
+  .dashboard {
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "hdr" "predict" "waves" "heatmap" "ia" "tc" "doubt" "critic" "memory" "idme" "sleep" "summary";
+    padding: 14px 10px 32px;
+  }
+  .header { flex-direction: column; align-items: flex-start; }
+  .ia-body { flex-direction: column; gap: 16px; }
+  .summary-grid { grid-template-columns: repeat(2, 1fr); }
+  .predict-body { flex-direction: column; }
+}
+
+/* ── Pulse animation ── */
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 8px rgba(0,210,255,0.1); }
+  50% { box-shadow: 0 0 18px rgba(0,210,255,0.25); }
+}
+.pulse { animation: pulse-glow 2s ease-in-out infinite; }
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
+</style>
+</head>
+<body>
+
+<div class="dashboard">
+
+  <!-- ═══ Header ═══ -->
+  <div class="card header" id="header">
+    <h1>🧠 TARS Thinking Dashboard</h1>
+    <div class="header-controls">
+      <div class="conn-status">
+        <span class="conn-dot" id="connDot"></span>
+        <span id="connLabel">Disconnected</span>
+      </div>
+      <button class="btn" id="btnDemo" onclick="startDemo()">▶ Demo</button>
+      <button class="btn" id="btnClear" onclick="clearDashboard()">✕ Clear</button>
+    </div>
+  </div>
+
+  <!-- ═══ Predictive Complexity ═══ -->
+  <div class="card predict-section" id="predictSection">
+    <div class="card-title"><span class="icon">🎯</span> Predictive Complexity (MetaCortex)</div>
+    <div class="predict-body">
+      <div class="predict-chip"><div class="pval" id="predTaskType">—</div><div class="plbl">Task Type</div></div>
+      <div class="predict-chip"><div class="pval" id="predError">—</div><div class="plbl">P(Error)</div></div>
+      <div class="predict-chip"><div class="pval" id="predWaves">—</div><div class="plbl">Est. Waves</div></div>
+      <div class="predict-chip"><div class="pval" id="predDepth">—</div><div class="plbl">Depth</div></div>
+      <div class="predict-query" id="predQuery">Ожидание запроса…</div>
+    </div>
+  </div>
+
+  <!-- ═══ Wave Pipeline ═══ -->
+  <div class="card wave-pipeline" id="wavePipeline">
+    <div class="card-title"><span class="icon">🌊</span> Wave Pipeline</div>
+    <div class="card-body" id="waveContainer">
+      <div class="wave-empty" id="waveEmpty">Ожидание данных мышления…</div>
+    </div>
+  </div>
+
+  <!-- ═══ Block Heatmap ═══ -->
+  <div class="card heatmap-section" id="heatmapSection">
+    <div class="card-title"><span class="icon">🔥</span> Block Activation Heatmap</div>
+    <div class="heatmap-grid" id="heatmapGrid"></div>
+  </div>
+
+  <!-- ═══ Integral Auditor ═══ -->
+  <div class="card ia-section" id="iaSection">
+    <div class="card-title"><span class="icon">📐</span> Integral Auditor</div>
+    <div class="ia-body">
+      <div class="gauge-wrap">
+        <svg class="gauge-svg" viewBox="0 0 120 120">
+          <circle class="gauge-bg" cx="60" cy="60" r="50"/>
+          <circle class="gauge-fill" id="gaugeArc" cx="60" cy="60" r="50"
+                  stroke-dasharray="314.16" stroke-dashoffset="314.16"/>
+        </svg>
+        <div class="gauge-value">
+          <span class="big" id="pValue">0.00</span>
+          <span class="label">p-value</span>
+        </div>
+      </div>
+      <div class="ia-stats">
+        <div class="ia-row"><span class="label">R²</span><span class="value" id="rSquared">—</span></div>
+        <div class="ia-row"><span class="label">Threshold</span><span class="value" id="pThreshold">—</span></div>
+        <div class="ia-row"><span class="label">Converged</span><span class="value" id="iaConverged">—</span></div>
+        <div class="ia-row"><span class="label">Task Type</span><span class="value" id="taskType">—</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ ThinkingChain ═══ -->
+  <div class="card tc-section" id="tcSection">
+    <div class="card-title"><span class="icon">💭</span> ThinkingChain</div>
+    <div class="phase-breadcrumb" id="phaseBreadcrumb">
+      <div class="phase-step" data-phase="explore"><span>🔍</span> Explore</div>
+      <div class="phase-arrow">→</div>
+      <div class="phase-step" data-phase="analyze"><span>📊</span> Analyze</div>
+      <div class="phase-arrow">→</div>
+      <div class="phase-step" data-phase="synthesize"><span>🔧</span> Synthesize</div>
+      <div class="phase-arrow">→</div>
+      <div class="phase-step" data-phase="verify"><span>✅</span> Verify</div>
+    </div>
+    <div class="confidence-bar-wrap">
+      <div class="confidence-label">
+        <span>Confidence</span>
+        <span id="confValue" style="font-family:var(--font-mono)">0%</span>
+      </div>
+      <div class="confidence-bar"><div class="confidence-bar-fill" id="confFill" style="width:0%"></div></div>
+    </div>
+  </div>
+
+  <!-- ═══ DoubtEngine ═══ -->
+  <div class="card doubt-section" id="doubtSection">
+    <div class="card-title"><span class="icon">🔍</span> DoubtEngine</div>
+    <div class="doubt-bars">
+      <div class="doubt-row">
+        <div class="doubt-head"><span class="name">Coherence</span><span class="val" id="dCoherenceVal">—</span></div>
+        <div class="doubt-bar"><div class="doubt-bar-fill coherence" id="dCoherenceFill" style="width:0%"></div></div>
+      </div>
+      <div class="doubt-row">
+        <div class="doubt-head"><span class="name">Safety</span><span class="val" id="dSafetyVal">—</span></div>
+        <div class="doubt-bar"><div class="doubt-bar-fill safety" id="dSafetyFill" style="width:0%"></div></div>
+      </div>
+      <div class="doubt-row">
+        <div class="doubt-head"><span class="name">Repetition</span><span class="val" id="dRepeatVal">—</span></div>
+        <div class="doubt-bar"><div class="doubt-bar-fill repeat" id="dRepeatFill" style="width:0%"></div></div>
+      </div>
+    </div>
+    <div class="doubt-verdict pending" id="doubtVerdict">⏳ Awaiting verdict</div>
+  </div>
+
+  <!-- ═══ CriticHead ═══ -->
+  <div class="card critic-section" id="criticSection">
+    <div class="card-title"><span class="icon">🧪</span> CriticHead (Cerebellum)</div>
+    <div class="critic-score-wrap">
+      <div class="critic-score-big" id="criticScore">—</div>
+      <div class="critic-label">TASK SPEC SCORE</div>
+    </div>
+    <div class="critic-details">
+      <div class="critic-detail-row"><span>Needs Data</span><span class="v" id="criticNeedsData">—</span></div>
+      <div class="critic-detail-row"><span>Should Stop</span><span class="v" id="criticShouldStop">—</span></div>
+      <div class="critic-detail-row"><span>RAG Complete</span><span class="v" id="ragComplete">—</span></div>
+    </div>
+  </div>
+
+  <!-- ═══ Memory Flow + ThoughtCache ═══ -->
+  <div class="card memory-section" id="memorySection">
+    <div class="card-title"><span class="icon">🧠</span> Memory Flow (QueryRouter)</div>
+    <div class="mem-flow" id="memFlow">
+      <div class="mem-node" id="memWkv"><div class="mem-name">WKV</div><div class="mem-weight" id="memWkvW">—</div></div>
+      <div class="mem-arrow">→</div>
+      <div class="mem-node" id="memLeann"><div class="mem-name">LEANN</div><div class="mem-weight" id="memLeannW">—</div></div>
+      <div class="mem-arrow">→</div>
+      <div class="mem-node" id="memTitans"><div class="mem-name">Titans</div><div class="mem-weight" id="memTitansW">—</div></div>
+      <div class="mem-arrow">→</div>
+      <div class="mem-node" id="memWeb"><div class="mem-name">Web</div><div class="mem-weight" id="memWebW">—</div></div>
+      <div class="mem-arrow">→</div>
+      <div class="mem-node" id="memHistory"><div class="mem-name">History</div><div class="mem-weight" id="memHistoryW">—</div></div>
+      <div style="margin-left:auto"><span class="cache-hit-badge miss" id="cacheHitBadge">📦 No Cache</span></div>
+    </div>
+  </div>
+
+  <!-- ═══ IDME Expansion ═══ -->
+  <div class="card idme-section" id="idmeSection">
+    <div class="card-title"><span class="icon">🔮</span> IDME Expansion Rounds</div>
+    <div class="idme-timeline" id="idmeTimeline">
+      <div class="idme-empty" id="idmeEmpty">No expansion rounds</div>
+    </div>
+  </div>
+
+  <!-- ═══ Sleep / Circadian / Self-Verify ═══ -->
+  <div class="card sleep-section" id="sleepSection">
+    <div class="card-title"><span class="icon">🌙</span> System Status</div>
+    <div class="sleep-body">
+      <div class="sleep-chip">💤 Sleep: <span class="sv" id="sleepStatus">Active</span></div>
+      <div class="sleep-chip">📚 Memories: <span class="sv" id="sleepMemories">0</span></div>
+      <div class="sleep-chip">⏱ Consolidations: <span class="sv" id="sleepCount">0</span></div>
+      <div class="sleep-chip">✅ Self-Verify: <span class="sv" id="selfVerify">—</span></div>
+      <div class="sleep-chip">🎯 Speculative: <span class="sv" id="specAccept">—</span></div>
+    </div>
+  </div>
+
+  <!-- ═══ Summary Card ═══ -->
+  <div class="card summary-section" id="summarySection">
+    <div class="card-title"><span class="icon">📊</span> Final Summary</div>
+    <div class="summary-grid" id="summaryGrid">
+      <div class="summary-item"><div class="val" id="sumTime">—</div><div class="lbl">Total ms</div></div>
+      <div class="summary-item"><div class="val" id="sumWaves">—</div><div class="lbl">Waves</div></div>
+      <div class="summary-item"><div class="val" id="sumBlocks">—</div><div class="lbl">Blocks</div></div>
+      <div class="summary-item"><div class="val" id="sumP">—</div><div class="lbl">Final p</div></div>
+      <div class="summary-item"><div class="val" id="sumConf">—</div><div class="lbl">Confidence</div></div>
+      <div class="summary-item"><div class="val" id="sumMatrices">—</div><div class="lbl">Matrices</div></div>
+      <div class="summary-item"><div class="val" id="sumConverged">—</div><div class="lbl">Converged</div></div>
+      <div class="summary-item"><div class="val" id="sumVerdict">—</div><div class="lbl">Verdict</div></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+/* ═══════════════════════════════════════════════════
+   TARS Thinking Dashboard — Client Logic
+   WebSocket + Demo Mode
+   ═══════════════════════════════════════════════════ */
+
+const WS_URL = 'ws://localhost:7861/ws/thinking';
+let ws = null;
+let reconnectTimer = null;
+let demoMode = false;
+
+// ── WebSocket ──
+function connect() {
+  if (demoMode) return;
+  try {
+    ws = new WebSocket(WS_URL);
+    ws.onopen = () => {
+      setConnected(true);
+      clearTimeout(reconnectTimer);
+    };
+    ws.onmessage = (e) => {
+      try { handleMessage(JSON.parse(e.data)); } catch(err) { console.warn('WS parse error:', err); }
+    };
+    ws.onclose = () => {
+      setConnected(false);
+      scheduleReconnect();
+    };
+    ws.onerror = () => {
+      setConnected(false);
+    };
+  } catch(e) {
+    setConnected(false);
+    scheduleReconnect();
+  }
+}
+
+function scheduleReconnect() {
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(connect, 3000);
+}
+
+function setConnected(ok) {
+  const dot = document.getElementById('connDot');
+  const lbl = document.getElementById('connLabel');
+  if (ok) {
+    dot.classList.add('connected');
+    lbl.textContent = 'Connected';
+  } else {
+    dot.classList.remove('connected');
+    lbl.textContent = 'Disconnected';
+  }
+}
+
+// ── Message Router ──
+function handleMessage(msg) {
+  switch(msg.type) {
+    case 'session_start': onSessionStart(msg); break;
+    case 'wave_update': onWaveUpdate(msg); break;
+    case 'idme_round': onIdmeRound(msg); break;
+    case 'session_end': onSessionEnd(msg); break;
+    default: console.log('Unknown msg type:', msg.type);
+  }
+}
+
+// ── Session Start ──
+let heatmapData = {}; // {blockIdx: {surprise, novelty}}
+function onSessionStart(msg) {
+  clearDashboard();
+  document.getElementById('taskType').textContent = msg.task_type || '—';
+  document.getElementById('pThreshold').textContent = (msg.p_threshold || 0).toFixed(2);
+  document.getElementById('taskType').className = 'value';
+
+  // Predictive Complexity
+  document.getElementById('predTaskType').textContent = (msg.task_type || '—').toUpperCase();
+  const errPred = msg.error_pred ?? 0;
+  const errEl = document.getElementById('predError');
+  errEl.textContent = (errPred * 100).toFixed(0) + '%';
+  errEl.className = 'pval ' + (errPred > 0.6 ? 'high' : errPred > 0.3 ? 'mid' : 'low');
+  document.getElementById('predWaves').textContent = msg.estimated_waves ?? '—';
+  document.getElementById('predDepth').textContent = msg.estimated_depth ?? 12;
+  document.getElementById('predQuery').textContent = msg.query || 'Ожидание запроса…';
+
+  // Memory Flow (QueryRouter source_weights)
+  if (msg.source_weights) {
+    const sw = msg.source_weights;
+    const names = ['leann','titans','web','history'];
+    const ids = ['memLeannW','memTitansW','memWebW','memHistoryW'];
+    const nodeIds = ['memLeann','memTitans','memWeb','memHistory'];
+    names.forEach((n,i) => {
+      const w = sw[n] ?? sw[i] ?? 0;
+      document.getElementById(ids[i]).textContent = (w * 100).toFixed(0) + '%';
+      const node = document.getElementById(nodeIds[i]);
+      node.classList.toggle('active-mem', w > 0.2);
+      node.classList.toggle('skipped', w < 0.05);
+    });
+    document.getElementById('memWkvW').textContent = msg.rag_skipped ? 'Only' : 'Base';
+  }
+
+  // ThoughtCache
+  if (msg.cache_hit) {
+    const badge = document.getElementById('cacheHitBadge');
+    badge.className = 'cache-hit-badge hit';
+    badge.textContent = '⚡ Cache ' + (msg.cache_similarity * 100).toFixed(0) + '%';
+  }
+
+  // Init heatmap grid (12 blocks)
+  const totalBlocks = msg.total_blocks || 12;
+  const grid = document.getElementById('heatmapGrid');
+  grid.innerHTML = '';
+  for (let i = 0; i < totalBlocks; i++) {
+    const cell = document.createElement('div');
+    cell.className = 'heatmap-cell';
+    cell.id = 'hm-' + i;
+    cell.style.background = 'var(--bg-inner)';
+    cell.innerHTML = '<span class="blk-id">B' + i + '</span><span class="blk-val">—</span>';
+    grid.appendChild(cell);
+    heatmapData[i] = {surprise: 0, novelty: 0};
+  }
+}
+
+// ── Wave Update ──
+let waveData = [];
+function onWaveUpdate(msg) {
+  waveData.push(msg);
+  renderWaves();
+
+  // Update IA
+  if (msg.ia) {
+    updateGauge(msg.ia.p || 0, msg.ia.converged || false);
+    const r2 = msg.ia.r_squared || 0;
+    const r2El = document.getElementById('rSquared');
+    r2El.textContent = r2.toFixed(3);
+    r2El.className = 'value ' + (r2 > 0.9 ? 'good' : r2 > 0.7 ? 'mid' : 'bad');
+    document.getElementById('iaConverged').textContent = msg.ia.converged ? '✅ Yes' : '❌ No';
+    document.getElementById('iaConverged').className = 'value ' + (msg.ia.converged ? 'good' : '');
+  }
+
+  // Update ThinkingChain
+  if (msg.thinking) {
+    setPhase(msg.thinking.phase || 'explore');
+    const conf = (msg.thinking.confidence || 0) * 100;
+    document.getElementById('confValue').textContent = conf.toFixed(0) + '%';
+    document.getElementById('confFill').style.width = conf + '%';
+  }
+
+  // Update CriticHead
+  if (msg.critic) {
+    const sc = msg.critic.score || 0;
+    const scEl = document.getElementById('criticScore');
+    scEl.textContent = (sc * 100).toFixed(0) + '%';
+    scEl.className = 'critic-score-big' + (sc < 0.5 ? ' low' : sc < 0.75 ? ' mid' : '');
+    document.getElementById('criticNeedsData').textContent = msg.critic.needs_data ? 'Yes' : 'No';
+    document.getElementById('criticShouldStop').textContent = msg.critic.should_stop ? 'Yes' : 'No';
+  }
+
+  // Update DoubtEngine
+  if (msg.doubt) updateDoubt(msg.doubt);
+
+  // Update Block Heatmap
+  const waveNum = msg.wave || waveData.length;
+  const bL = (waveNum - 1) * 2;
+  const bR = bL + 1;
+  const surpL = msg.block_l?.surprise ?? 0;
+  const surpR = msg.block_r?.surprise ?? 0;
+  updateHeatmapCell(bL, surpL);
+  updateHeatmapCell(bR, surpR);
+}
+
+function updateHeatmapCell(idx, surprise) {
+  const cell = document.getElementById('hm-' + idx);
+  if (!cell) return;
+  heatmapData[idx] = {surprise};
+  // Color: green (low) → yellow → red (high surprise)
+  const intensity = Math.min(surprise / 0.5, 1.0);
+  const r = Math.round(40 + intensity * 200);
+  const g = Math.round(200 - intensity * 170);
+  const b = Math.round(80 - intensity * 60);
+  cell.style.background = `rgba(${r},${g},${b},0.3)`;
+  cell.style.borderColor = `rgba(${r},${g},${b},0.5)`;
+  cell.querySelector('.blk-val').textContent = surprise.toFixed(2);
+  cell.querySelector('.blk-val').style.color = `rgb(${r},${g},${b})`;
+}
+
+function renderWaves() {
+  const container = document.getElementById('waveContainer');
+  const empty = document.getElementById('waveEmpty');
+  if (empty) empty.remove();
+
+  // Clear and rebuild
+  container.innerHTML = '';
+  waveData.forEach((w, i) => {
+    const isLast = (i === waveData.length - 1);
+    const card = document.createElement('div');
+    card.className = 'wave-card' + (isLast ? ' active pulse' : '');
+
+    const waveNum = w.wave || (i + 1);
+    const bL = (waveNum - 1) * 2;
+    const bR = bL + 1;
+
+    // Block pair
+    const blockHtml = `
+      <div class="block-pair">
+        <span class="block-pill ${isLast ? 'active-block' : ''}">B${bL}</span>
+        <span class="block-separator">‖</span>
+        <span class="block-pill ${isLast ? 'active-block' : ''}">B${bR}</span>
+      </div>
+    `;
+
+    // Merge bar
+    const alpha = w.merge_alpha || 0.5;
+    const mergeHtml = `
+      <div style="font-size:9px;color:var(--text-dim);margin-top:4px">merge α = ${alpha.toFixed(2)}</div>
+      <div class="merge-bar"><div class="merge-bar-fill" style="width:${alpha*100}%"></div></div>
+    `;
+
+    // Expert pills
+    let expertsHtml = '';
+    const allExperts = [
+      ...(w.block_l?.experts || []),
+      ...(w.block_r?.experts || [])
+    ];
+    if (allExperts.length > 0) {
+      const pills = [...new Set(allExperts)].map(e => {
+        const cls = ['code','math','action'].includes(e) ? e : '';
+        return `<span class="expert-pill ${cls}">${e}</span>`;
+      }).join('');
+      expertsHtml = `<div class="expert-pills">${pills}</div>`;
+    }
+
+    card.innerHTML = `
+      <div class="wave-label">Wave ${waveNum}</div>
+      ${blockHtml}${mergeHtml}${expertsHtml}
+    `;
+    container.appendChild(card);
+  });
+
+  // Auto-scroll to latest
+  container.scrollLeft = container.scrollWidth;
+}
+
+// ── Gauge ──
+const CIRCUMFERENCE = 2 * Math.PI * 50; // r=50
+function updateGauge(p, converged) {
+  const pNorm = Math.min(p / 2.0, 1.0); // normalize p to [0,1] with max=2.0
+  const offset = CIRCUMFERENCE * (1 - pNorm);
+  const arc = document.getElementById('gaugeArc');
+  arc.style.strokeDashoffset = offset;
+  arc.className = 'gauge-fill' + (converged ? ' converged' : p > 0.8 ? '' : p > 0.4 ? ' warning' : ' danger');
+  document.getElementById('pValue').textContent = p.toFixed(2);
+}
+
+// ── Phase ──
+const PHASE_ORDER = ['explore', 'analyze', 'synthesize', 'verify'];
+function setPhase(phase) {
+  const steps = document.querySelectorAll('.phase-step');
+  const idx = PHASE_ORDER.indexOf(phase);
+  steps.forEach((el, i) => {
+    const realIdx = Math.floor(i); // skip arrows counted via querySelectorAll
+    el.classList.remove('active', 'done');
+    const stepPhase = el.dataset.phase;
+    const sIdx = PHASE_ORDER.indexOf(stepPhase);
+    if (sIdx < idx) el.classList.add('done');
+    else if (sIdx === idx) el.classList.add('active');
+  });
+}
+
+// ── Doubt ──
+function updateDoubt(d) {
+  const coh = d.coherence ?? 0;
+  const saf = d.safety ?? 0;
+  const rep = d.repeat ?? 0;
+
+  document.getElementById('dCoherenceVal').textContent = coh.toFixed(2);
+  document.getElementById('dCoherenceFill').style.width = (coh * 100) + '%';
+  document.getElementById('dSafetyVal').textContent = saf.toFixed(2);
+  document.getElementById('dSafetyFill').style.width = (saf * 100) + '%';
+  document.getElementById('dRepeatVal').textContent = rep.toFixed(2);
+  document.getElementById('dRepeatFill').style.width = (rep * 100) + '%';
+
+  // Verdict
+  const v = document.getElementById('doubtVerdict');
+  if (saf < 0.3 || coh < 0.2 || rep > 0.9) {
+    v.className = 'doubt-verdict block'; v.textContent = '🚫 BLOCK';
+  } else if (saf < 0.6 || coh < 0.5 || rep > 0.7) {
+    v.className = 'doubt-verdict flag'; v.textContent = '⚠️ FLAG';
+  } else {
+    v.className = 'doubt-verdict pass'; v.textContent = '✅ PASS';
+  }
+}
+
+// ── IDME ──
+let idmeRounds = [];
+function onIdmeRound(msg) {
+  idmeRounds.push(msg);
+  renderIdme();
+}
+function renderIdme() {
+  const tl = document.getElementById('idmeTimeline');
+  const empty = document.getElementById('idmeEmpty');
+  if (empty) empty.remove();
+  tl.innerHTML = '';
+  idmeRounds.forEach((r, i) => {
+    const el = document.createElement('div');
+    el.className = 'idme-round' + (r.best_p_delta > 0.01 ? ' winner' : '');
+    el.innerHTML = `
+      <div class="idme-round-label">Round ${r.round || (i+1)}</div>
+      <div class="idme-stat"><span>Matrices</span><span class="v">${r.matrices_recruited || 0}</span></div>
+      <div class="idme-stat"><span>Δp</span><span class="v">${(r.best_p_delta || 0).toFixed(3)}</span></div>
+    `;
+    tl.appendChild(el);
+  });
+}
+
+// ── Session End ──
+function onSessionEnd(msg) {
+  document.getElementById('sumTime').textContent = (msg.total_ms || 0).toFixed(0);
+  document.getElementById('sumWaves').textContent = msg.waves || 0;
+  document.getElementById('sumBlocks').textContent = msg.blocks || 0;
+
+  const fp = msg.final_p || 0;
+  const fpEl = document.getElementById('sumP');
+  fpEl.textContent = fp.toFixed(2);
+  fpEl.className = 'val' + (fp > 1.0 ? ' green' : fp > 0.5 ? ' yellow' : ' red');
+
+  const conf = (msg.confidence || 0) * 100;
+  const confEl = document.getElementById('sumConf');
+  confEl.textContent = conf.toFixed(0) + '%';
+  confEl.className = 'val' + (conf > 80 ? ' green' : conf > 50 ? ' yellow' : ' red');
+
+  document.getElementById('sumMatrices').textContent = msg.matrices_recruited || 0;
+  document.getElementById('sumConverged').textContent = msg.converged ? '✅' : '❌';
+  document.getElementById('sumConverged').className = 'val' + (msg.converged ? ' green' : ' red');
+
+  if (msg.doubt) {
+    updateDoubt(msg.doubt);
+    const vEl = document.getElementById('sumVerdict');
+    const d = msg.doubt;
+    if ((d.safety ?? 1) < 0.3 || (d.coherence ?? 1) < 0.2 || (d.repeat ?? 0) > 0.9) {
+      vEl.textContent = '🚫'; vEl.className = 'val red';
+    } else if ((d.safety ?? 1) < 0.6 || (d.coherence ?? 1) < 0.5 || (d.repeat ?? 0) > 0.7) {
+      vEl.textContent = '⚠️'; vEl.className = 'val yellow';
+    } else {
+      vEl.textContent = '✅'; vEl.className = 'val green';
+    }
+  }
+
+  document.getElementById('ragComplete').textContent = msg.rag_complete ? '✅' : '❌';
+
+  // Sleep / System Status
+  if (msg.sleep) {
+    document.getElementById('sleepMemories').textContent = msg.sleep.history_size ?? 0;
+    document.getElementById('sleepCount').textContent = msg.sleep.consolidations ?? 0;
+    document.getElementById('sleepStatus').textContent = msg.sleep.should_consolidate ? '💤 Ready' : 'Active';
+  }
+  if (msg.self_verify !== undefined) {
+    const sv = document.getElementById('selfVerify');
+    sv.textContent = (msg.self_verify * 100).toFixed(0) + '%';
+    sv.style.color = msg.self_verify > 0.8 ? 'var(--accent-green)' : 'var(--accent-red)';
+  }
+  if (msg.spec_accept_rate !== undefined) {
+    document.getElementById('specAccept').textContent = (msg.spec_accept_rate * 100).toFixed(0) + '%';
+  }
+
+  document.querySelectorAll('.wave-card.pulse').forEach(el => el.classList.remove('pulse'));
+}
+
+// ── Clear ──
+function clearDashboard() {
+  waveData = [];
+  idmeRounds = [];
+  heatmapData = {};
+  document.getElementById('waveContainer').innerHTML = '<div class="wave-empty" id="waveEmpty">Ожидание данных мышления…</div>';
+  document.getElementById('idmeTimeline').innerHTML = '<div class="idme-empty" id="idmeEmpty">No expansion rounds</div>';
+  document.getElementById('heatmapGrid').innerHTML = '';
+  updateGauge(0, false);
+  document.getElementById('rSquared').textContent = '—'; document.getElementById('rSquared').className = 'value';
+  document.getElementById('pThreshold').textContent = '—';
+  document.getElementById('iaConverged').textContent = '—'; document.getElementById('iaConverged').className = 'value';
+  document.getElementById('taskType').textContent = '—';
+  setPhase('');
+  document.getElementById('confValue').textContent = '0%';
+  document.getElementById('confFill').style.width = '0%';
+  ['dCoherenceVal','dSafetyVal','dRepeatVal'].forEach(id => document.getElementById(id).textContent = '—');
+  ['dCoherenceFill','dSafetyFill','dRepeatFill'].forEach(id => document.getElementById(id).style.width = '0%');
+  document.getElementById('doubtVerdict').className = 'doubt-verdict pending';
+  document.getElementById('doubtVerdict').textContent = '⏳ Awaiting verdict';
+  document.getElementById('criticScore').textContent = '—'; document.getElementById('criticScore').className = 'critic-score-big';
+  document.getElementById('criticNeedsData').textContent = '—';
+  document.getElementById('criticShouldStop').textContent = '—';
+  document.getElementById('ragComplete').textContent = '—';
+  // Predictive
+  ['predTaskType','predError','predWaves','predDepth'].forEach(id => document.getElementById(id).textContent = '—');
+  document.getElementById('predError').className = 'pval';
+  document.getElementById('predQuery').textContent = 'Ожидание запроса…';
+  // Memory
+  ['memLeannW','memTitansW','memWebW','memHistoryW','memWkvW'].forEach(id => document.getElementById(id).textContent = '—');
+  ['memLeann','memTitans','memWeb','memHistory'].forEach(id => {
+    const el = document.getElementById(id); el.classList.remove('active-mem','skipped');
+  });
+  document.getElementById('cacheHitBadge').className = 'cache-hit-badge miss';
+  document.getElementById('cacheHitBadge').textContent = '📦 No Cache';
+  // Sleep
+  document.getElementById('sleepStatus').textContent = 'Active';
+  document.getElementById('sleepMemories').textContent = '0';
+  document.getElementById('sleepCount').textContent = '0';
+  document.getElementById('selfVerify').textContent = '—'; document.getElementById('selfVerify').style.color = '';
+  document.getElementById('specAccept').textContent = '—';
+  // Summary
+  ['sumTime','sumWaves','sumBlocks','sumP','sumConf','sumMatrices','sumConverged','sumVerdict'].forEach(id => {
+    const el = document.getElementById(id); el.textContent = '—'; el.className = 'val';
+  });
+}
+
+// ═══ Demo Mode ═══
+function startDemo() {
+  const btn = document.getElementById('btnDemo');
+  if (demoMode) { demoMode = false; btn.classList.remove('active'); btn.textContent = '▶ Demo'; return; }
+  demoMode = true; btn.classList.add('active'); btn.textContent = '⏸ Stop';
+  clearDashboard();
+
+  const expertSets = [['code','generic'],['code','math'],['math','code'],['code'],['generic','code'],['math']];
+  const phases = ['explore','explore','analyze','synthesize','synthesize','verify'];
+  const pValues = [0.15, 0.38, 0.65, 0.88, 1.10, 1.45];
+  const rSq = [0.42, 0.61, 0.78, 0.88, 0.93, 0.96];
+  const confs = [0.12, 0.28, 0.52, 0.71, 0.85, 0.93];
+  const critics = [0.35, 0.52, 0.68, 0.78, 0.85, 0.91];
+  const alphas = [0.48, 0.52, 0.55, 0.60, 0.57, 0.53];
+
+  // Session start with predictive + memory data
+  handleMessage({
+    type:'session_start', query:'Напиши функцию сортировки и объясни', task_type:'code', p_threshold:1.20,
+    error_pred: 0.28, estimated_waves: 6, estimated_depth: 12, total_blocks: 12,
+    source_weights: {leann:0.45, titans:0.25, web:0.05, history:0.15}, rag_skipped: false,
+    cache_hit: false
+  });
+
+  let step = 0;
+  const timer = setInterval(() => {
+    if (!demoMode || step >= 6) {
+      clearInterval(timer);
+      if (demoMode) {
+        setTimeout(() => { if (!demoMode) return; handleMessage({type:'idme_round', round:1, matrices_recruited:3, best_p_delta:0.05}); }, 300);
+        setTimeout(() => { if (!demoMode) return; handleMessage({type:'idme_round', round:2, matrices_recruited:2, best_p_delta:0.02}); }, 600);
+        setTimeout(() => { if (!demoMode) return; handleMessage({type:'idme_round', round:3, matrices_recruited:1, best_p_delta:0.008}); }, 900);
+        setTimeout(() => {
+          if (!demoMode) return;
+          handleMessage({
+            type:'session_end', total_ms:823, waves:6, blocks:12,
+            final_p:1.52, converged:true, confidence:0.93, matrices_recruited:6, rag_complete:true,
+            doubt:{coherence:0.94, safety:0.99, repeat:0.08},
+            sleep:{history_size:47, consolidations:3, should_consolidate:false},
+            self_verify: 0.91, spec_accept_rate: 0.72
+          });
+          demoMode = false; btn.classList.remove('active'); btn.textContent = '▶ Demo';
+        }, 1400);
+      }
+      return;
+    }
+    handleMessage({
+      type:'wave_update', wave: step+1,
+      block_l: {experts:[expertSets[step][0]], surprise: 0.05+Math.random()*0.15},
+      block_r: {experts:expertSets[step].slice(1), surprise: 0.03+Math.random()*0.12},
+      merge_alpha: alphas[step],
+      ia: {p:pValues[step], r_squared:rSq[step], converged:pValues[step]>1.2},
+      critic: {score:critics[step], needs_data:step<2, should_stop:step>=5},
+      thinking: {phase:phases[step], confidence:confs[step]},
+      doubt: {coherence:0.5+step*0.08+Math.random()*0.05, safety:0.85+Math.random()*0.15, repeat:Math.max(0,0.15-step*0.02+Math.random()*0.05)},
+    });
+    step++;
+  }, 700);
+}
+
+// ── Init ──
+connect();
+</script>
+
+</body>
+</html>

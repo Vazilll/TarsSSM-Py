@@ -42,6 +42,13 @@ class LeannIndex:
         self.index_path = index_path
         self.texts = []
         self.timestamps = []    # Unix timestamp каждого документа
+        self.deleted = []       # Tombstone flags (soft-delete)
+        
+        # ═══ Brain-inspired: Reconsolidation + Emotional Tags ═══
+        self.access_count = []   # How many times recalled (synaptic strength)
+        self.last_accessed = []  # Unix timestamp of last recall
+        self.importance = []     # Emotional tag: surprise × critic × feedback
+        
         self.embeddings = None  # numpy array (int8) или None
         self.emb_scales = None  # numpy array (float32) per-vector scales
         self.model = None
@@ -150,15 +157,23 @@ class LeannIndex:
         self.ivf_assignments = assignments.astype(np.int32)
         self.logger.info(f"LEANN: IVF индекс: {k} кластеров, {n} документов")
 
-    def add_document(self, text: str, timestamp: float = 0.0):
+    def add_document(self, text: str, timestamp: float = 0.0,
+                     importance: float = 0.5):
         """Регистрация нового знания в памяти ассистента.
         
         Incremental IVF: новый документ назначается ближайшему кластеру
         вместо полной перестройки индекса.
         Auto-save: каждые 50 новых документов.
+        
+        Args:
+            importance: emotional tag (0.0-1.0), higher = stronger memory
         """
         self.texts.append(text)
         self.timestamps.append(timestamp or time.time())
+        self.deleted.append(False)
+        self.access_count.append(0)
+        self.last_accessed.append(time.time())
+        self.importance.append(importance)
         emb_q, scale = self._get_embedding(text)
         
         if self.embeddings is not None and len(self.embeddings) > 0:
@@ -202,42 +217,66 @@ class LeannIndex:
                 self.logger.warning(f"Auto-save failed: {e}")
     
     def remove_document(self, index: int) -> bool:
-        """Remove a document by index. Rebuilds BM25 and invalidates IVF.
+        """Soft-delete a document by index (tombstone flag).
+        
+        The document remains physically in the index but is invisible
+        to searches. Call purge_deleted() for physical cleanup.
         
         Args:
             index: Index of the document to remove (0-based)
         Returns:
-            True if removed, False if index out of range
+            True if removed, False if index out of range or already deleted
         """
         if index < 0 or index >= len(self.texts):
             return False
+        if self.deleted[index]:
+            return False  # Already deleted
         
-        # Remove from texts and timestamps
-        removed_text = self.texts.pop(index)
-        if index < len(self.timestamps):
-            self.timestamps.pop(index)
+        self.deleted[index] = True
         
-        # Remove from embeddings
-        if self.embeddings is not None and index < len(self.embeddings):
-            self.embeddings = np.delete(self.embeddings, index, axis=0)
-            self.emb_scales = np.delete(self.emb_scales, index)
-        
-        # Invalidate IVF (rebuild needed)
-        if self.ivf_assignments is not None:
-            self.ivf_assignments = np.delete(self.ivf_assignments, index)
-            # Full rebuild if significant portion removed
-            if len(self.texts) > self.ivf_n_clusters * 2:
-                self._build_ivf()
-        
-        # Force BM25 rebuild
+        # Force BM25 rebuild (it doesn't know about tombstones)
         self._bm25_dirty = True
         self._bm25 = None
         
-        # Clear embedding cache (it may reference removed text)
+        self.logger.info(f"LEANN: Soft-deleted doc #{index}: '{self.texts[index][:40]}...'")
+        return True
+    
+    def purge_deleted(self) -> int:
+        """Physically remove all tombstoned documents.
+        
+        Call periodically (e.g. weekly maintenance) to reclaim space.
+        
+        Returns:
+            Number of documents purged
+        """
+        if not any(self.deleted):
+            return 0
+        
+        keep = [i for i, d in enumerate(self.deleted) if not d]
+        purged = len(self.deleted) - len(keep)
+        
+        self.texts = [self.texts[i] for i in keep]
+        self.timestamps = [self.timestamps[i] for i in keep]
+        self.deleted = [False] * len(keep)
+        self.access_count = [self.access_count[i] for i in keep] if self.access_count else [0] * len(keep)
+        self.last_accessed = [self.last_accessed[i] for i in keep] if self.last_accessed else [0.0] * len(keep)
+        self.importance = [self.importance[i] for i in keep] if self.importance else [0.5] * len(keep)
+        
+        if self.embeddings is not None and len(self.embeddings) > 0:
+            self.embeddings = self.embeddings[keep]
+            self.emb_scales = self.emb_scales[keep]
+        
+        # Rebuild IVF and BM25
+        self.ivf_centroids = None
+        self.ivf_assignments = None
+        if self.embeddings is not None and len(self.embeddings) >= self.ivf_n_clusters * 2:
+            self._build_ivf()
+        self._bm25_dirty = True
+        self._bm25 = None
         self._emb_cache.clear()
         
-        self.logger.info(f"LEANN: Removed doc #{index}: '{removed_text[:40]}...'")
-        return True
+        self.logger.info(f"LEANN: Purged {purged} deleted documents")
+        return purged
     
     def _get_embeddings_batch(self, texts: List[str]) -> List[tuple]:
         """Batch embedding: process multiple texts in a single forward pass.
@@ -336,15 +375,39 @@ class LeannIndex:
             top_scores = all_scores[top_indices]
         
         results = []
+        now = time.time()
         for i, idx in enumerate(top_indices):
+            if idx < len(self.deleted) and self.deleted[idx]:
+                continue  # Skip tombstoned documents
             ts = self.timestamps[idx] if idx < len(self.timestamps) else 0.0
+            raw_score = float(top_scores[i])
+            
+            # ═══ Brain: Ebbinghaus forgetting curve ═══
+            # S(t) = e^(-t/τ), τ = half_life_days * 86400
+            last_acc = self.last_accessed[idx] if idx < len(self.last_accessed) else ts
+            days_since = max(0.0, (now - last_acc) / 86400.0)
+            decay = np.exp(-days_since / max(self.decay_half_life, 1.0))
+            
+            # ═══ Brain: Synaptic strength (access count) ═══
+            acc_count = self.access_count[idx] if idx < len(self.access_count) else 0
+            strength = min(1.0 + 0.1 * acc_count, 2.0)  # cap at 2x boost
+            
+            # ═══ Brain: Emotional importance (amygdala tag) ═══
+            imp = self.importance[idx] if idx < len(self.importance) else 0.5
+            imp_boost = imp ** 0.3  # mild boost: 0.5→0.81, 1.0→1.0
+            
+            final_score = raw_score * decay * strength * imp_boost
+            
             results.append(SearchResult(
                 index=int(idx),
                 text=self.texts[idx],
-                score=float(top_scores[i]),
-                vector_score=float(top_scores[i]),
+                score=final_score,
+                vector_score=raw_score,
                 timestamp=ts,
             ))
+        
+        # Re-sort by brain-adjusted score
+        results.sort(key=lambda r: r.score, reverse=True)
         return results
     
     async def search(self, query: str, top_k: int = 5, 
@@ -352,14 +415,15 @@ class LeannIndex:
                      use_mmr: bool = True,
                      use_decay: bool = True) -> list:
         """
-        Гибридный поиск знаний.
+        Гибридный поиск знаний (Brain-inspired).
         
-        Алгоритмы (портированы из OpenClaw):
+        Алгоритмы:
           1. Vector Search (IVF/brute-force cosine) — семантическая близость
           2. BM25 Keyword Search — точные совпадения терминов  
           3. Hybrid Merge — объединение vector + BM25 с весами
-          4. Temporal Decay — старые воспоминания угасают
+          4. Ebbinghaus Decay — старые неиспользованные воспоминания угасают
           5. MMR Re-ranking — разнообразие результатов
+          6. Reconsolidation — recalled memories get access_count++ (stronger)
         
         Returns:
             List[str] — тексты документов (backward-compatible)
@@ -398,8 +462,20 @@ class LeannIndex:
         if use_mmr and len(results) > 1:
             results = mmr_rerank(results[:fetch_k], self.mmr_lambda)
         
+        final = results[:top_k]
+        
+        # ── Шаг 5: Reconsolidation (strengthen on recall) ──
+        # Like the hippocampus: recalled memories become labile and get reinforced
+        now = time.time()
+        for r in final:
+            idx = r.index
+            if idx < len(self.access_count):
+                self.access_count[idx] += 1
+            if idx < len(self.last_accessed):
+                self.last_accessed[idx] = now
+        
         # Вернуть top_k текстов (backward compatible)
-        return [r.text for r in results[:top_k]]
+        return [r.text for r in final]
     
     async def search_rich(self, query: str, top_k: int = 5,
                           use_hybrid: bool = True,
@@ -468,6 +544,15 @@ class LeannIndex:
                     save_dict['ivf_assignments'] = self.ivf_assignments
                 if self.timestamps:
                     save_dict['timestamps'] = np.array(self.timestamps, dtype=np.float64)
+                if self.deleted and any(self.deleted):
+                    save_dict['deleted'] = np.array(self.deleted, dtype=np.bool_)
+                # Brain-inspired fields
+                if self.access_count:
+                    save_dict['access_count'] = np.array(self.access_count, dtype=np.int32)
+                if self.last_accessed:
+                    save_dict['last_accessed'] = np.array(self.last_accessed, dtype=np.float64)
+                if self.importance:
+                    save_dict['importance'] = np.array(self.importance, dtype=np.float32)
                 np.savez_compressed(npz_tmp, **save_dict)
             
             with open(texts_tmp, 'w', encoding='utf-8') as f:
@@ -531,6 +616,26 @@ class LeannIndex:
                 else:
                     # Legacy: нет timestamps → ставим 0
                     self.timestamps = [0.0] * len(self.texts)
+                
+                # Загрузить tombstone flags
+                if 'deleted' in data:
+                    self.deleted = data['deleted'].tolist()
+                else:
+                    self.deleted = [False] * len(self.texts)
+                
+                # Загрузить brain-inspired fields
+                if 'access_count' in data:
+                    self.access_count = data['access_count'].tolist()
+                else:
+                    self.access_count = [0] * len(self.texts)
+                if 'last_accessed' in data:
+                    self.last_accessed = data['last_accessed'].tolist()
+                else:
+                    self.last_accessed = [ts for ts in self.timestamps]
+                if 'importance' in data:
+                    self.importance = data['importance'].tolist()
+                else:
+                    self.importance = [0.5] * len(self.texts)
                 
                 # Загрузить или построить IVF
                 if 'ivf_centroids' in data and 'ivf_assignments' in data:

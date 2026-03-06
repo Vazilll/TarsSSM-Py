@@ -33,7 +33,7 @@ class TarsMemoryHub:
     Единственная точка входа для всех операций с памятью.
     """
     
-    def __init__(self, storage_path="data/tars_memories.json"):
+    def __init__(self, storage_path="data/memory/tars_memories.json"):
         self.storage_path = storage_path
         self._facts = []
         
@@ -257,7 +257,7 @@ class TarsMemoryHub:
 # ═══ Backward compatibility ═══
 class TarsStorage:
     """Legacy wrapper → TarsMemoryHub."""
-    def __init__(self, storage_path="data/tars_memories.json"):
+    def __init__(self, storage_path="data/memory/tars_memories.json"):
         self._hub = TarsMemoryHub(storage_path)
     
     async def remember(self, text, user_id="tars_user"):

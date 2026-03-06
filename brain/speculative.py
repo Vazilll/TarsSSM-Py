@@ -72,14 +72,32 @@ class SpeculativeDecoder:
         self.target = target_model
         self.tokenizer = tokenizer
         self.K = draft_k
+        self._initial_K = draft_k  # T10: remember initial K for adaptive reset
         self.temperature = temperature
         self.top_k = top_k
         self.top_p = top_p
+        
+        # T10: EMA acceptance rate tracking
+        self._ema_acceptance = 0.5  # start at 50%
+        self._total_steps = 0
         
         self.device = next(target_model.parameters()).device
         self.draft.to(self.device)
         self.draft.eval()
         self.target.eval()
+        
+        # T10: Shared vocabulary projection alignment
+        # If target has lm_head, share it with draft for better alignment
+        self._align_heads()
+    
+    def _align_heads(self):
+        """T10: Share target LM head weights with draft for vocabulary alignment."""
+        try:
+            if hasattr(self.target, 'lm_head') and hasattr(self.draft, 'set_shared_head'):
+                self.draft.set_shared_head(self.target.lm_head.weight)
+                logger.info("Shared LM head alignment: draft ← target")
+        except Exception as e:
+            logger.debug(f"Head alignment skipped: {e}")
     
     @torch.no_grad()
     def generate(
@@ -254,9 +272,22 @@ class SpeculativeDecoder:
         
         text = self.tokenizer.decode(generated)
         
+        # T10: Update EMA acceptance rate
+        self._ema_acceptance = 0.9 * self._ema_acceptance + 0.1 * acceptance
+        self._total_steps += 1
+        
+        # T10: Adaptive K — self-tune draft length
+        if acceptance < 0.4 and self.K > 1:
+            self.K = max(1, self.K - 1)
+            logger.debug(f"Adaptive K: ↓ K={self.K} (acceptance={acceptance:.1%})")
+        elif acceptance > 0.8 and self.K < self._initial_K:
+            self.K = min(self._initial_K, self.K + 1)
+            logger.debug(f"Adaptive K: ↑ K={self.K} (acceptance={acceptance:.1%})")
+        
         logger.info(
             f"Speculative: {tokens_gen} tokens, "
-            f"accept={acceptance:.1%}, "
+            f"accept={acceptance:.1%}, K={self.K}, "
+            f"ema={self._ema_acceptance:.1%}, "
             f"speedup≈{estimated_speedup:.1f}x, "
             f"{elapsed:.0f}ms"
         )
@@ -270,6 +301,15 @@ class SpeculativeDecoder:
             time_ms=elapsed,
             speedup=estimated_speedup,
         )
+    
+    def get_stats(self) -> dict:
+        """T10: Get current speculative stats for inclusion in think() stats."""
+        return {
+            "current_K": self.K,
+            "initial_K": self._initial_K,
+            "ema_acceptance": self._ema_acceptance,
+            "total_steps": self._total_steps,
+        }
     
     def _target_forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Forward through target model, return logits."""

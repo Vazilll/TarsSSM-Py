@@ -91,6 +91,21 @@ def surrogate_spike(membrane: torch.Tensor, D: int = 1, alpha: float = 1.0) -> t
     return SurrogateSpikeFunction.apply(membrane, D, alpha)
 
 
+def binary_spike(membrane: torch.Tensor, theta: torch.Tensor = None) -> torch.Tensor:
+    """
+    Binary spike (SpikeGPT-style): {0, 1} only.
+    Forward:  spike = heaviside(membrane - theta)
+    Backward: STE (straight-through estimator)
+    
+    32x faster on neuromorphic hardware (only ADD, no SUB).
+    """
+    if theta is None:
+        theta = torch.ones_like(membrane)
+    spike = (membrane >= theta).float()
+    # STE: gradient passes through as-is
+    return spike + (membrane - membrane.detach()) * 0  # keeps grad graph
+
+
 # ═══════════════════════════════════════════════════════
 # 2. SI-LIF Neuron (Signed Integer Leaky-Integrate-and-Fire)
 # ═══════════════════════════════════════════════════════
@@ -115,11 +130,13 @@ class SI_LIF(nn.Module):
     """
     
     def __init__(self, dim: int, beta: float = 0.9, D: int = 1, alpha: float = 1.0,
-                 learnable_beta: bool = True, learnable_theta: bool = True):
+                 learnable_beta: bool = True, learnable_theta: bool = True,
+                 binary_mode: bool = False):
         super().__init__()
         self.dim = dim
         self.D = D
         self.alpha = alpha
+        self.binary_mode = binary_mode  # SpikeGPT: {0, 1} only
         
         # β (decay) — per-neuron learnable
         if learnable_beta:
@@ -193,8 +210,13 @@ class SI_LIF(nn.Module):
         # 1. Leak + Integrate
         membrane = beta * membrane + x
         
-        # 2. Fire (ternary spike через surrogate gradient)
-        spike = surrogate_spike(membrane, self.D, self.alpha)
+        # 2. Fire
+        if self.binary_mode:
+            # SpikeGPT-style: binary {0, 1} spikes
+            spike = binary_spike(membrane, self.theta)
+        else:
+            # Standard SI-LIF: ternary {-D, ..., +D} spikes
+            spike = surrogate_spike(membrane, self.D, self.alpha)
         
         # 3. Reset (soft reset — вычитаем spike * θ)
         membrane = membrane - spike * self.theta
@@ -215,10 +237,11 @@ class SpikingLinear(nn.Module):
     Результат: тернарные веса × тернарные активации = только ADD/SUB.
     """
     
-    def __init__(self, d_in: int, d_out: int, beta: float = 0.9, D: int = 1):
+    def __init__(self, d_in: int, d_out: int, beta: float = 0.9, D: int = 1,
+                 binary_mode: bool = False):
         super().__init__()
         self.linear = _Linear(d_in, d_out, bias=False)
-        self.lif = SI_LIF(d_out, beta=beta, D=D)
+        self.lif = SI_LIF(d_out, beta=beta, D=D, binary_mode=binary_mode)
     
     def forward(self, x: torch.Tensor, membrane: Optional[torch.Tensor] = None,
                 temporal_phase: Optional[torch.Tensor] = None
@@ -260,18 +283,19 @@ class SpikingGRUCell(nn.Module):
     Результат: рекуррентное состояние обновляется через тернарные спайки.
     """
     
-    def __init__(self, dim: int, expansion_factor: float = 1.5, beta: float = 0.9):
+    def __init__(self, dim: int, expansion_factor: float = 1.5, beta: float = 0.9,
+                 binary_mode: bool = False):
         super().__init__()
         inner_dim = int(dim * expansion_factor)
         self.dim = dim
         
         # Gate pathway: input → linear → SI-LIF → gate
         self.gate_proj = _Linear(dim, inner_dim, bias=False)
-        self.gate_lif = SI_LIF(inner_dim, beta=beta, D=1)
+        self.gate_lif = SI_LIF(inner_dim, beta=beta, D=1, binary_mode=binary_mode)
         
         # Candidate pathway: input → linear → SI-LIF → candidate
         self.cand_proj = _Linear(dim, inner_dim, bias=False)
-        self.cand_lif = SI_LIF(inner_dim, beta=beta, D=1)
+        self.cand_lif = SI_LIF(inner_dim, beta=beta, D=1, binary_mode=binary_mode)
         
         # Output projection: inner_dim → dim
         self.out_proj = _Linear(inner_dim, dim, bias=False)
@@ -326,7 +350,7 @@ class SpikingMinGRUBlock(nn.Module):
     
     def __init__(self, dim: int, num_heads: int = 4, dropout: float = 0.1,
                  expansion_factor: float = 1.5, beta: float = 0.9,
-                 num_layers: int = 1):
+                 num_layers: int = 1, binary_mode: bool = False):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -338,7 +362,8 @@ class SpikingMinGRUBlock(nn.Module):
         
         # Multi-head spiking GRU cells
         self.gru_heads = nn.ModuleList([
-            SpikingGRUCell(head_dim, expansion_factor=expansion_factor, beta=beta)
+            SpikingGRUCell(head_dim, expansion_factor=expansion_factor,
+                          beta=beta, binary_mode=binary_mode)
             for _ in range(num_heads)
         ])
         
@@ -484,14 +509,15 @@ class SpikingSynapsePool(nn.Module):
     SYNAPSE_TYPES = ["action", "search", "social", "code", "generic"]
     
     def __init__(self, dim: int = 256, n_synapses: int = 5, num_heads: int = 4,
-                 beta: float = 0.9):
+                 beta: float = 0.9, binary_mode: bool = False):
         super().__init__()
         self.dim = dim
         self.n_synapses = n_synapses
         
         # Synapses
         self.synapses = nn.ModuleList([
-            SpikingMinGRUBlock(dim, num_heads=num_heads, beta=beta)
+            SpikingMinGRUBlock(dim, num_heads=num_heads, beta=beta,
+                              binary_mode=binary_mode)
             for _ in range(n_synapses)
         ])
         

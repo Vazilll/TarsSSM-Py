@@ -373,27 +373,91 @@ class RrnCore:
         self.llm = None
         self.working_memory = []
         self.brain_dim = brain_dim
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # ═══ RRN Spine — загрузка обученных весов ═══
+        # Поддерживает динамическое определение dim из чекпоинта
+        rrn_weights = Path(__file__).parent.parent / "models" / "brain" / "rrn_spine.pt"
+        if rrn_weights.exists():
+            try:
+                rrn_ckpt = torch.load(str(rrn_weights), map_location='cpu', weights_only=False)
+                # Определяем dim из input_proj checkpoint
+                ip_state = rrn_ckpt.get('input_proj', {})
+                if 'weight' in ip_state:
+                    dim = ip_state['weight'].shape[0]  # [dim, brain_dim] → dim
+                    brain_dim_ckpt = ip_state['weight'].shape[1]
+                    if brain_dim_ckpt != brain_dim:
+                        brain_dim = brain_dim_ckpt
+                        self.brain_dim = brain_dim
+                self.logger.info(f"Spine: RRN checkpoint detected dim={dim}, brain_dim={brain_dim}, "
+                                f"epoch={rrn_ckpt.get('epoch', '?')}")
+            except Exception as e:
+                rrn_ckpt = None
+                self.logger.warning(f"Spine: Cannot read rrn_spine.pt: {e}")
+        else:
+            rrn_ckpt = None
         
         # Нейронное ядро RRN
         self.neural_core = TarsRRN(dim=dim, mem_slots=4, num_heads=4, max_steps=8)
-        self.input_proj = nn.Linear(brain_dim, dim)   # Проекция из Mamba-2 пространства (2048→256)
-        self.output_proj = nn.Linear(dim, brain_dim)   # Обратная проекция (256→2048)
+        self.input_proj = nn.Linear(brain_dim, dim)
+        self.output_proj = nn.Linear(dim, brain_dim)
+        
+        # Загружаем обученные веса spine если есть
+        if rrn_ckpt is not None:
+            try:
+                rrn_core_state = rrn_ckpt.get('rrn_core', {})
+                if rrn_core_state:
+                    self.neural_core.load_state_dict(rrn_core_state, strict=False)
+                ip_state = rrn_ckpt.get('input_proj', {})
+                if ip_state:
+                    self.input_proj.load_state_dict(ip_state, strict=False)
+                op_state = rrn_ckpt.get('output_proj', {})
+                if op_state:
+                    self.output_proj.load_state_dict(op_state, strict=False)
+                # mode_head (если есть) — для будущего использования
+                self._mode_head_state = rrn_ckpt.get('mode_head', None)
+                self.logger.info(f"Spine: RRN weights loaded (epoch {rrn_ckpt.get('epoch', '?')}, "
+                                f"acc={rrn_ckpt.get('eval_acc', '?')})")
+            except Exception as e:
+                self.logger.warning(f"Spine: RRN weight load failed: {e}")
         
         param_count = sum(p.numel() for p in self.neural_core.parameters())
-        self.logger.info(f"Spine: Нейронное ядро ({param_count:,} params, brain_dim={brain_dim})")
+        self.logger.info(f"Spine: Нейронное ядро ({param_count:,} params, dim={dim}, brain_dim={brain_dim})")
         
-        # MinGRU для рефлексов
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # ═══ MinGRU для рефлексов — динамическое определение dim из чекпоинта ═══
         try:
             from brain.min_gru.mingru_lm import MinGRU_LM
-            self.mingru_lm = MinGRU_LM(dim=256, num_tokens=256, num_layers=4)
             
-            # Загрузить обученные веса если есть
             weights_path = Path(__file__).parent.parent / "models" / "mingru" / "mingru_best.pt"
             if weights_path.exists():
-                ckpt = torch.load(str(weights_path), map_location='cpu', weights_only=True)
-                self.mingru_lm.load_state_dict(ckpt['model_state_dict'], strict=False)
-                self.logger.info(f"Spine: MinGRU weights loaded (epoch {ckpt.get('epoch', '?')})")
+                ckpt = torch.load(str(weights_path), map_location='cpu', weights_only=False)
+                mingru_dim = ckpt.get('dim', 256)
+                mingru_tokens = ckpt.get('num_tokens', 256)
+                mingru_layers = ckpt.get('num_layers', 4)
+                mingru_ctx = ckpt.get('context_dim', 1024)
+                
+                self.mingru_lm = MinGRU_LM(
+                    dim=mingru_dim, num_tokens=mingru_tokens,
+                    num_layers=mingru_layers, context_dim=mingru_ctx,
+                )
+                # Загрузка весов с частичным совпадением (strict=False)
+                state = ckpt.get('model_state_dict', ckpt)
+                model_state = self.mingru_lm.state_dict()
+                loaded, skipped = 0, 0
+                for key, value in state.items():
+                    if key in model_state and model_state[key].shape == value.shape:
+                        model_state[key] = value
+                        loaded += 1
+                    else:
+                        skipped += 1
+                self.mingru_lm.load_state_dict(model_state, strict=False)
+                self.logger.info(f"Spine: MinGRU loaded dim={mingru_dim}, layers={mingru_layers}, "
+                                f"epoch={ckpt.get('epoch', '?')}, "
+                                f"tensors={loaded}/{loaded+skipped}")
+            else:
+                # Fallback — создаём с дефолтными размерностями
+                self.mingru_lm = MinGRU_LM(dim=256, num_tokens=256, num_layers=4)
+                self.logger.info("Spine: MinGRU created with defaults (no weights)")
             
             self.mingru_lm.to(self.device)
             self.mingru_lm.eval()
@@ -410,37 +474,56 @@ class RrnCore:
         # Synapse Pool (lazy-load)
         self._synapse_pool = None
         
-         # ═══ Spiking Synapses (SNN) — нейроморфный апгрейд ═══
+        # ═══ Spiking Synapses (SNN) — динамический dim из чекпоинта ═══
         self.has_spiking = False
         self._spiking_states = None
         try:
             from brain.spiking import SpikingSynapsePool
-            self.spiking_pool = SpikingSynapsePool(dim=dim, n_synapses=5, beta=0.9)
             
-            # Load trained weights if available
             snn_weights = Path(__file__).parent.parent / "models" / "spiking" / "spiking_best.pt"
+            snn_dim = dim  # По умолчанию — dim RRN
+            snn_beta = 0.9
+            
             if snn_weights.exists():
-                ckpt = torch.load(str(snn_weights), map_location='cpu', weights_only=True)
+                ckpt = torch.load(str(snn_weights), map_location='cpu', weights_only=False)
+                snn_config = ckpt.get('config', {})
+                snn_dim = snn_config.get('dim', dim)
+                snn_beta = snn_config.get('beta', 0.9)
                 snn_state = ckpt.get('model_state_dict', {})
-                # Extract only the snn_block weights (skip embedding/head)
+            else:
+                ckpt = None
+                snn_state = {}
+            
+            self.spiking_pool = SpikingSynapsePool(dim=snn_dim, n_synapses=5, beta=snn_beta)
+            
+            if snn_state:
+                # Extract snn_blocks.0.* weights → load into each synapse
                 block_state = {}
                 for k, v in snn_state.items():
-                    if k.startswith('snn_block.'):
-                        # Map snn_block.X → synapses.0.X (first synapse gets trained weights)
-                        new_key = k.replace('snn_block.', '')
+                    if k.startswith('snn_blocks.0.'):
+                        new_key = k.replace('snn_blocks.0.', '')
                         block_state[new_key] = v
                 if block_state:
-                    # Load into all 5 synapses (shared initialization, specialize during use)
-                    for i, synapse in enumerate(self.spiking_pool.synapses):
+                    for synapse in self.spiking_pool.synapses:
                         synapse.load_state_dict(block_state, strict=False)
-                    self.logger.info(f"Spine: SNN weights loaded ({len(block_state)} tensors, "
+                    self.logger.info(f"Spine: SNN weights loaded (dim={snn_dim}, "
+                                    f"{len(block_state)} tensors, "
                                     f"epoch {ckpt.get('epoch', '?')})")
+            
+            # Мост проекции: если snn_dim ≠ RRN dim, нужны линейные слои
+            if snn_dim != dim:
+                self._rrn_to_snn = nn.Linear(dim, snn_dim).to(self.device)
+                self._snn_to_rrn = nn.Linear(snn_dim, dim).to(self.device)
+                self.logger.info(f"Spine: SNN bridge {dim}→{snn_dim}→{dim}")
+            else:
+                self._rrn_to_snn = None
+                self._snn_to_rrn = None
             
             self.spiking_pool.to(self.device)
             self.spiking_pool.eval()
             self.has_spiking = True
             snn_params = sum(p.numel() for p in self.spiking_pool.parameters())
-            self.logger.info(f"Spine: SNN SpikingSynapsePool active ({snn_params:,} params)")
+            self.logger.info(f"Spine: SNN SpikingSynapsePool active ({snn_params:,} params, dim={snn_dim})")
         except Exception as e:
             self.logger.info(f"Spine: SNN not available, using MinGRU fallback: {e}")
     
@@ -533,15 +616,21 @@ class RrnCore:
             if self.has_spiking:
                 try:
                     with torch.no_grad():
-                        # x_proj: [1, dim=256], добавляем seq dim → [1, 1, 256]
-                        spike_input = x_proj.unsqueeze(1)
+                        # Проекция RRN dim → SNN dim (если отличаются)
+                        snn_input = x_proj
+                        if self._rrn_to_snn is not None:
+                            snn_input = self._rrn_to_snn(snn_input)
+                        spike_input = snn_input.unsqueeze(1)  # [1, 1, snn_dim]
                         spike_out, self._spiking_states = self.spiking_pool(
                             spike_input,
                             prev_states=self._spiking_states,
                             task_type="action",
                         )
-                        # Проецируем назад в brain space
-                        snn_vec = self.output_proj(spike_out.squeeze(1))
+                        # Обратная проекция SNN dim → RRN dim
+                        snn_result = spike_out.squeeze(1)
+                        if self._snn_to_rrn is not None:
+                            snn_result = self._snn_to_rrn(snn_result)
+                        snn_vec = self.output_proj(snn_result)
                         snn_context = f"[SNN spike context: {spike_out.abs().sum():.0f} active spikes]"
                         self.logger.debug(f"Spine SNN: sparsity={self.spiking_pool.synapses[0].sparsity:.1%}")
                 except Exception as e:
@@ -741,11 +830,22 @@ class RrnCore:
                 tokens = torch.tensor([text_bytes], dtype=torch.long).to(self.device)
                 with torch.no_grad():
                     # Используем обученную таблицу embedding MinGRU
-                    emb = self.mingru_lm.embedding(tokens)  # [1, L, 256]
+                    emb = self.mingru_lm.embedding(tokens)  # [1, L, mingru_dim]
                     # Mean pooling → семантический вектор
-                    vec_256 = emb.mean(dim=1)  # [1, 256]
-                    # Проекция в brain-пространство через output_proj
-                    vec = self.output_proj(vec_256)  # [1, brain_dim]
+                    vec_emb = emb.mean(dim=1)  # [1, mingru_dim]
+                    # Проекция в brain-пространство
+                    # Если MinGRU dim совпадает с RRN dim — используем output_proj
+                    # Иначе — прямая линейная интерполяция в brain_dim
+                    rrn_dim = self.output_proj.in_features
+                    if vec_emb.shape[-1] == rrn_dim:
+                        vec = self.output_proj(vec_emb)  # [1, brain_dim]
+                    else:
+                        # Адаптивная проекция: repeat/truncate → brain_dim
+                        if vec_emb.shape[-1] < self.brain_dim:
+                            repeats = self.brain_dim // vec_emb.shape[-1] + 1
+                            vec = vec_emb.repeat(1, repeats)[:, :self.brain_dim]
+                        else:
+                            vec = vec_emb[:, :self.brain_dim]
                 return vec.cpu()
             except Exception:
                 pass
