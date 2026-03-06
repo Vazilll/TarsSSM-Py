@@ -25,6 +25,7 @@
   python local_train.py --level small          # Быстрая отладка (~15 мин)
   python local_train.py --level medium         # Стандарт (~3 часа)
   python local_train.py --level max            # Продакшн (~15 часов)
+  python local_train.py --level marathon        # 4 дня непрерывно (~96 часов)
   python local_train.py --drive colab          # + Google Drive через Colab
   python local_train.py --drive rclone         # + Google Drive через rclone
   python local_train.py --phase 4              # Только Mamba-2
@@ -73,8 +74,8 @@ parser = argparse.ArgumentParser(
     description="ТАРС v3 — Универсальное обучение",
     formatter_class=argparse.RawDescriptionHelpFormatter,
 )
-parser.add_argument("--level", choices=["small", "medium", "max"], default=None,
-                    help="Уровень обучения: small (~15 мин), medium (~3ч), max (~15ч)")
+parser.add_argument("--level", choices=["small", "medium", "max", "marathon"], default=None,
+                    help="Уровень обучения: small (~15 мин), medium (~3ч), max (~15ч), marathon (~96ч)")
 parser.add_argument("--drive", choices=["none", "colab", "rclone"], default=None,
                     help="Подключение диска: none / colab / rclone")
 parser.add_argument("--resume", action="store_true", help="Продолжить с чекпоинта")
@@ -329,15 +330,16 @@ def interactive_menu():
         print("  ┌─────────────────────────────────────────────────┐")
         print("  │  📊 Уровень обучения:                           │")
         print("  │                                                 │")
-        print("  │  [1] Малый   — отладка, ~15 мин                 │")
-        print("  │  [2] Средний — стандарт, ~3 часа                │")
+        print("  │  [1] Малый    — отладка, ~15 мин                │")
+        print("  │  [2] Средний  — стандарт, ~3 часа               │")
         print("  │  [3] Максимум — продакшн, ~15 часов             │")
+        print("  │  [4] Марафон  — 4 дня непрерывно, ~96 часов     │")
         print("  └─────────────────────────────────────────────────┘")
         try:
-            ch = input("  Выберите [1/2/3] (default=2): ").strip()
+            ch = input("  Выберите [1/2/3/4] (default=2): ").strip()
         except (EOFError, KeyboardInterrupt):
             ch = "2"
-        level = {"1": "small", "3": "max"}.get(ch, "medium")
+        level = {"1": "small", "3": "max", "4": "marathon"}.get(ch, "medium")
 
     return drive, level
 
@@ -429,7 +431,7 @@ def get_config(level, hw):
             "wiki_count": 50000,
             "snn_max_mb": 20,
         }
-    else:  # max
+    elif level == "max":
         # ═══ МАКСИМУМ: продакшн ═══
         return {**common,
             "name": f"MAX ({d}d×{nl}L, batch={batch}×{accum})",
@@ -443,6 +445,22 @@ def get_config(level, hw):
             "instruct_ep": 3, "cot_ep": 5, "dpo_ep": 3, "rlvr_ep": 3, "distill_ep": 3,
             "wiki_count": 100000,
             "snn_max_mb": 50,
+        }
+    else:  # marathon
+        # ═══ МАРАФОН: 4 дня непрерывного обучения ═══
+        return {**common,
+            "name": f"MARATHON ({d}d×{nl}L, batch={batch}×{accum}, ~96h)",
+            "seq_start": 512, "seq_mid": 1024, "seq_max": min(2048, max_seq_by_ram),
+            "reflex_ep": 200, "rrn_ep": 100, "mingru_ep": 50,
+            "snn_ep": 60, "snn_dim": min(d, 512), "snn_heads": 8,
+            "snn_batch": min(batch * 8, 64), "snn_seq": 256,
+            "mingru_dim": min(d, 512), "mingru_layers": 6,
+            "mamba_ep": [50, 25, 15, 10], "mamba_lr": [3e-4, 8e-5, 2e-5, 8e-6],
+            "personality_ep": 15, "second_pass_ep": 10,
+            "instruct_ep": 10, "cot_ep": 15, "dpo_ep": 8, "rlvr_ep": 8, "distill_ep": 5,
+            "wiki_count": 500000,
+            "snn_max_mb": 100,
+            "marathon": True,  # flag для доп. циклов
         }
 
 # ═══════════════════════════════════════════
@@ -1013,7 +1031,10 @@ def main():
                "--phase", str(mp),
                "--device", device,
                "--curriculum", "--label_smoothing", "0.1",
-               "--grad_ckpt", "--no_wiki"]
+               "--grad_ckpt"]
+        # Marathon mode loads Wikipedia for real training data
+        if not cfg.get("marathon"):
+            cmd += ["--no_wiki"]
         # ── AMP: bf16 для Ampere+, fp16 для T4/Turing ──
         amp = cfg.get("amp_dtype", "fp32")
         if amp == "bf16": cmd += ["--bf16"]
@@ -1081,6 +1102,43 @@ def main():
         ok = run(cmd, label="Personality")
         results["personality"] = ok
         if ok: mark_done(state, "personality")
+
+    # ═══ MARATHON: Second Cycle Refinement (phases 2-4 again, lower LR) ═══
+    if cfg.get("marathon") and should_run(4) and not is_done(state, "marathon_cycle2"):
+        print(f"\n  🔄 MARATHON Cycle 2: Refinement passes (phases 2→3→4, halved LR)...")
+        cycle2_eps = [10, 5, 5]   # phases 2,3,4
+        cycle2_lrs = [4e-5, 1e-5, 4e-6]
+        cycle2_seqs = [cfg["seq_mid"], cfg["seq_max"], cfg["seq_max"]]
+        for ci, (mp, ep, lr, sl) in enumerate(zip([2,3,4], cycle2_eps, cycle2_lrs, cycle2_seqs)):
+            pk2 = f"marathon_c2_p{mp}"
+            if is_done(state, pk2):
+                print(f"  ⏭ Cycle2 Phase {mp}: уже выполнена")
+                continue
+            print(f"\n  🔄 Cycle2 Phase {mp}: {ep} epochs, LR={lr}, seq={sl}")
+            cmd = [PYTHON, str(TRAIN_DIR / "train_mamba2.py"),
+                   "--d_model", str(cfg["d_model"]),
+                   "--n_layers", str(cfg["n_layers"]),
+                   "--vocab_size", str(cfg["vocab_size"]),
+                   "--batch", str(cfg["batch"]),
+                   "--accum_steps", str(cfg["accum"]),
+                   "--epochs", str(ep),
+                   "--lr", str(lr),
+                   "--seq_len", str(sl),
+                   "--phase", str(mp),
+                   "--device", device,
+                   "--curriculum", "--label_smoothing", "0.05",
+                   "--grad_ckpt", "--resume"]
+            if bf16: cmd += ["--bf16"]
+            if cfg.get("use_compile"): cmd += ["--compile"]
+            if cfg.get("use_wsd"): cmd += ["--wsd"]
+            if cfg.get("num_workers", 0) > 0:
+                cmd += ["--num_workers", str(cfg["num_workers"])]
+            if cfg.get("pin_memory"): cmd += ["--pin_memory"]
+            ok = run(cmd, label=f"C2-P{mp}")
+            results[pk2] = ok
+            if ok: mark_done(state, pk2)
+        mark_done(state, "marathon_cycle2")
+        if drive_ok: drive_backup(drive_mode)
 
     # ═══ Phase 4.6, 5: → local_train_extras.py ═══
     # Second Pass и Квантизация вынесены в local_train_extras.py
