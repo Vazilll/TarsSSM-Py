@@ -1078,31 +1078,39 @@ def main():
             logger.info(f"🔄 Loading checkpoint: {ckpt_path}")
             try:
                 ckpt = torch.load(str(ckpt_path), map_location=device, weights_only=False)
-                # Check vocab compatibility
-                ckpt_vocab = ckpt.get('vocab_size', None)
-                if ckpt_vocab is not None and ckpt_vocab != BYTE_VOCAB:
-                    logger.warning(f"⚠️  Checkpoint vocab={ckpt_vocab} ≠ current vocab={BYTE_VOCAB}")
-                    logger.warning(f"  Пропускаем несовместимый чекпоинт — обучение с нуля")
+
+                # ── Check 1: embedding shape compatibility ──
+                sd = ckpt.get('model_state_dict', {})
+                emb_w = sd.get('embedding.weight', None)
+                if emb_w is not None and emb_w.shape[0] != BYTE_VOCAB:
+                    logger.warning(f"⚠️  Checkpoint embedding [{emb_w.shape[0]}] ≠ vocab [{BYTE_VOCAB}]")
+                    logger.warning(f"  Удаляю несовместимый чекпоинт...")
+                    ckpt_path.unlink(missing_ok=True)
                     ckpt = None
-                else:
-                    # Check embedding shape
-                    emb_key = 'model_state_dict'
-                    if emb_key in ckpt:
-                        emb_w = ckpt[emb_key].get('embedding.weight', None)
-                        if emb_w is not None and emb_w.shape[0] != BYTE_VOCAB:
-                            logger.warning(f"⚠️  Checkpoint embedding [{emb_w.shape[0]}] ≠ vocab [{BYTE_VOCAB}]")
-                            logger.warning(f"  Пропускаем несовместимый чекпоинт — обучение с нуля")
-                            ckpt = None
                 
+                # ── Check 2: NaN in weights ──
                 if ckpt is not None:
-                    model.load_state_dict(ckpt['model_state_dict'], strict=False)
+                    has_nan = False
+                    for key, tensor in sd.items():
+                        if torch.is_floating_point(tensor) and torch.isnan(tensor).any():
+                            has_nan = True
+                            logger.warning(f"⚠️  NaN в весах: {key}")
+                            break
+                    if has_nan:
+                        logger.warning(f"  Удаляю NaN-чекпоинт — обучение с нуля")
+                        ckpt_path.unlink(missing_ok=True)
+                        ckpt = None
+
+                # ── Load if OK ──
+                if ckpt is not None:
+                    model.load_state_dict(sd, strict=False)
                     state["current_epoch"] = ckpt.get('epoch', 0)
                     state["total_steps"] = ckpt.get('total_steps', 0)
                     ckpt_loaded = True
-                    logger.info(f"  Resumed from epoch {state['current_epoch']}, step {state['total_steps']}")
+                    logger.info(f"  ✅ Resumed from epoch {state['current_epoch']}, step {state['total_steps']}")
             except Exception as e:
                 logger.warning(f"⚠️  Checkpoint corrupted: {e}")
-                logger.warning(f"  Deleting bad checkpoint and starting fresh...")
+                logger.warning(f"  Удаляю — обучение с нуля...")
                 try:
                     ckpt_path.unlink()
                 except Exception:
