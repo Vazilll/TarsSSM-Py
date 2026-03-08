@@ -239,9 +239,10 @@ python training/data/download_hf_dataset.py --preset all
 
 ### SSD (Mamba-2):
 ```
-γ_t = FlashSigmoid(W_γ · x_t) = 0.5 + 0.25 · (W_γ · x_t)
-s_{t+1} = γ_t ⊙ s_t + B_t · x_t
-y_ssd = C_t^T · s_{t+1} + D · x_t
+Δt = softplus(W_dt · x_t + bias)         — discretization step (> 0)
+s_{t+1} = exp(A · Δt) ⊙ s_t + B_t · x_t  — state update
+y_ssd = C_t^T · s_{t+1} + D · x_t         — readout
+# NOTE: FlashSigmoid (γ=0.5+0.25·x) planned for Phase 2 Graduated 8-8-8
 ```
 
 ### WKV-7 (RWKV-7 GatedDeltaNet):

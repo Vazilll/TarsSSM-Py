@@ -147,51 +147,65 @@ def ssd_scan(X, A, B, C, chunk_size=64, initial_states=None):
     batch, seqlen, nheads, headdim = X.shape
     d_state = B.shape[-1]
     
-    pad = (chunk_size - seqlen % chunk_size) % chunk_size
-    if pad > 0:
-        X = F.pad(X, (0, 0, 0, 0, 0, pad))
-        A = F.pad(A, (0, 0, 0, pad))
-        B = F.pad(B, (0, 0, 0, 0, 0, pad))
-        C = F.pad(C, (0, 0, 0, 0, 0, pad))
+    # ═══ SSD MUST run in fp32 ═══
+    # exp(cumsum(A)) overflows in fp16 when cumsum > 11 (fp16 max ≈ 65504).
+    # With A values from log-uniform(1,16), cumsums over chunk_size=64
+    # easily exceed 11 → exp() → inf → NaN in einsum.
+    orig_dtype = X.dtype
+    if X.dtype != torch.float32:
+        X = X.float()
+        A = A.float()
+        B = B.float()
+        C = C.float()
+        if initial_states is not None:
+            initial_states = initial_states.float()
     
-    T = X.shape[1]
-    n_chunks = T // chunk_size
-    
-    X = rearrange(X, "b (c l) h p -> b c l h p", l=chunk_size)
-    A = rearrange(A, "b (c l) h -> b h c l", l=chunk_size)
-    B = rearrange(B, "b (c l) h n -> b c l h n", l=chunk_size)
-    C = rearrange(C, "b (c l) h n -> b c l h n", l=chunk_size)
-    
-    A_cumsum = torch.cumsum(A, dim=-1)
-    
-    # 1. Intra-chunk
-    L = torch.exp(segsum(A))
-    Y_diag = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", C, B, L, X)
-    
-    # 2. Inter-chunk states
-    decay_states = torch.exp(A_cumsum[:, :, :, -1:] - A_cumsum)
-    states = torch.einsum("bclhn,bhcl,bclhp->bchpn", B, decay_states, X)
-    
-    # 3. Inter-chunk recurrence
-    if initial_states is None:
-        initial_states = states.new_zeros(states[:, :1].shape)
-    states = torch.cat([initial_states, states], dim=1)
-    
-    decay_chunk = torch.exp(segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0))))
-    new_states = torch.einsum("bhzc,bchpn->bzhpn", decay_chunk, states)
-    states = new_states[:, :-1]
-    final_state = new_states[:, -1]
-    
-    # 4. State → output
-    state_decay_out = torch.exp(A_cumsum)
-    Y_off = torch.einsum("bclhn,bchpn,bhcl->bclhp", C, states, state_decay_out)
-    
-    Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
-    
-    if pad > 0:
-        Y = Y[:, :seqlen]
-    
-    return Y, final_state
+    with torch.amp.autocast('cuda', enabled=False):
+        pad = (chunk_size - seqlen % chunk_size) % chunk_size
+        if pad > 0:
+            X = F.pad(X, (0, 0, 0, 0, 0, pad))
+            A = F.pad(A, (0, 0, 0, pad))
+            B = F.pad(B, (0, 0, 0, 0, 0, pad))
+            C = F.pad(C, (0, 0, 0, 0, 0, pad))
+        
+        T = X.shape[1]
+        n_chunks = T // chunk_size
+        
+        X = rearrange(X, "b (c l) h p -> b c l h p", l=chunk_size)
+        A = rearrange(A, "b (c l) h -> b h c l", l=chunk_size)
+        B = rearrange(B, "b (c l) h n -> b c l h n", l=chunk_size)
+        C = rearrange(C, "b (c l) h n -> b c l h n", l=chunk_size)
+        
+        A_cumsum = torch.cumsum(A, dim=-1)
+        
+        # 1. Intra-chunk
+        L = torch.exp(segsum(A))
+        Y_diag = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", C, B, L, X)
+        
+        # 2. Inter-chunk states
+        decay_states = torch.exp(A_cumsum[:, :, :, -1:] - A_cumsum)
+        states = torch.einsum("bclhn,bhcl,bclhp->bchpn", B, decay_states, X)
+        
+        # 3. Inter-chunk recurrence
+        if initial_states is None:
+            initial_states = states.new_zeros(states[:, :1].shape)
+        states = torch.cat([initial_states, states], dim=1)
+        
+        decay_chunk = torch.exp(segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0))))
+        new_states = torch.einsum("bhzc,bchpn->bzhpn", decay_chunk, states)
+        states = new_states[:, :-1]
+        final_state = new_states[:, -1]
+        
+        # 4. State → output
+        state_decay_out = torch.exp(A_cumsum)
+        Y_off = torch.einsum("bclhn,bchpn,bhcl->bclhp", C, states, state_decay_out)
+        
+        Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
+        
+        if pad > 0:
+            Y = Y[:, :seqlen]
+        
+        return Y.to(orig_dtype), final_state
 
 
 class CausalConv1d(nn.Module):
@@ -587,10 +601,11 @@ class TarsCoreBlock(nn.Module):
             dim=-1
         )
         
-        # FlashSigmoid: γ = 0.5 + 0.25·x (HELIX GOLDEN spec)
-        # No exp() — ~5× faster than softplus on CPU
-        dt_raw = dt + self.dt_bias
-        dt = torch.clamp(0.5 + 0.25 * dt_raw, min=0.001, max=0.999)
+        # Softplus: ensures dt > 0 for numerical stability
+        # NOTE: GOLDEN spec's FlashSigmoid (γ=0.5+0.25·x) applies to SSM decay gate γ
+        # in Graduated 8-8-8 layout (Phase 2). Mamba-2's dt is discretization step with
+        # bias initialized in log-space → softplus is the correct activation here.
+        dt = F.softplus(dt + self.dt_bias)
         
         # ═══ Conv1d with state caching for step mode ═══
         conv_dim = self.d_inner + 2 * self.ngroups * self.d_state
