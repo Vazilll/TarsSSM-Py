@@ -496,16 +496,184 @@ def save_state(state):
 
 
 # ═══════════════════════════════════════════
-# 9. Datasets
+# 9. Datasets — Реальные данные
 # ═══════════════════════════════════════════
 
+# Vocab = 256 (UTF-8 byte-level, без BPE обучения)
+BYTE_VOCAB = 256
+
+
+def find_text_files():
+    """Найти текстовые файлы для обучения."""
+    search_dirs = [
+        ROOT / "data",
+        ROOT / "data" / "datasets",
+    ]
+    
+    found = []
+    for d in search_dirs:
+        if d.exists():
+            found.extend(d.glob("*.txt"))
+            found.extend(d.glob("hf_*.txt"))
+    
+    # Дедупликация
+    seen = set()
+    unique = []
+    for f in found:
+        r = f.resolve()
+        if r not in seen and f.stat().st_size > 100:
+            seen.add(r)
+            unique.append(f)
+    
+    return sorted(unique, key=lambda f: -f.stat().st_size)
+
+
+def auto_download_data():
+    """Авто-скачивание датасетов из HuggingFace (chat preset)."""
+    logger.info("📥 Авто-скачивание данных из HuggingFace...")
+    
+    # Установить datasets если нет
+    try:
+        import datasets as _
+    except ImportError:
+        logger.info("  Установка: datasets")
+        subprocess.run(
+            [PYTHON, "-m", "pip", "install", "datasets", "--quiet"],
+            capture_output=True
+        )
+    
+    # Скачать через наш download_hf_dataset.py
+    dl_script = ROOT / "training" / "data" / "download_hf_dataset.py"
+    if not dl_script.exists():
+        logger.warning("⚠️  download_hf_dataset.py не найден")
+        return False
+    
+    data_dir = ROOT / "data"
+    data_dir.mkdir(exist_ok=True)
+    
+    try:
+        result = subprocess.run(
+            [PYTHON, str(dl_script), "--preset", "chat",
+             "--count", "5000", "--output", str(data_dir)],
+            cwd=str(ROOT), capture_output=True, text=True, timeout=600,
+        )
+        if result.returncode == 0:
+            logger.info("✅ Данные скачаны")
+            if result.stdout:
+                for line in result.stdout.strip().split('\n')[-5:]:
+                    logger.info(f"  {line.strip()}")
+            return True
+        else:
+            logger.warning(f"⚠️  Скачивание завершилось с ошибкой: {result.stderr[:200]}")
+            return False
+    except subprocess.TimeoutExpired:
+        logger.warning("⚠️  Timeout скачивания (>10 мин)")
+        return False
+    except Exception as e:
+        logger.warning(f"⚠️  Ошибка скачивания: {e}")
+        return False
+
+
+def load_corpus_text(data_path=None):
+    """Загрузить текстовый корпус для обучения.
+    
+    Приоритет:
+      1. --data (конкретный файл)
+      2. data/*.txt (все текстовые файлы)
+      3. Авто-скачивание из HF
+      4. Random tokens (fallback)
+    
+    Returns: (bytes_list, total_size) или None
+    """
+    # 1. Конкретный файл
+    if data_path and os.path.exists(data_path):
+        with open(data_path, 'rb') as f:
+            raw = f.read()
+        mb = len(raw) / 1024**2
+        logger.info(f"📂 Файл: {data_path} ({mb:.1f} MB)")
+        return raw
+    
+    # 2. Все .txt из data/
+    txt_files = find_text_files()
+    if txt_files:
+        parts = []
+        total = 0
+        for f in txt_files:
+            try:
+                with open(f, 'rb') as fh:
+                    data = fh.read()
+                parts.append(data)
+                total += len(data)
+                logger.info(f"  📄 {f.name}: {len(data)/1024:.0f} KB")
+            except Exception as e:
+                logger.debug(f"  Skipped {f.name}: {e}")
+        if parts:
+            corpus = b'\n\n'.join(parts)
+            logger.info(f"📂 Корпус: {len(txt_files)} файлов, {total/1024**2:.1f} MB")
+            return corpus
+    
+    # 3. Авто-скачивание
+    logger.info("📂 Текстовые данные не найдены — пробуем скачать...")
+    if auto_download_data():
+        txt_files = find_text_files()
+        if txt_files:
+            parts = []
+            for f in txt_files:
+                try:
+                    with open(f, 'rb') as fh:
+                        parts.append(fh.read())
+                except Exception:
+                    pass
+            if parts:
+                corpus = b'\n\n'.join(parts)
+                logger.info(f"📂 Скачанный корпус: {len(parts)} файлов, {len(corpus)/1024**2:.1f} MB")
+                return corpus
+    
+    # 4. Fallback — нет данных
+    return None
+
+
 def load_dataset(cfg, vocab_size):
-    """Загрузить dataset (text file или random tokens)."""
+    """Загрузить dataset (реальные тексты или random tokens)."""
     import torch
     from torch.utils.data import Dataset, DataLoader
 
+    class TextCorpusDataset(Dataset):
+        """UTF-8 byte-level chunked text dataset.
+        
+        Каждый символ → UTF-8 байт → токен [0..255].
+        Chunks с overlap (stride = seq_len // 2).
+        """
+        def __init__(self, raw_bytes, seq_len):
+            tokens = list(raw_bytes)
+            stride = max(1, seq_len // 2)  # 50% overlap
+            
+            self.chunks = []
+            for i in range(0, len(tokens) - seq_len - 1, stride):
+                chunk = tokens[i:i + seq_len + 1]
+                if len(chunk) == seq_len + 1:
+                    self.chunks.append(chunk)
+            
+            # Перемешать чанки
+            random.shuffle(self.chunks)
+            
+            if not self.chunks:
+                # Fallback: pad short corpus
+                tokens = tokens + [0] * (seq_len + 1 - len(tokens))
+                self.chunks = [tokens[:seq_len + 1]]
+            
+            logger.info(f"📂 TextCorpus: {len(raw_bytes)/1024**2:.1f} MB → "
+                        f"{len(self.chunks)} chunks, seq_len={seq_len}")
+        
+        def __len__(self):
+            return len(self.chunks)
+        
+        def __getitem__(self, idx):
+            t = torch.tensor(self.chunks[idx], dtype=torch.long)
+            return {'input_ids': t[:-1], 'labels': t[1:]}
+
     class RandomTokenDataset(Dataset):
-        """Random tokens для smoke test."""
+        """Random tokens (fallback если нет данных)."""
         def __init__(self, vocab_size, seq_len, n_samples):
             self.data = torch.randint(0, vocab_size, (n_samples, seq_len + 1))
         def __len__(self):
@@ -514,36 +682,17 @@ def load_dataset(cfg, vocab_size):
             t = self.data[idx]
             return {'input_ids': t[:-1], 'labels': t[1:]}
 
-    class TextChunkDataset(Dataset):
-        """Chunked text file dataset."""
-        def __init__(self, file_path, seq_len, vocab_size):
-            with open(file_path, 'rb') as f:
-                data = f.read()
-            # Byte-level tokenization (simple but fast)
-            tokens = list(data[:min(len(data), 50_000_000)])  # cap at 50MB
-            n_chunks = len(tokens) // (seq_len + 1)
-            if n_chunks == 0:
-                n_chunks = 1
-                tokens = tokens + [0] * (seq_len + 1 - len(tokens))
-            tokens = tokens[:n_chunks * (seq_len + 1)]
-            self.chunks = torch.tensor(tokens, dtype=torch.long).view(n_chunks, seq_len + 1)
-            # Clamp to vocab_size
-            self.chunks = self.chunks.clamp(0, vocab_size - 1)
-            logger.info(f"📂 Loaded {file_path}: {len(data)} bytes → {n_chunks} chunks of {seq_len}")
-        def __len__(self):
-            return len(self.chunks)
-        def __getitem__(self, idx):
-            t = self.chunks[idx]
-            return {'input_ids': t[:-1], 'labels': t[1:]}
-
-    # Choose dataset
-    if args.data and os.path.exists(args.data):
-        dataset = TextChunkDataset(args.data, cfg["seq_len"], vocab_size)
+    # Загрузить корпус
+    corpus_bytes = load_corpus_text(data_path=args.data)
+    
+    if corpus_bytes is not None:
+        dataset = TextCorpusDataset(corpus_bytes, cfg["seq_len"])
     else:
-        n_samples = cfg["steps_per_epoch"] * cfg["batch"] * cfg["epochs"]
-        n_samples = min(n_samples, 50000)  # cap memory
+        n_samples = cfg["steps_per_epoch"] * cfg["batch"]
+        n_samples = min(n_samples, 5000)
         dataset = RandomTokenDataset(vocab_size, cfg["seq_len"], n_samples)
-        logger.info(f"📂 Random tokens: {n_samples} samples, seq_len={cfg['seq_len']}")
+        logger.warning(f"⚠️  Нет текстовых данных — random tokens ({n_samples} samples)")
+        logger.warning(f"   Положите .txt файлы в {ROOT / 'data'}/")
 
     dataloader = DataLoader(
         dataset,
@@ -907,7 +1056,8 @@ def main():
     model_cfg = TarsConfig(
         d_model=cfg["d_model"],
         n_layers=cfg["n_layers"],
-        quant_mode="fp16",  # training in FP16/BF16, not ternary
+        vocab_size=BYTE_VOCAB,  # UTF-8 byte-level (256 tokens)
+        quant_mode="fp16",      # training in FP16/BF16, not ternary
     )
     model = TarsHelixLite(model_cfg).to(device)
 
@@ -937,7 +1087,7 @@ def main():
                 ckpt = None
 
     # ═══ Dataset ═══
-    dataloader = load_dataset(cfg, model_cfg.vocab_size)
+    dataloader = load_dataset(cfg, BYTE_VOCAB)
 
     # ═══ Optimizer ═══
     optimizer = torch.optim.AdamW(
@@ -958,6 +1108,9 @@ def main():
 
     # ═══ Scheduler ═══
     total_steps = len(dataloader) * cfg["epochs"]
+    # Dummy step to avoid "scheduler before optimizer" warning
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
     scheduler = get_cosine_schedule(
         optimizer,
         warmup_steps=cfg["warmup"],
