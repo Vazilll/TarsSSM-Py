@@ -132,11 +132,21 @@ def setup_drive(mode):
 def drive_backup(mode):
     """Бэкап чекпоинтов на Drive."""
     if mode == "colab":
+        # If models/ is already symlinked to Drive, files are already there
+        if (ROOT / "models").is_symlink():
+            logger.info("☁️  models/ → Drive (symlink) — файлы уже на Drive")
+            return True
         drive_models = Path("/content/drive/MyDrive/TarsData/models/tars_lite")
         drive_models.mkdir(parents=True, exist_ok=True)
         if SAVE_DIR.exists():
             for f in SAVE_DIR.glob("*.pt"):
                 dst = drive_models / f.name
+                # Skip if same file (resolved paths match)
+                try:
+                    if f.resolve() == dst.resolve():
+                        continue
+                except Exception:
+                    pass
                 shutil.copy2(str(f), str(dst))
                 logger.info(f"☁️  → Drive: {f.name} ({f.stat().st_size/1e6:.1f} MB)")
             return True
@@ -620,9 +630,10 @@ def train(model, dataloader, optimizer, scheduler, scaler, cfg, state, drive_mod
                 else:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                # Scheduler AFTER optimizer (PyTorch requirement)
                 if scheduler is not None:
                     scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
                 total_steps += 1
 
             # Stats
