@@ -21,11 +21,11 @@ from brain.mamba2.bitnet import UniversalLinear
 class LoRAAdapter(nn.Module):
     """Один LoRA эксперт: ΔW = B·A (low-rank)."""
     
-    def __init__(self, d_model: int = 768, rank: int = 8, alpha: float = 1.0,
+    def __init__(self, d_model: int = 768, rank: int = 8, alpha: float = 16.0,
                  quant_mode: str = "fp16"):
         super().__init__()
         self.rank = rank
-        self.alpha = alpha / rank  # LoRA scaling
+        self.alpha = alpha / rank  # LoRA scaling (16/8 = 2.0, formula #83)
         
         self.A = UniversalLinear(d_model, rank, bias=False, mode=quant_mode)
         self.B = UniversalLinear(rank, d_model, bias=False, mode=quant_mode)

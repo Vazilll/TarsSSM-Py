@@ -483,15 +483,16 @@ class TarsCoreBlock(nn.Module):
         self.beta_gate = UniversalLinear(d_state, d_state, bias=True, mode=quant_mode)
         
         # ═══════════════════════════════════
-        # 🔥 DEEP GATED FUSION (WuNeng)
+        # 🔥 WuNeng FUSION — HELIX v6 Bottleneck
         # ═══════════════════════════════════
-        # Fusion happens in d_inner space (before out_proj)
-        # y_ssd is [B, L, d_inner], y_wkv needs upscaling from d_state
+        # Information bottleneck: 2×d_inner → 192 → GELU → d_inner
+        # Forces extraction of ESSENCE from both SSD and WKV paths
+        BOTTLENECK_DIM = 192  # HELIX v6 spec
         self.wkv_up = UniversalLinear(d_state, self.d_inner, bias=False, mode=quant_mode)
         self.fusion_gate = nn.Sequential(
-            UniversalLinear(self.d_inner * 2, self.d_inner, bias=True, mode=quant_mode),
-            nn.SiLU(),
-            UniversalLinear(self.d_inner, self.d_inner, bias=True, mode=quant_mode),
+            UniversalLinear(self.d_inner * 2, BOTTLENECK_DIM, bias=True, mode=quant_mode),
+            nn.GELU(),
+            UniversalLinear(BOTTLENECK_DIM, self.d_inner, bias=True, mode=quant_mode),
             nn.Sigmoid()
         )
         
@@ -512,9 +513,11 @@ class TarsCoreBlock(nn.Module):
         # These learn universal patterns the model can always attend to
         if n_meta_tokens > 0:
             self.meta_k = nn.Parameter(torch.randn(1, n_meta_tokens, self.ngroups * d_state) * 0.02)
+            self.meta_c = nn.Parameter(torch.randn(1, n_meta_tokens, self.ngroups * d_state) * 0.02)
             self.meta_v = nn.Parameter(torch.randn(1, n_meta_tokens, self.d_inner) * 0.02)
         else:
             self.meta_k = None
+            self.meta_c = None
             self.meta_v = None
     
     def forward(
@@ -649,11 +652,16 @@ class TarsCoreBlock(nn.Module):
             meta_len = 0
             if self.meta_k is not None and self.n_meta_tokens > 0:
                 meta_len = self.n_meta_tokens
-                # Meta B (keys): [1, M, ngroups*d_state] → [B, M, nheads, d_state]
+                # Meta B (keys/input proj): [1, M, ngroups*d_state] → [B, M, nheads, d_state]
                 meta_B = self.meta_k.expand(batch, -1, -1)
                 meta_B = rearrange(meta_B, "b m (g n) -> b m g n", g=self.ngroups)
                 if self.ngroups < self.nheads:
                     meta_B = repeat(meta_B, "b m g n -> b m (g r) n", r=hpg)
+                # Meta C (output proj): separate from B for expressiveness
+                meta_C = self.meta_c.expand(batch, -1, -1)
+                meta_C = rearrange(meta_C, "b m (g n) -> b m g n", g=self.ngroups)
+                if self.ngroups < self.nheads:
+                    meta_C = repeat(meta_C, "b m g n -> b m (g r) n", r=hpg)
                 # Meta V (values): [1, M, d_inner] → [B, M, nheads, headdim]
                 meta_V = self.meta_v.expand(batch, -1, -1)
                 meta_V = rearrange(meta_V, "b m (h p) -> b m h p", p=self.headdim)
@@ -662,7 +670,7 @@ class TarsCoreBlock(nn.Module):
                 
                 # Prepend
                 B_heads = torch.cat([meta_B, B_heads], dim=1)
-                C_heads = torch.cat([meta_B, C_heads], dim=1)  # C reads same keys
+                C_heads = torch.cat([meta_C, C_heads], dim=1)  # dedicated C for output
                 x_dt = torch.cat([meta_V, x_dt], dim=1)
                 A_dt = torch.cat([meta_A, A_dt], dim=1)
             

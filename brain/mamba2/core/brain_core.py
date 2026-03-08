@@ -48,16 +48,16 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 
 class RotaryPositionEmbedding(nn.Module):
     """
-    Unified RoPE: Rotary Position Embedding (Qwen3/Mamba-3 style).
+    Unified RoPE: Rotary Position Embedding.
     
-    Uses base=1,000,000 for up to 32K+ context (vs standard 10,000).
+    Uses base=500,000 (TARS default) for up to 32K+ context.
     Applied to WKV branch for positional awareness in SSM-Attention hybrid.
     
     Math: RoPE(x, pos) = x * cos(θ_pos) + rotate_half(x) * sin(θ_pos)
     where θ_i = pos / base^(2i/d)
     """
     
-    def __init__(self, dim, base=1_000_000, max_seq_len=32768):
+    def __init__(self, dim, base=500_000, max_seq_len=32768):
         super().__init__()
         self.dim = dim
         self.base = base
@@ -103,14 +103,16 @@ class RotaryPositionEmbedding(nn.Module):
 
 class WaveConsolidation(nn.Module):
     """
-    Полноценный слой консолидации волны.
+    WuNeng Fusion — информационное горлышко (HELIX v6).
     
     Архитектура:
       1. Dimension-wise Gate: σ(W · [h_L; h_R]) ∈ (0,1)^d
-      2. Deep Fusion MLP: [h_L; h_R] → 2d → SiLU → d → d
+      2. WuNeng Bottleneck: [h_L; h_R] → 2d → 192 → GELU → d
       3. Reflex integration: сигнал от MoLE stats обоих блоков
-      4. Output: gate * x_left + (1-gate) * x_right + fusion + reflex
+      4. Output: (1-gate) * x_left + gate * x_right + fusion + reflex
     """
+    
+    BOTTLENECK_DIM = 192  # HELIX v6: информационное горлышко
     
     def __init__(self, d_model: int = 768):
         super().__init__()
@@ -121,12 +123,11 @@ class WaveConsolidation(nn.Module):
             nn.Sigmoid(),
         )
         
+        # WuNeng bottleneck: 2d → 192 → GELU → d (per HELIX v6 spec)
         self.fusion = nn.Sequential(
-            nn.Linear(d_model * 2, d_model * 2),
-            nn.SiLU(),
-            nn.Linear(d_model * 2, d_model),
-            nn.SiLU(),
-            nn.Linear(d_model, d_model),
+            nn.Linear(d_model * 2, self.BOTTLENECK_DIM),
+            nn.GELU(),
+            nn.Linear(self.BOTTLENECK_DIM, d_model),
         )
         
         self.reflex_gate = nn.Sequential(
@@ -218,6 +219,8 @@ class SharedGlobalAttention(nn.Module):
         self.v_proj = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
         self.gate = nn.Parameter(torch.tensor(0.1))
+        # BUG-4 fix: learnable temperature for QK-norm (Qwen3-style)
+        self.log_temperature = nn.Parameter(torch.tensor(math.log(10.0)))
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, L, D = x.shape
@@ -234,7 +237,8 @@ class SharedGlobalAttention(nn.Module):
         q = F.normalize(q, p=2, dim=-1)
         k = F.normalize(k, p=2, dim=-1)
         
-        scale = self.head_dim ** -0.5
+        # BUG-4 fix: learnable temperature instead of 1/√d (killed attention with QK-norm)
+        scale = torch.exp(self.log_temperature)
         attn = (q @ k.transpose(-2, -1)) * scale
         causal_mask = torch.triu(
             torch.ones(L, L, device=x.device, dtype=torch.bool), diagonal=1
@@ -456,8 +460,8 @@ class BrainCore(nn.Module):
             nn.Linear(d_model // 4, vocab_size),
         )
         
-        # ═══ RoPE ═══
-        self.rope = RotaryPositionEmbedding(d_model // (d_model // 64), base=1_000_000)
+        # ═══ RoPE (base=500K per TARS spec, matches config.py) ═══
+        self.rope = RotaryPositionEmbedding(d_model // (d_model // 64), base=500_000)
         
         # ═══ Wave-Parallel Input Diversification ═══
         self.proj_left = nn.Linear(d_model, d_model, bias=False)
@@ -521,7 +525,7 @@ class BrainCore(nn.Module):
             self.reset_cache()
         
         c = self._gen_cache
-        x = self.embedding(token_ids)
+        x = self.embedding(token_ids) * math.sqrt(self.d_model)  # Vaswani scaling
         
         n_waves = self.n_layers // 2
         wave_summary = None
@@ -603,7 +607,7 @@ class BrainCore(nn.Module):
         Pipeline: Embedding → TemporalEmbedding → Wave Loop →
                   RMSNorm → PersonalityAdapter → LM Head → Loss
         """
-        x = self.embedding(input_ids)
+        x = self.embedding(input_ids) * math.sqrt(self.d_model)  # Vaswani scaling
         
         # ═══ Temporal Embedding (if available on parent) ═══
         if hasattr(self, 'temporal_embedding'):

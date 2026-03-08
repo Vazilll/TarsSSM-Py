@@ -1,0 +1,24 @@
+[package]
+name = "tars-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "TARS inference runtime — fast C++/Rust core for SSM+WKV hybrid model"
+
+[lib]
+name = "tars_core"
+crate-type = ["cdylib"]  # Python extension via PyO3
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+memmap2 = "0.9"          # Memory-mapped file I/O for safetensors
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+cc = "1.0"               # Build C++ kernels from Rust build script
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+target-cpu = "native"

@@ -691,3 +691,237 @@ def make_lr_schedule(optimizer, total_steps: int, warmup_steps: int = 0,
     
     else:
         raise ValueError(f"Unknown schedule: {schedule}")
+
+
+# ═══════════════════════════════════════════
+# 9. Z-Loss — Logit Stability Regularizer
+# ═══════════════════════════════════════════
+
+def z_loss(logits: torch.Tensor, alpha: float = 1e-4) -> torch.Tensor:
+    """
+    Z-loss: penalizes large logits to prevent log-prob instability.
+    
+    L_z = α × log²(Σ exp(logits))
+    
+    From: PaLM (Chowdhery et al., 2022).
+    Prevents logits from growing unbounded, which causes:
+      - fp16 overflow in softmax
+      - training instability in late stages
+    
+    Args:
+        logits: [batch, seq, vocab] or [batch, vocab]
+        alpha: regularization strength (1e-4 recommended)
+    
+    Returns:
+        scalar z-loss
+    """
+    # log(sum(exp(logits))) per sample, then square
+    log_z = torch.logsumexp(logits, dim=-1)  # [batch, seq] or [batch]
+    return alpha * (log_z ** 2).mean()
+
+
+# ═══════════════════════════════════════════
+# 10. Adaptive Gradient Clipping (AGC)
+# ═══════════════════════════════════════════
+
+def adaptive_grad_clip(model: nn.Module, clip_factor: float = 0.01,
+                       eps: float = 1e-3) -> float:
+    """
+    Adaptive Gradient Clipping (AGC) — per-layer, based on weight/grad ratio.
+    
+    For each parameter: if ||grad|| > clip_factor × ||weight||, scale grad down.
+    
+    From: NFNet (Brock et al., 2021).
+    Better than global grad_norm clip for heterogeneous architectures
+    (SSM states, attention, MLP have very different gradient scales).
+    
+    Args:
+        model: nn.Module
+        clip_factor: max ratio of grad_norm/weight_norm (default: 0.01)
+        eps: min weight norm to avoid division by zero
+    
+    Returns:
+        max ratio observed (for monitoring)
+    """
+    max_ratio = 0.0
+    _raw = getattr(model, '_orig_mod', model)
+    
+    for name, param in _raw.named_parameters():
+        if param.grad is None:
+            continue
+        
+        w_norm = param.data.norm(2).item()
+        g_norm = param.grad.data.norm(2).item()
+        
+        if w_norm < eps:
+            continue
+        
+        ratio = g_norm / w_norm
+        max_ratio = max(max_ratio, ratio)
+        
+        if ratio > clip_factor:
+            # Scale gradient to meet the clip factor
+            scale = clip_factor * w_norm / (g_norm + 1e-8)
+            param.grad.data.mul_(scale)
+    
+    return max_ratio
+
+
+# ═══════════════════════════════════════════
+# 11. CAGrad — Common Ascent Gradient (for UMOT)
+# ═══════════════════════════════════════════
+
+class CAGrad:
+    """
+    Conflict-Averse Gradient (CAGrad) for multi-task learning.
+    
+    Finds the gradient direction that improves ALL tasks simultaneously.
+    If tasks conflict, projects to the common descent direction.
+    
+    ~15% overhead per step (vs PCGrad's ~150% for 6 tasks).
+    
+    From: Liu et al., "Conflict-Averse Gradient Descent for Multi-task Learning" (NeurIPS 2021).
+    
+    Usage (in UMOT training):
+        cagrad = CAGrad()
+        
+        # Compute per-task gradients
+        grads = {}
+        for task in ['CE', 'SFT', 'DPO']:
+            loss = compute_loss(task, ...)
+            loss.backward(retain_graph=True)
+            grads[task] = [p.grad.clone() for p in model.parameters() if p.grad is not None]
+            model.zero_grad()
+        
+        # Merge into common descent direction
+        merged = cagrad.merge(grads)
+        # Apply merged gradients
+        for p, g in zip(model.parameters(), merged):
+            p.grad = g
+        optimizer.step()
+    """
+    
+    def __init__(self, c: float = 0.5):
+        """
+        Args:
+            c: trade-off between average loss and worst-case loss.
+               c=0 → simple average; c=1 → worst-case optimization.
+               Recommended: c=0.5.
+        """
+        self.c = c
+    
+    def merge(self, task_grads: dict) -> list:
+        """
+        Merge per-task gradient lists into a single common-descent gradient.
+        
+        Args:
+            task_grads: dict {task_name: [grad_tensor_per_param, ...]}
+        
+        Returns:
+            list of merged gradient tensors (one per parameter)
+        """
+        tasks = list(task_grads.keys())
+        n_tasks = len(tasks)
+        
+        if n_tasks == 0:
+            return []
+        if n_tasks == 1:
+            return task_grads[tasks[0]]
+        
+        # Flatten all per-task grads into single vectors
+        flat_grads = []
+        for task in tasks:
+            flat = torch.cat([g.flatten() for g in task_grads[task]])
+            flat_grads.append(flat)
+        
+        flat_grads = torch.stack(flat_grads)  # [n_tasks, total_params]
+        
+        # Average gradient
+        avg_grad = flat_grads.mean(dim=0)
+        
+        # Check for conflicts: if any task gradient has negative dot product with avg
+        dots = (flat_grads * avg_grad.unsqueeze(0)).sum(dim=-1)  # [n_tasks]
+        
+        if (dots >= 0).all():
+            # No conflict → just average
+            merged_flat = avg_grad
+        else:
+            # CAGrad: find direction within c-radius of average that maximizes
+            # minimum task improvement
+            # Simplified: project conflicting grads onto avg direction
+            merged_flat = avg_grad.clone()
+            for i, task in enumerate(tasks):
+                if dots[i] < 0:
+                    # Project conflicting gradient to be orthogonal to avg
+                    proj = (flat_grads[i] @ avg_grad) / (avg_grad.norm() ** 2 + 1e-8)
+                    corrected = flat_grads[i] - proj * avg_grad
+                    merged_flat = merged_flat + self.c * corrected / n_tasks
+        
+        # Un-flatten back to per-parameter tensors
+        result = []
+        offset = 0
+        for g in task_grads[tasks[0]]:
+            n = g.numel()
+            result.append(merged_flat[offset:offset + n].reshape_as(g))
+            offset += n
+        
+        return result
+
+
+class PCGrad:
+    """
+    PCGrad — Project Conflicting Gradients.
+    
+    Simpler but slower than CAGrad: O(n²) pairwise projections.
+    Used as FALLBACK if CAGrad is unstable.
+    
+    From: Yu et al., "Gradient Surgery for Multi-Task Learning" (NeurIPS 2020).
+    
+    WARNING: ~150% overhead for 6 tasks. Use CAGrad instead.
+    """
+    
+    @staticmethod
+    def merge(task_grads: dict) -> list:
+        """Project conflicting task gradients pairwise."""
+        tasks = list(task_grads.keys())
+        n_tasks = len(tasks)
+        
+        if n_tasks <= 1:
+            return task_grads[tasks[0]] if tasks else []
+        
+        # Flatten
+        flat_grads = []
+        for task in tasks:
+            flat = torch.cat([g.flatten() for g in task_grads[task]])
+            flat_grads.append(flat)
+        
+        # Pairwise projection (random order)
+        import random
+        order = list(range(n_tasks))
+        random.shuffle(order)
+        
+        projected = [g.clone() for g in flat_grads]
+        
+        for i in order:
+            for j in order:
+                if i == j:
+                    continue
+                dot = (projected[i] @ projected[j]).item()
+                if dot < 0:
+                    # Project: remove conflicting component
+                    proj = dot / (projected[j].norm() ** 2 + 1e-8)
+                    projected[i] = projected[i] - proj * projected[j]
+        
+        # Average projected gradients
+        merged_flat = torch.stack(projected).mean(dim=0)
+        
+        # Un-flatten
+        result = []
+        offset = 0
+        for g in task_grads[tasks[0]]:
+            n = g.numel()
+            result.append(merged_flat[offset:offset + n].reshape_as(g))
+            offset += n
+        
+        return result
+

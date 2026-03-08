@@ -36,5 +36,11 @@ fastapi>=0.100.0,<1.0.0
 uvicorn>=0.22.0,<1.0.0
 websockets>=11.0,<14.0
 
+# ═══ Вес-формат (C++ ↔ Python) ═══
+safetensors>=0.4.0,<1.0.0
+
+# ═══ C++ биндинги (Agent 1 — опционально) ═══
+# pybind11>=2.11.0,<3.0.0  # uncomment if building C++ core
+
 # ═══ Тестирование ═══
 pytest>=7.0.0,<9.0.0

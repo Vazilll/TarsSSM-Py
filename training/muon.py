@@ -51,8 +51,8 @@ class Muon(Optimizer):
         """
         Approximate matrix orthogonalization via Newton-Schulz iteration.
         
-        Iteratively computes: X_{k+1} = X_k (3I - X_k^T X_k) / 2
-        Converges to orthogonal matrix in ~5 steps.
+        Uses quintic polynomial: a*X + b*(X@X.T@X) + c*(X@X.T@X@X.T@X)
+        with coefficients (3.4445, -4.775, 2.0315) for optimal convergence.
         
         This is the key innovation over AdamW: instead of element-wise
         scaling, Muon orthogonalizes the entire gradient matrix.
@@ -73,23 +73,30 @@ class Muon(Optimizer):
             transposed = True
             rows, cols = G.shape
         
-        # Normalize 
+        # Normalize
         scale = max(G.norm(), 1e-6)
         X = G / scale
         
-        # Newton-Schulz iterations
-        # X_{k+1} = X_k @ (3I - X_k^T @ X_k) / 2
-        I = torch.eye(cols, device=G.device, dtype=G.dtype)
+        # Quintic Newton-Schulz polynomial coefficients
+        # From: "Muon: An optimizer for hidden layers in LLMs"
+        a, b, c = 3.4445, -4.7750, 2.0315
+        
         for _ in range(steps):
             A = X @ X.T  # [rows, rows]
-            # 3I - A ≈ orthogonal correction
-            B = torch.eye(rows, device=G.device, dtype=G.dtype) * 3 - A
-            X = B @ X / 2
+            # Quintic: φ(X) = aX + bX(XᵀX) + cX(XᵀX)²
+            # Rewritten: X ← (aI + bA + cA²) @ X  where A = XXᵀ
+            I = torch.eye(A.shape[0], device=A.device, dtype=A.dtype)
+            B = a * I + b * A + c * (A @ A)
+            X = B @ X
         
         if transposed:
             X = X.T
         
-        return X.reshape(original_shape) * scale
+        # BUG-3 fix: return orthogonal direction WITHOUT scale
+        # Newton-Schulz produces X with X·X^T ≈ I (unit norm rows).
+        # Multiplying by ||G|| would make effective lr ∝ ||G||·lr,
+        # defeating the purpose of orthogonalization. lr controls step size.
+        return X.reshape(original_shape)
     
     @torch.no_grad()
     def step(self, closure=None):

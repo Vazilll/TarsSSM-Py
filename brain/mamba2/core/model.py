@@ -70,9 +70,9 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 
 class RotaryPositionEmbedding(nn.Module):
     """
-    Unified RoPE: Rotary Position Embedding (Qwen3/Mamba-3 style).
+    Unified RoPE: Rotary Position Embedding.
     
-    Uses base=1,000,000 for up to 32K+ context (vs standard 10,000).
+    Uses base=500,000 (TARS default) for up to 32K+ context.
     Applied to WKV branch for positional awareness in SSM-Attention hybrid.
     
     Math: RoPE(x, pos) = x * cos(θ_pos) + rotate_half(x) * sin(θ_pos)
@@ -81,7 +81,7 @@ class RotaryPositionEmbedding(nn.Module):
     Lazy compute: starts with small buffer (512), auto-extends on demand.
     """
     
-    def __init__(self, dim, base=1_000_000, max_seq_len=32768):
+    def __init__(self, dim, base=500_000, max_seq_len=32768):
         super().__init__()
         self.dim = dim
         self.base = base
@@ -160,20 +160,16 @@ class RotaryPositionEmbedding(nn.Module):
 
 class WaveConsolidation(nn.Module):
     """
-    Полноценный слой консолидации волны.
-    
-    Заменяет лёгкий WaveMerge+WaveGate.
-    Это «большой» слой, который объединяет результаты обоих блоков
-    и рефлексы (MoLE experts) в единый выход.
+    WuNeng Fusion — информационное горлышко (HELIX v6).
     
     Архитектура:
       1. Dimension-wise Gate: σ(W · [h_L; h_R]) ∈ (0,1)^d
-         — не скаляр, а полный d_model gate
-      2. Deep Fusion MLP: [h_L; h_R] → 2d → SiLU → d → d
-         — глубокая нелинейная коррекция
+      2. WuNeng Bottleneck: [h_L; h_R] → 2d → 192 → GELU → d
       3. Reflex integration: сигнал от MoLE stats обоих блоков
-      4. Output: gate * x_left + (1-gate) * x_right + fusion + reflex
+      4. Output: (1-gate) * x_left + gate * x_right + fusion + reflex
     """
+    
+    BOTTLENECK_DIM = 192  # HELIX v6: информационное горлышко
     
     def __init__(self, d_model: int = 768):
         super().__init__()
@@ -185,13 +181,11 @@ class WaveConsolidation(nn.Module):
             nn.Sigmoid(),
         )
         
-        # 2. Deep Fusion MLP (большой слой)
+        # 2. WuNeng bottleneck: 2d → 192 → GELU → d (per HELIX v6 spec)
         self.fusion = nn.Sequential(
-            nn.Linear(d_model * 2, d_model * 2),
-            nn.SiLU(),
-            nn.Linear(d_model * 2, d_model),
-            nn.SiLU(),
-            nn.Linear(d_model, d_model),
+            nn.Linear(d_model * 2, self.BOTTLENECK_DIM),
+            nn.GELU(),
+            nn.Linear(self.BOTTLENECK_DIM, d_model),
         )
         
         # 3. Reflex integration gate (MoLE expert signals)
@@ -338,6 +332,11 @@ class SharedGlobalAttention(nn.Module):
         
         # Gated residual: starts small
         self.gate = nn.Parameter(torch.tensor(0.1))
+        
+        # BUG-4 fix: learnable temperature for QK-norm (Qwen3-style)
+        # After L2-normalization, dot products ∈ [-1, 1]. Static 1/√d kills attention.
+        # Learnable log-temperature lets the model control softmax sharpness.
+        self.log_temperature = nn.Parameter(torch.tensor(math.log(10.0)))
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -361,8 +360,10 @@ class SharedGlobalAttention(nn.Module):
         q = F.normalize(q, p=2, dim=-1)
         k = F.normalize(k, p=2, dim=-1)
         
-        # Scaled dot-product attention
-        scale = self.head_dim ** -0.5
+        # Scaled dot-product attention with learnable temperature (BUG-4 fix)
+        # QK-norm makes dot products ∈ [-1,1], so we use learned temperature
+        # instead of fixed 1/√d which would compress values to ≈[-0.125, 0.125]
+        scale = torch.exp(self.log_temperature)
         attn = (q @ k.transpose(-2, -1)) * scale
         # Causal mask
         causal_mask = torch.triu(
@@ -727,7 +728,7 @@ class TarsMamba2LM(nn.Module):
         # ═══ Wave Consolidation (6 слоёв для 12/2=6 волн) ═══
         # Каждый consolidation — полноценный слой слияния:
         #   1. Dimension-wise gate (не скаляр, а полный d_model)
-        #   2. Deep fusion MLP (2d → 2d → d → d) 
+        #   2. WuNeng Bottleneck (2d → 192 → GELU → d, HELIX v6)
         #   3. Reflex integration (MoLE expert signal)
         n_waves = n_layers // 2
         self.wave_consolidations = nn.ModuleList([
@@ -886,8 +887,8 @@ class TarsMamba2LM(nn.Module):
         self._gen_cache = None  # Initialized by reset_cache()
         self._prefix_cache = None  # For prefix caching (system prompt)
         
-        # ═══ Unified RoPE for WKV branch (Qwen3/Mamba-3 style) ═══
-        self.rope = RotaryPositionEmbedding(d_model // (d_model // 64), base=1_000_000)
+        # ═══ RoPE (base=500K per TARS spec, matches config.py) ═══
+        self.rope = RotaryPositionEmbedding(d_model // (d_model // 64), base=500_000)
         
         # ═══ Wave-Parallel Input Diversification ═══
         # Prevents both blocks from learning identical features
@@ -1098,7 +1099,7 @@ class TarsMamba2LM(nn.Module):
             self.reset_cache()
         
         c = self._gen_cache
-        x = self.embedding(token_ids)
+        x = self.embedding(token_ids) * math.sqrt(self.d_model)  # Vaswani scaling
         
         n_waves = self.n_layers // 2
         wave_summary = None  # scratchpad: итог предыдущей волны
@@ -1337,7 +1338,7 @@ class TarsMamba2LM(nn.Module):
             logits [B, L, vocab_size] if labels is None
             (logits, loss) if labels is provided
         """
-        x = self.embedding(input_ids)  # [B, L, d_model]
+        x = self.embedding(input_ids) * math.sqrt(self.d_model)  # Vaswani scaling
         
         # ═══ Temporal Embedding: inject time sense ═══
         x = self.temporal_embedding(x)
@@ -1566,7 +1567,7 @@ class TarsMamba2LM(nn.Module):
         # Средний запрос:  ... → [B2 || B3] → merge → spine → СОШЛОСЬ (4)
         # Сложный запрос:  ... все 6 волн (12 блоков) → IDME
         # ═══════════════════════════════════════════════════════════════
-        x = self.embedding(input_ids)
+        x = self.embedding(input_ids) * math.sqrt(self.d_model)  # Vaswani scaling
         
         # ═══ QueryRouter: определяем стратегию поиска ПЕРЕД волнами ═══
         # Вместо слепого RAG → нейросеть решает: искать / не искать / где.
