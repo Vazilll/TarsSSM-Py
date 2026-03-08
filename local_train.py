@@ -914,13 +914,24 @@ def main():
     # Resume from checkpoint
     if args.resume:
         ckpt_path = SAVE_DIR / "checkpoint_latest.pt"
+        if not ckpt_path.exists():
+            ckpt_path = SAVE_DIR / "checkpoint_best.pt"
         if ckpt_path.exists():
             logger.info(f"🔄 Loading checkpoint: {ckpt_path}")
-            ckpt = torch.load(str(ckpt_path), map_location=device, weights_only=False)
-            model.load_state_dict(ckpt['model_state_dict'], strict=False)
-            state["current_epoch"] = ckpt.get('epoch', 0)
-            state["total_steps"] = ckpt.get('total_steps', 0)
-            logger.info(f"  Resumed from epoch {state['current_epoch']}, step {state['total_steps']}")
+            try:
+                ckpt = torch.load(str(ckpt_path), map_location=device, weights_only=False)
+                model.load_state_dict(ckpt['model_state_dict'], strict=False)
+                state["current_epoch"] = ckpt.get('epoch', 0)
+                state["total_steps"] = ckpt.get('total_steps', 0)
+                logger.info(f"  Resumed from epoch {state['current_epoch']}, step {state['total_steps']}")
+            except Exception as e:
+                logger.warning(f"⚠️  Checkpoint corrupted: {e}")
+                logger.warning(f"  Deleting bad checkpoint and starting fresh...")
+                try:
+                    ckpt_path.unlink()
+                except Exception:
+                    pass
+                ckpt = None
 
     # ═══ Dataset ═══
     dataloader = load_dataset(cfg, model_cfg.vocab_size)
