@@ -351,45 +351,62 @@ def wkv_scan(
     if state is None:
         state = r.new_zeros(B, S, S)
     
-    # ═══ Tier 1: FLA Triton kernel (GPU, fastest) ═══
-    if _USE_FLA and _fla_recurrent_rwkv is not None and L > 1:
+    # ═══ WKV MUST run in fp32 ═══
+    # Sequential recurrence accumulates numerical errors in fp16.
+    # Also fixes AMP backward crash: JIT-compiled _wkv_step creates
+    # intermediate tensors whose dtype/shape don't match what autograd
+    # expects during backward recompute in fp32.
+    orig_dtype = r.dtype
+    if r.dtype != torch.float32:
+        r = r.float()
+        k = k.float()
+        v = v.float()
+        w = w.float()
+        bonus = bonus.float()
+        state = state.float()
+    
+    # Disable autocast for this entire block
+    with torch.amp.autocast('cuda', enabled=False):
+        # ═══ Tier 1: FLA Triton kernel (GPU, fastest) ═══
+        if _USE_FLA and _fla_recurrent_rwkv is not None and L > 1:
+            try:
+                output, state = _fla_recurrent_rwkv(
+                    r, k, v, w, bonus, state
+                )
+                return output.to(orig_dtype), state
+            except Exception:
+                pass  # Fallback to JIT
+        
+        # ═══ Tier 2: JIT-compiled full loop (2.5x vs Python) ═══
         try:
-            output, state = _fla_recurrent_rwkv(
-                r, k, v, w, bonus, state
-            )
-            return output, state
+            output, state = _wkv_scan_jit(r, k, v, w, bonus, state, chunk_size)
+            return output.to(orig_dtype), state
         except Exception:
-            pass  # Fallback to JIT
-    
-    # ═══ Tier 2: JIT-compiled full loop (2.5x vs Python) ═══
-    try:
-        return _wkv_scan_jit(r, k, v, w, bonus, state, chunk_size)
-    except Exception:
-        pass  # Fallback to Python
-    
-    # ═══ Tier 3: Pure Python loop (always works) ═══
-    output = r.new_zeros(B, L, S)
-    
-    if L == 1:
-        y_t, state = _wkv_step(state, k[:, 0], v[:, 0], r[:, 0], w[:, 0], bonus[:, 0])
-        output[:, 0] = y_t
-        return output, state
-    
-    for chunk_start in range(0, L, chunk_size):
-        chunk_end = min(chunk_start + chunk_size, L)
-        k_c = k[:, chunk_start:chunk_end]
-        v_c = v[:, chunk_start:chunk_end]
-        r_c = r[:, chunk_start:chunk_end]
-        w_c = w[:, chunk_start:chunk_end]
-        b_c = bonus[:, chunk_start:chunk_end]
-        cs = chunk_end - chunk_start
-        for t in range(cs):
-            y_t, state = _wkv_step(
-                state, k_c[:, t], v_c[:, t], r_c[:, t], w_c[:, t], b_c[:, t]
-            )
-            output[:, chunk_start + t] = y_t
-    
-    return output, state
+            pass  # Fallback to Python
+        
+        # ═══ Tier 3: Pure Python loop (always works) ═══
+        output = torch.zeros(B, L, S, dtype=torch.float32, device=r.device)
+        
+        if L == 1:
+            y_t, state = _wkv_step(state, k[:, 0], v[:, 0], r[:, 0], w[:, 0], bonus[:, 0])
+            output[:, 0] = y_t
+            return output.to(orig_dtype), state
+        
+        for chunk_start in range(0, L, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, L)
+            k_c = k[:, chunk_start:chunk_end]
+            v_c = v[:, chunk_start:chunk_end]
+            r_c = r[:, chunk_start:chunk_end]
+            w_c = w[:, chunk_start:chunk_end]
+            b_c = bonus[:, chunk_start:chunk_end]
+            cs = chunk_end - chunk_start
+            for t in range(cs):
+                y_t, state = _wkv_step(
+                    state, k_c[:, t], v_c[:, t], r_c[:, t], w_c[:, t], b_c[:, t]
+                )
+                output[:, chunk_start + t] = y_t
+        
+        return output.to(orig_dtype), state
 
 
 # ═══════════════════════════════════════════
