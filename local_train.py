@@ -382,7 +382,7 @@ def auto_config(level, hw):
 
     # Batch по VRAM
     if vram >= 30:      batch = 8
-    elif vram >= 15:    batch = 4
+    elif vram >= 12:    batch = 4   # T4(15GB), L4(24GB)
     elif vram >= 8:     batch = 2
     else:               batch = 1
 
@@ -394,22 +394,22 @@ def auto_config(level, hw):
         "small": {
             "epochs": 2, "steps_per_epoch": 100,
             "seq_len": 256, "accum": max(1, 16 // batch),
-            "lr": 5e-4, "warmup": 50,
+            "lr": 5e-4, "warmup": 50, "max_chunks": 2000,
         },
         "medium": {
-            "epochs": 5, "steps_per_epoch": 500,
-            "seq_len": 512, "accum": max(1, 32 // batch),
-            "lr": 3e-4, "warmup": 200,
+            "epochs": 3, "steps_per_epoch": 500,
+            "seq_len": 512, "accum": max(1, 16 // batch),
+            "lr": 3e-4, "warmup": 200, "max_chunks": 20000,
         },
         "max": {
-            "epochs": 15, "steps_per_epoch": 2000,
-            "seq_len": 1024, "accum": max(1, 32 // batch),
-            "lr": 3e-4, "warmup": 500,
+            "epochs": 5, "steps_per_epoch": 2000,
+            "seq_len": 1024, "accum": max(1, 16 // batch),
+            "lr": 3e-4, "warmup": 500, "max_chunks": 100000,
         },
         "marathon": {
-            "epochs": 50, "steps_per_epoch": 5000,
-            "seq_len": 1024, "accum": max(1, 32 // batch),
-            "lr": 3e-4, "warmup": 1000,
+            "epochs": 15, "steps_per_epoch": 5000,
+            "seq_len": 1024, "accum": max(1, 16 // batch),
+            "lr": 3e-4, "warmup": 1000, "max_chunks": 500000,
         },
     }
 
@@ -644,7 +644,7 @@ def load_dataset(cfg, vocab_size):
         Каждый символ → UTF-8 байт → токен [0..255].
         Chunks с overlap (stride = seq_len // 2).
         """
-        def __init__(self, raw_bytes, seq_len):
+        def __init__(self, raw_bytes, seq_len, max_chunks=0):
             tokens = list(raw_bytes)
             stride = max(1, seq_len // 2)  # 50% overlap
             
@@ -656,6 +656,10 @@ def load_dataset(cfg, vocab_size):
             
             # Перемешать чанки
             random.shuffle(self.chunks)
+            
+            # Ограничить размер по уровню
+            if max_chunks > 0 and len(self.chunks) > max_chunks:
+                self.chunks = self.chunks[:max_chunks]
             
             if not self.chunks:
                 # Fallback: pad short corpus
@@ -684,9 +688,10 @@ def load_dataset(cfg, vocab_size):
 
     # Загрузить корпус
     corpus_bytes = load_corpus_text(data_path=args.data)
+    max_chunks = cfg.get("max_chunks", 0)
     
     if corpus_bytes is not None:
-        dataset = TextCorpusDataset(corpus_bytes, cfg["seq_len"])
+        dataset = TextCorpusDataset(corpus_bytes, cfg["seq_len"], max_chunks=max_chunks)
     else:
         n_samples = cfg["steps_per_epoch"] * cfg["batch"]
         n_samples = min(n_samples, 5000)
@@ -1108,9 +1113,9 @@ def main():
 
     # ═══ Scheduler ═══
     total_steps = len(dataloader) * cfg["epochs"]
-    # Dummy step to avoid "scheduler before optimizer" warning
-    optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
+    # Suppress warning (scheduler before first optimizer.step is harmless here)
+    import warnings
+    warnings.filterwarnings("ignore", "Detected call of `lr_scheduler.step\\(\\)` before")
     scheduler = get_cosine_schedule(
         optimizer,
         warmup_steps=cfg["warmup"],
