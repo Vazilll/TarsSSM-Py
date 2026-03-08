@@ -854,6 +854,7 @@ def _save_checkpoint(model, optimizer, scheduler, scaler, epoch, total_steps, lo
         'epoch': epoch,
         'total_steps': total_steps,
         'loss': loss,
+        'vocab_size': BYTE_VOCAB,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'config': {
@@ -1077,11 +1078,28 @@ def main():
             logger.info(f"🔄 Loading checkpoint: {ckpt_path}")
             try:
                 ckpt = torch.load(str(ckpt_path), map_location=device, weights_only=False)
-                model.load_state_dict(ckpt['model_state_dict'], strict=False)
-                state["current_epoch"] = ckpt.get('epoch', 0)
-                state["total_steps"] = ckpt.get('total_steps', 0)
-                ckpt_loaded = True
-                logger.info(f"  Resumed from epoch {state['current_epoch']}, step {state['total_steps']}")
+                # Check vocab compatibility
+                ckpt_vocab = ckpt.get('vocab_size', None)
+                if ckpt_vocab is not None and ckpt_vocab != BYTE_VOCAB:
+                    logger.warning(f"⚠️  Checkpoint vocab={ckpt_vocab} ≠ current vocab={BYTE_VOCAB}")
+                    logger.warning(f"  Пропускаем несовместимый чекпоинт — обучение с нуля")
+                    ckpt = None
+                else:
+                    # Check embedding shape
+                    emb_key = 'model_state_dict'
+                    if emb_key in ckpt:
+                        emb_w = ckpt[emb_key].get('embedding.weight', None)
+                        if emb_w is not None and emb_w.shape[0] != BYTE_VOCAB:
+                            logger.warning(f"⚠️  Checkpoint embedding [{emb_w.shape[0]}] ≠ vocab [{BYTE_VOCAB}]")
+                            logger.warning(f"  Пропускаем несовместимый чекпоинт — обучение с нуля")
+                            ckpt = None
+                
+                if ckpt is not None:
+                    model.load_state_dict(ckpt['model_state_dict'], strict=False)
+                    state["current_epoch"] = ckpt.get('epoch', 0)
+                    state["total_steps"] = ckpt.get('total_steps', 0)
+                    ckpt_loaded = True
+                    logger.info(f"  Resumed from epoch {state['current_epoch']}, step {state['total_steps']}")
             except Exception as e:
                 logger.warning(f"⚠️  Checkpoint corrupted: {e}")
                 logger.warning(f"  Deleting bad checkpoint and starting fresh...")
