@@ -912,6 +912,8 @@ def main():
     model = TarsHelixLite(model_cfg).to(device)
 
     # Resume from checkpoint
+    ckpt = None
+    ckpt_loaded = False
     if args.resume:
         ckpt_path = SAVE_DIR / "checkpoint_latest.pt"
         if not ckpt_path.exists():
@@ -923,6 +925,7 @@ def main():
                 model.load_state_dict(ckpt['model_state_dict'], strict=False)
                 state["current_epoch"] = ckpt.get('epoch', 0)
                 state["total_steps"] = ckpt.get('total_steps', 0)
+                ckpt_loaded = True
                 logger.info(f"  Resumed from epoch {state['current_epoch']}, step {state['total_steps']}")
             except Exception as e:
                 logger.warning(f"⚠️  Checkpoint corrupted: {e}")
@@ -945,9 +948,11 @@ def main():
     )
 
     # Resume optimizer
-    if args.resume and 'optimizer_state_dict' in (ckpt if 'ckpt' in dir() else {}):
+    if args.resume and ckpt_loaded:
         try:
-            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            if 'optimizer_state_dict' in ckpt:
+                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                logger.info("  Optimizer state restored")
         except Exception:
             pass
 
