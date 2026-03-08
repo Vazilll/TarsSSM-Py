@@ -151,61 +151,68 @@ def ssd_scan(X, A, B, C, chunk_size=64, initial_states=None):
     # exp(cumsum(A)) overflows in fp16 when cumsum > 11 (fp16 max ≈ 65504).
     # With A values from log-uniform(1,16), cumsums over chunk_size=64
     # easily exceed 11 → exp() → inf → NaN in einsum.
+    #
+    # NOTE: torch.amp.autocast(enabled=False) does NOT survive
+    # torch.utils.checkpoint recomputation — checkpoint replays the outer
+    # autocast context, re-casting einsum operands to fp16.
+    # Fix: explicit .float() on every einsum operand (bullet-proof).
     orig_dtype = X.dtype
-    if X.dtype != torch.float32:
-        X = X.float()
-        A = A.float()
-        B = B.float()
-        C = C.float()
-        if initial_states is not None:
-            initial_states = initial_states.float()
+    X = X.float()
+    A = A.float()
+    B = B.float()
+    C = C.float()
+    if initial_states is not None:
+        initial_states = initial_states.float()
     
-    with torch.amp.autocast('cuda', enabled=False):
-        pad = (chunk_size - seqlen % chunk_size) % chunk_size
-        if pad > 0:
-            X = F.pad(X, (0, 0, 0, 0, 0, pad))
-            A = F.pad(A, (0, 0, 0, pad))
-            B = F.pad(B, (0, 0, 0, 0, 0, pad))
-            C = F.pad(C, (0, 0, 0, 0, 0, pad))
-        
-        T = X.shape[1]
-        n_chunks = T // chunk_size
-        
-        X = rearrange(X, "b (c l) h p -> b c l h p", l=chunk_size)
-        A = rearrange(A, "b (c l) h -> b h c l", l=chunk_size)
-        B = rearrange(B, "b (c l) h n -> b c l h n", l=chunk_size)
-        C = rearrange(C, "b (c l) h n -> b c l h n", l=chunk_size)
-        
-        A_cumsum = torch.cumsum(A, dim=-1)
-        
-        # 1. Intra-chunk
-        L = torch.exp(segsum(A))
-        Y_diag = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", C, B, L, X)
-        
-        # 2. Inter-chunk states
-        decay_states = torch.exp(A_cumsum[:, :, :, -1:] - A_cumsum)
-        states = torch.einsum("bclhn,bhcl,bclhp->bchpn", B, decay_states, X)
-        
-        # 3. Inter-chunk recurrence
-        if initial_states is None:
-            initial_states = states.new_zeros(states[:, :1].shape)
-        states = torch.cat([initial_states, states], dim=1)
-        
-        decay_chunk = torch.exp(segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0))))
-        new_states = torch.einsum("bhzc,bchpn->bzhpn", decay_chunk, states)
-        states = new_states[:, :-1]
-        final_state = new_states[:, -1]
-        
-        # 4. State → output
-        state_decay_out = torch.exp(A_cumsum)
-        Y_off = torch.einsum("bclhn,bchpn,bhcl->bclhp", C, states, state_decay_out)
-        
-        Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
-        
-        if pad > 0:
-            Y = Y[:, :seqlen]
-        
-        return Y.to(orig_dtype), final_state
+    pad = (chunk_size - seqlen % chunk_size) % chunk_size
+    if pad > 0:
+        X = F.pad(X, (0, 0, 0, 0, 0, pad))
+        A = F.pad(A, (0, 0, 0, pad))
+        B = F.pad(B, (0, 0, 0, 0, 0, pad))
+        C = F.pad(C, (0, 0, 0, 0, 0, pad))
+    
+    T = X.shape[1]
+    n_chunks = T // chunk_size
+    
+    X = rearrange(X, "b (c l) h p -> b c l h p", l=chunk_size)
+    A = rearrange(A, "b (c l) h -> b h c l", l=chunk_size)
+    B = rearrange(B, "b (c l) h n -> b c l h n", l=chunk_size)
+    C = rearrange(C, "b (c l) h n -> b c l h n", l=chunk_size)
+    
+    A_cumsum = torch.cumsum(A, dim=-1)  # float32
+    
+    # 1. Intra-chunk (all ops in float32, explicit casts for einsum)
+    L = torch.exp(segsum(A))  # float32
+    Y_diag = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp",
+                           C.float(), B.float(), L.float(), X.float())
+    
+    # 2. Inter-chunk states
+    decay_states = torch.exp(A_cumsum[:, :, :, -1:] - A_cumsum)  # float32
+    states = torch.einsum("bclhn,bhcl,bclhp->bchpn",
+                           B.float(), decay_states.float(), X.float())
+    
+    # 3. Inter-chunk recurrence
+    if initial_states is None:
+        initial_states = torch.zeros_like(states[:, :1])
+    states = torch.cat([initial_states.float(), states], dim=1)
+    
+    decay_chunk = torch.exp(segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0))))
+    new_states = torch.einsum("bhzc,bchpn->bzhpn",
+                               decay_chunk.float(), states.float())
+    states = new_states[:, :-1]
+    final_state = new_states[:, -1]
+    
+    # 4. State → output
+    state_decay_out = torch.exp(A_cumsum)  # float32
+    Y_off = torch.einsum("bclhn,bchpn,bhcl->bclhp",
+                          C.float(), states.float(), state_decay_out.float())
+    
+    Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
+    
+    if pad > 0:
+        Y = Y[:, :seqlen]
+    
+    return Y.to(orig_dtype), final_state
 
 
 class CausalConv1d(nn.Module):
@@ -371,56 +378,53 @@ def wkv_scan(
     # intermediate tensors whose dtype/shape don't match what autograd
     # expects during backward recompute in fp32.
     orig_dtype = r.dtype
-    if r.dtype != torch.float32:
-        r = r.float()
-        k = k.float()
-        v = v.float()
-        w = w.float()
-        bonus = bonus.float()
-        state = state.float()
+    r = r.float()
+    k = k.float()
+    v = v.float()
+    w = w.float()
+    bonus = bonus.float()
+    state = state.float()
     
-    # Disable autocast for this entire block
-    with torch.amp.autocast('cuda', enabled=False):
-        # ═══ Tier 1: FLA Triton kernel (GPU, fastest) ═══
-        if _USE_FLA and _fla_recurrent_rwkv is not None and L > 1:
-            try:
-                output, state = _fla_recurrent_rwkv(
-                    r, k, v, w, bonus, state
-                )
-                return output.to(orig_dtype), state
-            except Exception:
-                pass  # Fallback to JIT
-        
-        # ═══ Tier 2: JIT-compiled full loop (2.5x vs Python) ═══
+    # ═══ Tier 1: FLA Triton kernel (GPU, fastest) ═══
+    if _USE_FLA and _fla_recurrent_rwkv is not None and L > 1:
         try:
-            output, state = _wkv_scan_jit(r, k, v, w, bonus, state, chunk_size)
+            output, state = _fla_recurrent_rwkv(
+                r, k, v, w, bonus, state
+            )
             return output.to(orig_dtype), state
         except Exception:
-            pass  # Fallback to Python
-        
-        # ═══ Tier 3: Pure Python loop (always works) ═══
-        output = torch.zeros(B, L, S, dtype=torch.float32, device=r.device)
-        
-        if L == 1:
-            y_t, state = _wkv_step(state, k[:, 0], v[:, 0], r[:, 0], w[:, 0], bonus[:, 0])
-            output[:, 0] = y_t
-            return output.to(orig_dtype), state
-        
-        for chunk_start in range(0, L, chunk_size):
-            chunk_end = min(chunk_start + chunk_size, L)
-            k_c = k[:, chunk_start:chunk_end]
-            v_c = v[:, chunk_start:chunk_end]
-            r_c = r[:, chunk_start:chunk_end]
-            w_c = w[:, chunk_start:chunk_end]
-            b_c = bonus[:, chunk_start:chunk_end]
-            cs = chunk_end - chunk_start
-            for t in range(cs):
-                y_t, state = _wkv_step(
-                    state, k_c[:, t], v_c[:, t], r_c[:, t], w_c[:, t], b_c[:, t]
-                )
-                output[:, chunk_start + t] = y_t
-        
+            pass  # Fallback to JIT
+    
+    # ═══ Tier 2: JIT-compiled full loop (2.5x vs Python) ═══
+    try:
+        output, state = _wkv_scan_jit(r, k, v, w, bonus, state, chunk_size)
         return output.to(orig_dtype), state
+    except Exception:
+        pass  # Fallback to Python
+    
+    # ═══ Tier 3: Pure Python loop (always works) ═══
+    output = torch.zeros(B, L, S, dtype=torch.float32, device=r.device)
+    
+    if L == 1:
+        y_t, state = _wkv_step(state, k[:, 0], v[:, 0], r[:, 0], w[:, 0], bonus[:, 0])
+        output[:, 0] = y_t
+        return output.to(orig_dtype), state
+    
+    for chunk_start in range(0, L, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, L)
+        k_c = k[:, chunk_start:chunk_end]
+        v_c = v[:, chunk_start:chunk_end]
+        r_c = r[:, chunk_start:chunk_end]
+        w_c = w[:, chunk_start:chunk_end]
+        b_c = bonus[:, chunk_start:chunk_end]
+        cs = chunk_end - chunk_start
+        for t in range(cs):
+            y_t, state = _wkv_step(
+                state, k_c[:, t], v_c[:, t], r_c[:, t], w_c[:, t], b_c[:, t]
+            )
+            output[:, chunk_start + t] = y_t
+    
+    return output.to(orig_dtype), state
 
 
 # ═══════════════════════════════════════════
