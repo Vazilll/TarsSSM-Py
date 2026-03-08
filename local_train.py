@@ -714,19 +714,33 @@ def load_dataset(cfg, vocab_size):
 # 10. Training Loop
 # ═══════════════════════════════════════════
 
-def get_cosine_schedule(optimizer, warmup_steps, total_steps, min_lr_ratio=0.1):
-    """Cosine LR schedule with warmup."""
+def get_wsd_schedule(optimizer, warmup_steps, total_steps, min_lr_ratio=0.1):
+    """WSD (Warmup-Stable-Decay) LR schedule per HELIX GOLDEN spec.
+    
+    Phase 1: 5% linear warmup (0 → lr)
+    Phase 2: 75% stable (lr constant)
+    Phase 3: 20% cosine decay (lr → min_lr)
+    """
     import torch
+    stable_end = int(total_steps * 0.80)  # warmup(5%) + stable(75%)
     def lr_lambda(step):
         if step < warmup_steps:
+            # Phase 1: Linear warmup
             return step / max(1, warmup_steps)
-        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+        elif step < stable_end:
+            # Phase 2: Stable (full LR)
+            return 1.0
+        else:
+            # Phase 3: Cosine decay
+            decay_steps = total_steps - stable_end
+            progress = (step - stable_end) / max(1, decay_steps)
+            return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def train(model, dataloader, optimizer, scheduler, scaler, cfg, state, drive_mode):
-    """Full training loop with checkpointing."""
+def train(model, dataloader, optimizer, scheduler, scaler, cfg, state, drive_mode,
+          adamw_group=None, scheduler_adamw=None):
+    """Full training loop with checkpointing. Supports Muon+AdamW dual optimizer."""
     import torch
 
     device = cfg["device"]
@@ -776,18 +790,24 @@ def train(model, dataloader, optimizer, scheduler, scaler, cfg, state, drive_mod
 
             # Optimizer step (every accum steps)
             if (step + 1) % cfg['accum'] == 0 or (step + 1) == len(dataloader):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 if scaler is not None:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
+                # Step AdamW group (dual optimizer)
+                if adamw_group is not None:
+                    adamw_group.step()
                 # Scheduler AFTER optimizer (PyTorch requirement)
                 if scheduler is not None:
                     scheduler.step()
+                if scheduler_adamw is not None:
+                    scheduler_adamw.step()
                 optimizer.zero_grad(set_to_none=True)
+                if adamw_group is not None:
+                    adamw_group.zero_grad(set_to_none=True)
                 total_steps += 1
 
             # Stats
@@ -1103,11 +1123,19 @@ def main():
 
                 # ── Load if OK ──
                 if ckpt is not None:
-                    model.load_state_dict(sd, strict=False)
-                    state["current_epoch"] = ckpt.get('epoch', 0)
-                    state["total_steps"] = ckpt.get('total_steps', 0)
-                    ckpt_loaded = True
-                    logger.info(f"  ✅ Resumed from epoch {state['current_epoch']}, step {state['total_steps']}")
+                    # Skip useless checkpoints (no training progress)
+                    ckpt_epoch = ckpt.get('epoch', 0)
+                    ckpt_steps = ckpt.get('total_steps', 0)
+                    if ckpt_epoch == 0 and ckpt_steps == 0:
+                        logger.warning(f"⚠️  Checkpoint epoch=0, step=0 — бесполезный, пропускаем")
+                        ckpt_path.unlink(missing_ok=True)
+                        ckpt = None
+                    else:
+                        model.load_state_dict(sd, strict=False)
+                        state["current_epoch"] = ckpt_epoch
+                        state["total_steps"] = ckpt_steps
+                        ckpt_loaded = True
+                        logger.info(f"  ✅ Resumed from epoch {ckpt_epoch}, step {ckpt_steps}")
             except Exception as e:
                 logger.warning(f"⚠️  Checkpoint corrupted: {e}")
                 logger.warning(f"  Удаляю — обучение с нуля...")
@@ -1120,34 +1148,94 @@ def main():
     # ═══ Dataset ═══
     dataloader = load_dataset(cfg, BYTE_VOCAB)
 
-    # ═══ Optimizer ═══
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg["lr"],
-        weight_decay=0.01,
-        betas=(0.9, 0.95),
-    )
+    # ═══ Sanity check: forward pass before training ═══
+    logger.info("🔬 Sanity check: forward pass...")
+    model.eval()
+    with torch.no_grad():
+        test_x = torch.randint(0, BYTE_VOCAB, (1, 64), device=device)
+        test_out = model(test_x)
+        test_logits = test_out['logits'] if isinstance(test_out, dict) else test_out
+        if torch.isnan(test_logits).any() or torch.isinf(test_logits).any():
+            logger.warning("⚠️  Модель выдаёт NaN/Inf — переинициализация с нуля!")
+            # Re-create model from scratch
+            model = TarsHelixLite(model_cfg).to(device)
+            ckpt_loaded = False
+            ckpt = None
+            # Verify fix
+            test_out2 = model(test_x)
+            test_logits2 = test_out2['logits'] if isinstance(test_out2, dict) else test_out2
+            if torch.isnan(test_logits2).any():
+                logger.error("❌ Модель NaN даже после переинициализации!")
+                return
+            logger.info("  ✅ Переинициализация успешна")
+        else:
+            logger.info(f"  ✅ Forward OK: logits range [{test_logits.min():.2f}, {test_logits.max():.2f}]")
+    model.train()
 
-    # Resume optimizer
-    if args.resume and ckpt_loaded:
-        try:
-            if 'optimizer_state_dict' in ckpt:
-                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-                logger.info("  Optimizer state restored")
-        except Exception:
-            pass
+    # ═══ Optimizer: Muon (2D matrices) + AdamW (1D params) ═══
+    # HELIX GOLDEN: Muon for weight matrices, AdamW for biases/norms/embeddings
+    try:
+        from training.muon import Muon
+        muon_params = []
+        adamw_params = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if param.ndim >= 2 and 'embedding' not in name:
+                muon_params.append(param)
+            else:
+                adamw_params.append(param)
+        
+        # Muon uses ~10× higher LR than AdamW (orthogonalized gradients)
+        muon_lr = cfg["lr"] * 10  # e.g. 3e-4 → 3e-3
+        optimizer = Muon(
+            [{'params': muon_params, 'lr': muon_lr}],
+            lr=muon_lr,
+            weight_decay=0.01,
+        )
+        # Add AdamW group for 1D params
+        adamw_group = torch.optim.AdamW(
+            adamw_params,
+            lr=cfg["lr"],
+            weight_decay=0.01,
+            betas=(0.9, 0.95),
+        )
+        logger.info(f"  ⚡ Muon: {len(muon_params)} matrix params (lr={muon_lr:.1e})")
+        logger.info(f"  ⚡ AdamW: {len(adamw_params)} other params (lr={cfg['lr']:.1e})")
+        use_dual_optimizer = True
+    except ImportError:
+        logger.warning("  ⚠️ Muon not available — falling back to AdamW only")
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=cfg["lr"],
+            weight_decay=0.01,
+            betas=(0.9, 0.95),
+        )
+        adamw_group = None
+        use_dual_optimizer = False
 
-    # ═══ Scheduler ═══
-    total_steps = len(dataloader) * cfg["epochs"]
-    # Suppress warning (scheduler before first optimizer.step is harmless here)
+    # ═══ Scheduler: WSD (Warmup-Stable-Decay) per GOLDEN spec ═══
+    actual_steps_per_epoch = min(len(dataloader), cfg["steps_per_epoch"])
+    total_steps = actual_steps_per_epoch * cfg["epochs"]
+    warmup_steps = min(cfg["warmup"], int(total_steps * 0.05))  # cap at 5%
+    logger.info(f"📊 WSD Schedule: {warmup_steps} warmup → {int(total_steps*0.75)} stable → {int(total_steps*0.20)} decay")
     import warnings
     warnings.filterwarnings("ignore", "Detected call of `lr_scheduler.step\\(\\)` before")
-    scheduler = get_cosine_schedule(
+    scheduler = get_wsd_schedule(
         optimizer,
-        warmup_steps=cfg["warmup"],
+        warmup_steps=warmup_steps,
         total_steps=total_steps,
         min_lr_ratio=0.1,
     )
+    # Mirror scheduler for AdamW group
+    scheduler_adamw = None
+    if use_dual_optimizer:
+        scheduler_adamw = get_wsd_schedule(
+            adamw_group,
+            warmup_steps=warmup_steps,
+            total_steps=total_steps,
+            min_lr_ratio=0.1,
+        )
 
     # ═══ AMP Scaler ═══
     scaler = None
@@ -1156,7 +1244,9 @@ def main():
 
     # ═══ TRAIN! ═══
     try:
-        best_loss = train(model, dataloader, optimizer, scheduler, scaler, cfg, state, drive_mode)
+        best_loss = train(model, dataloader, optimizer, scheduler, scaler, cfg, state, drive_mode,
+                          adamw_group=adamw_group if use_dual_optimizer else None,
+                          scheduler_adamw=scheduler_adamw)
     except KeyboardInterrupt:
         logger.info("\n⏸ Прервано. Сохраняю чекпоинт...")
         _save_checkpoint(model, optimizer, scheduler, scaler,

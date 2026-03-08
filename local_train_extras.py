@@ -28,12 +28,92 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-# Reuse runner and config from main local_train
-from local_train import (
-    PYTHON, TRAINING, MODELS, TARS_V3, LOG_FILE,
-    benchmark_hardware, get_config, setup_cuda_env,
-    detect_gpu, run, load_state, mark_done, is_done,
-)
+# ═══════════════════════════════════════════
+# Compatibility layer — local_train.py was rewritten for HELIX LITE
+# These extras reference the old v3 pipeline API
+# ═══════════════════════════════════════════
+
+PYTHON = sys.executable
+TRAINING = ROOT / "training"
+MODELS = ROOT / "models"
+SAVE_DIR = MODELS / "tars_lite"
+LOG_FILE = ROOT / "train_lite.log"
+STATE_FILE = ROOT / "extras_state.json"
+
+import json, subprocess, logging
+logger = logging.getLogger("Tars.Extras")
+
+try:
+    from local_train import benchmark_hardware, detect_gpu, BYTE_VOCAB
+except ImportError:
+    def benchmark_hardware():
+        return {"device": "cpu", "vram_usable_gb": 0, "bf16": False, "fp16": False,
+                "ram_gb": 16, "cpu_count": 4, "num_workers": 0, "pin_memory": False}
+    def detect_gpu():
+        return None, 0, "cpu", False
+    BYTE_VOCAB = 256
+
+
+def get_config(level, hw):
+    """Minimal config for extras phases."""
+    vram = hw.get("vram_usable_gb", 0)
+    if vram >= 18:      d, nl = 1024, 20
+    elif vram >= 11:    d, nl = 768, 16
+    elif vram >= 5:     d, nl = 512, 10
+    else:               d, nl = 256, 6
+    return {
+        "d_model": d, "n_layers": nl,
+        "vocab_size": BYTE_VOCAB, "batch": 2, "accum": 4,
+        "seq_max": 2048, "second_pass_ep": 2, "distill_ep": 3,
+    }
+
+
+def setup_cuda_env(device, cfg):
+    """CUDA env setup stub."""
+    return {}
+
+
+def run(cmd, label=""):
+    """Run a subprocess command."""
+    logger.info(f"  🔧 [{label}] Running: {' '.join(str(c) for c in cmd[:5])}...")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+        if result.returncode == 0:
+            logger.info(f"  ✅ [{label}] OK")
+            return True
+        else:
+            logger.warning(f"  ❌ [{label}] Failed: {result.stderr[:200]}")
+            return False
+    except Exception as e:
+        logger.warning(f"  ❌ [{label}] Error: {e}")
+        return False
+
+
+def load_state():
+    """Load extras state."""
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"done": []}
+
+
+def save_state(state):
+    """Save extras state."""
+    with open(STATE_FILE, 'w') as f:
+        json.dump(state, f, indent=2)
+
+
+def is_done(state, phase):
+    return phase in state.get("done", [])
+
+
+def mark_done(state, phase):
+    if phase not in state.get("done", []):
+        state.setdefault("done", []).append(phase)
+    save_state(state)
 
 # ═══════════════════════════════════════════
 # CLI
@@ -214,7 +294,7 @@ def main():
     cfg = get_config(extra_args.level, hw)
     state = load_state()
     
-    local_train.CUDA_ENV = setup_cuda_env(device, cfg)
+    local_train.CUDA_ENV = setup_cuda_env(device, cfg) if hasattr(local_train, 'CUDA_ENV') else None
     
     results = {}
     t0 = time.time()

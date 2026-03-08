@@ -114,7 +114,7 @@ class WaveConsolidation(nn.Module):
     
     BOTTLENECK_DIM = 192  # HELIX v6: информационное горлышко
     
-    def __init__(self, d_model: int = 768):
+    def __init__(self, d_model: int = 1024):
         super().__init__()
         self.d_model = d_model
         
@@ -362,16 +362,16 @@ class BrainCore(nn.Module):
     
     def __init__(
         self,
-        d_model: int = 2048,
-        n_layers: int = 24,
-        vocab_size: int = 32000,
-        d_state: int = 128,
+        d_model: int = 1024,     # TARS HELIX (matches TarsConfig)
+        n_layers: int = 20,      # 20 HelixBlocks
+        vocab_size: int = 48256, # 48K text + 256 tool tokens
+        d_state: int = 64,       # SSM state dimension
         headdim: int = 64,
         omega_dim: int = 32,
         pool_size: int = 48,
         n_experts: int = 8,
         expert_rank: int = 8,
-        quant_mode: str = "fp16",
+        quant_mode: str = "ternary",
     ):
         super().__init__()
         self.d_model = d_model

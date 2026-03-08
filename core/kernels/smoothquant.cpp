@@ -153,7 +153,7 @@ float tars_quantize_int8(
         // Clamp to [-127, 127] and round
         if (v > 127.0f) v = 127.0f;
         if (v < -127.0f) v = -127.0f;
-        x_int8[i] = (int8_t)(v > 0 ? v + 0.5f : v - 0.5f);
+        x_int8[i] = (int8_t)roundf(v);
     }
 
     return scale;

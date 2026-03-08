@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 
-from brain.mamba2.ssd import TarsCoreBlock
+from brain.mamba2.core.ssd import TarsCoreBlock
 from brain.mamba2.mole_router import MoLELayer
 from brain.mamba2.novelty import NoveltyGate
 from brain.mamba2.bitnet import UniversalLinear, ActivationQuantizer, RMSNorm
@@ -91,13 +91,13 @@ class TarsBlock(nn.Module):
     
     def __init__(
         self,
-        d_model: int = 768,
+        d_model: int = 1024,
         d_state: int = 64,
         headdim: int = 64,
         omega_dim: int = 32,  # kept for API compat, ignored
         n_experts: int = 8,
         layer_idx: int = 0,
-        quant_mode: str = "fp16",
+        quant_mode: str = "ternary",
         dropout: float = 0.1,
     ):
         super().__init__()

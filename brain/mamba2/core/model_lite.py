@@ -169,9 +169,15 @@ class TarsHelixLite(nn.Module):
         # 1. Embed + scale
         x = self.embedding(input_ids) * self.embed_scale
         
-        # 2. Sequential block processing (no waves, no consolidation)
+        # 2. Sequential block processing with gradient checkpointing
         for block in self.blocks:
-            x, _, _, _, _ = block(x)
+            if self.training and self.n_layers > 4:
+                # Gradient checkpointing: ~40% memory savings at cost of ~30% compute
+                x, _, _, _, _ = torch.utils.checkpoint.checkpoint(
+                    block, x, use_reentrant=False
+                )
+            else:
+                x, _, _, _, _ = block(x)
         
         # 3. Final norm
         x = self.final_norm(x)
@@ -183,12 +189,11 @@ class TarsHelixLite(nn.Module):
         result = {'logits': logits}
         
         if labels is not None:
-            # Standard next-token prediction: shift logits and labels
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = labels[:, 1:].contiguous()
+            # Labels are ALREADY shifted by the dataset (input=t[:-1], labels=t[1:])
+            # So logits[i] should predict labels[i] directly — NO additional shift needed
             loss = F.cross_entropy(
-                shift_logits.view(-1, self.vocab_size),
-                shift_labels.view(-1),
+                logits.view(-1, self.vocab_size),
+                labels.view(-1),
                 ignore_index=-100,
             )
             result['loss'] = loss
