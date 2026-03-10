@@ -170,14 +170,30 @@ class TarsHelixLite(nn.Module):
         x = self.embedding(input_ids) * self.embed_scale
         
         # 2. Sequential block processing with gradient checkpointing
+        use_ckpt = getattr(self, '_use_gradient_checkpointing', False) and self.training
+        
         for block in self.blocks:
-            if self.training and self.n_layers > 4:
-                # Gradient checkpointing: ~40% memory savings at cost of ~30% compute
-                x, _, _, _, _ = torch.utils.checkpoint.checkpoint(
-                    block, x, use_reentrant=False
+            if use_ckpt:
+                # Wrap the block to return exactly ONE tensor and handle None inputs safely
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        # TarsBlock returns: x, wkv, x_prev, stats, ssd_state, conv_state
+                        # For LITE we only care about the first element `x`
+                        out = module(inputs[0])
+                        return out[0]
+                    return custom_forward
+                
+                # Checkpointing requires inputs to have requires_grad=True
+                if not x.requires_grad:
+                    x.requires_grad_(True)
+                
+                x = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(block), 
+                    x, 
+                    use_reentrant=False
                 )
             else:
-                x, _, _, _, _ = block(x)
+                x, _, _, _, _, _ = block(x)
         
         # 3. Final norm
         x = self.final_norm(x)
