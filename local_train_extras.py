@@ -151,7 +151,8 @@ def run_second_pass(cfg, device, bf16, state):
         return True
     
     print(f"\n  🔄 Phase 4.6: Second Pass (seq={cfg['seq_max']}, {cfg['second_pass_ep']}ep)...")
-    cmd = [PYTHON, str(TRAINING / "train_mamba2.py"),
+    # WARNING: train_mamba2.py is LEGACY — this phase needs migration to local_train.py
+    cmd = [PYTHON, str(TRAINING / "train" / "train_mamba2.py"),
            "--d_model", str(cfg["d_model"]), "--n_layers", str(cfg["n_layers"]),
            "--vocab_size", str(cfg["vocab_size"]),
            "--batch", str(cfg["batch"]),
@@ -203,7 +204,8 @@ def run_quantize(cfg, device, state):
     except Exception:
         dm, nl = str(cfg["d_model"]), str(cfg["n_layers"])
     
-    ok = run([PYTHON, str(TRAINING / "train_mamba2.py"),
+    # WARNING: train_mamba2.py is LEGACY — this phase needs migration to local_train.py
+    ok = run([PYTHON, str(TRAINING / "train" / "train_mamba2.py"),
               "--d_model", dm, "--n_layers", nl,
               "--batch", str(cfg["batch"]), "--accum_steps", str(cfg["accum"]),
               "--epochs", "3", "--lr", "5e-5", "--phase", "1",
@@ -267,7 +269,7 @@ def run_distillation(cfg, device, bf16, state):
     ok = run([PYTHON, str(TRAINING / "train_distill.py"),
               "--d_model", str(cfg["d_model"]), "--n_layers", str(cfg["n_layers"]),
               "--epochs", str(cfg["distill_ep"]), "--batch", str(cfg["batch"]),
-              "--device", device, "--save_dir", str(TARS_V3),
+              "--device", device, "--save_dir", str(SAVE_DIR),
               "--resume", "--grad_ckpt", "--lr", "1e-4",
               "--temperature", "3.0", "--alpha", "0.7",
               "--teacher_model", "Qwen/Qwen2.5-1.5B"]

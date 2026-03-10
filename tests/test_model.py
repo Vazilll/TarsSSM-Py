@@ -70,6 +70,64 @@ def test_model_forward(small_config, device):
 
 
 # ═══════════════════════════════════════════════════════════════
+# TarsHelixLite (CURRENT model — used for training)
+# ═══════════════════════════════════════════════════════════════
+
+def test_helix_lite_import():
+    """TarsHelixLite can be imported."""
+    from brain.mamba2.core.model_lite import TarsHelixLite
+    assert TarsHelixLite is not None
+
+
+def test_helix_lite_creation():
+    """TarsHelixLite can be instantiated with small config."""
+    from config import TarsConfig
+    from brain.mamba2.core.model_lite import TarsHelixLite
+    cfg = TarsConfig(d_model=128, n_layers=2, vocab_size=256, d_state=16, headdim=32)
+    model = TarsHelixLite(cfg)
+    assert model is not None
+    total = sum(p.numel() for p in model.parameters())
+    assert total > 0
+
+
+def test_helix_lite_forward():
+    """TarsHelixLite forward pass with loss computation."""
+    from config import TarsConfig
+    from brain.mamba2.core.model_lite import TarsHelixLite
+    cfg = TarsConfig(d_model=128, n_layers=2, vocab_size=256, d_state=16, headdim=32)
+    model = TarsHelixLite(cfg)
+    model.eval()
+
+    B, L = 2, 32
+    x = torch.randint(0, 256, (B, L))
+    labels = torch.randint(0, 256, (B, L))
+
+    with torch.no_grad():
+        result = model(x, labels=labels)
+
+    assert 'logits' in result
+    assert 'loss' in result
+    assert result['logits'].shape == (B, L, 256)
+    assert not torch.isnan(result['logits']).any(), "NaN in TarsHelixLite output"
+    assert not torch.isnan(result['loss']), "NaN loss in TarsHelixLite"
+
+
+def test_helix_lite_generate():
+    """TarsHelixLite generation produces tokens."""
+    from config import TarsConfig
+    from brain.mamba2.core.model_lite import TarsHelixLite
+    cfg = TarsConfig(d_model=128, n_layers=2, vocab_size=256, d_state=16, headdim=32)
+    model = TarsHelixLite(cfg)
+
+    prompt = torch.randint(0, 256, (1, 8))
+    with torch.no_grad():
+        generated = model.generate(prompt, max_new_tokens=4)
+
+    assert generated.shape[0] == 1
+    assert generated.shape[1] > prompt.shape[1], "No tokens generated"
+
+
+# ═══════════════════════════════════════════════════════════════
 # DoubtEngine
 # ═══════════════════════════════════════════════════════════════
 

@@ -68,6 +68,20 @@ class RandomTokenDataset(Dataset):
         }
 
 
+class TextChunkDataset(Dataset):
+    """Pre-chunked byte dataset from real text files."""
+    
+    def __init__(self, chunks):
+        self.chunks = chunks
+    
+    def __len__(self):
+        return len(self.chunks)
+    
+    def __getitem__(self, idx):
+        t = torch.tensor(self.chunks[idx], dtype=torch.long)
+        return {'input_ids': t[:-1], 'labels': t[1:]}
+
+
 class TextFileDataset(Dataset):
     """Simple text file dataset — tokenize and chunk."""
     
@@ -146,13 +160,26 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, cfg, epoch):
     return total_loss / total_tokens
 
 
-def get_cosine_schedule(optimizer, warmup_steps, total_steps, min_lr_ratio=0.1):
-    """Cosine LR schedule with warmup."""
+def get_wsd_schedule(optimizer, warmup_steps, total_steps, min_lr_ratio=0.1):
+    """WSD (Warmup-Stable-Decay) LR schedule per HELIX GOLDEN spec.
+    
+    Phase 1: 5% linear warmup (0 → lr)
+    Phase 2: 75% stable (lr constant)
+    Phase 3: 20% cosine decay (lr → min_lr)
+    """
+    stable_end = int(total_steps * 0.80)  # warmup(5%) + stable(75%)
     def lr_lambda(step):
         if step < warmup_steps:
+            # Phase 1: Linear warmup
             return step / max(1, warmup_steps)
-        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+        elif step < stable_end:
+            # Phase 2: Stable (full LR)
+            return 1.0
+        else:
+            # Phase 3: Cosine decay
+            decay_steps = total_steps - stable_end
+            progress = (step - stable_end) / max(1, decay_steps)
+            return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
@@ -312,6 +339,7 @@ def main():
     
     # ═══ Config ═══
     cfg = TarsConfig(
+        vocab_size=256,             # UTF-8 byte-level (LITE mode)
         batch_size=args.batch_size,
         lr=args.lr,
         max_seq_len=args.seq_len,
@@ -331,12 +359,62 @@ def main():
     
     # ═══ Dataset ═══
     if args.data and os.path.exists(args.data):
-        # TODO: integrate proper tokenizer
-        logger.info(f"Text file training not yet implemented — using random data")
-        dataset = RandomTokenDataset(cfg.vocab_size, args.seq_len, n_samples=args.steps * args.batch_size)
+        # Load real text file as UTF-8 bytes
+        logger.info(f"Loading text: {args.data}")
+        with open(args.data, 'rb') as f:
+            raw_bytes = f.read()
+        tokens = list(raw_bytes)
+        logger.info(f"  {len(raw_bytes)/1024**2:.1f} MB → {len(tokens)} tokens")
+        
+        # Chunk into sequences
+        seq_len = args.seq_len
+        chunks = []
+        stride = seq_len // 2  # 50% overlap
+        for i in range(0, len(tokens) - seq_len - 1, stride):
+            chunk = tokens[i:i + seq_len + 1]
+            if len(chunk) == seq_len + 1:
+                chunks.append(chunk)
+        
+        import random
+        random.shuffle(chunks)
+        if len(chunks) > args.steps * args.batch_size * 2:
+            chunks = chunks[:args.steps * args.batch_size * 2]
+        
+        logger.info(f"  {len(chunks)} chunks (seq_len={seq_len}, stride={stride})")
+        dataset = TextChunkDataset(chunks)
     else:
-        logger.info("No data file — using random tokens (test training)")
-        dataset = RandomTokenDataset(cfg.vocab_size, args.seq_len, n_samples=args.steps * args.batch_size)
+        # Try to find .txt files in data/
+        data_dir = os.path.join(os.path.dirname(__file__), "data")
+        txt_files = []
+        if os.path.exists(data_dir):
+            txt_files = sorted(
+                [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.txt')],
+                key=lambda x: -os.path.getsize(x)
+            )
+        
+        if txt_files:
+            # Use largest text file
+            chosen = txt_files[0]
+            logger.info(f"Found data: {chosen}")
+            with open(chosen, 'rb') as f:
+                raw_bytes = f.read()
+            tokens = list(raw_bytes)
+            chunks = []
+            stride = args.seq_len // 2
+            for i in range(0, len(tokens) - args.seq_len - 1, stride):
+                chunk = tokens[i:i + args.seq_len + 1]
+                if len(chunk) == args.seq_len + 1:
+                    chunks.append(chunk)
+            import random
+            random.shuffle(chunks)
+            if len(chunks) > args.steps * args.batch_size * 2:
+                chunks = chunks[:args.steps * args.batch_size * 2]
+            logger.info(f"  {len(raw_bytes)/1024**2:.1f} MB → {len(chunks)} chunks")
+            dataset = TextChunkDataset(chunks)
+        else:
+            logger.info("No data file — using random tokens (test training)")
+            dataset = RandomTokenDataset(cfg.vocab_size, args.seq_len, 
+                                         n_samples=args.steps * args.batch_size)
     
     dataloader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True,
@@ -352,7 +430,7 @@ def main():
     )
     
     total_steps = len(dataloader) * args.epochs
-    scheduler = get_cosine_schedule(
+    scheduler = get_wsd_schedule(
         optimizer, 
         warmup_steps=min(100, total_steps // 10),
         total_steps=total_steps,

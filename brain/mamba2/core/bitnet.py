@@ -215,8 +215,12 @@ class UniversalLinear(nn.Module):
             self.register_parameter("bias", None)
 
         # ═══ RMSNorm для стабилизации перед квантованием ═══
-        # Используется только в режиме 1.58-bit
+        # Используется в 1.58-bit режиме (и в fp16 если always_norm=True)
         self.input_norm = RMSNorm(in_features)
+        # Disable gradients when norm is unused (saves optimizer memory)
+        if mode == "fp16" and not always_norm:
+            for p in self.input_norm.parameters():
+                p.requires_grad_(False)
 
         # ═══ Кеш тернарных весов (для инференса без пересчёта) ═══
         self.register_buffer("_cached_ternary_w", None)
@@ -245,6 +249,10 @@ class UniversalLinear(nn.Module):
         if mode != self.mode:
             self.mode = mode
             self._cache_valid = False
+            # Toggle input_norm gradients based on usage
+            norm_needed = (mode == "158bit") or self.always_norm
+            for p in self.input_norm.parameters():
+                p.requires_grad_(norm_needed)
             if mode == "fp16":
                 self._cached_ternary_w = None
                 self._cached_scale = None

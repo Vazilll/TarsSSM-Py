@@ -437,6 +437,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TARS v3 Launcher")
     parser.add_argument("--check", action="store_true", help="Только проверка (без CLI)")
     parser.add_argument("--no-install", action="store_true", help="Пропустить установку зависимостей")
+    parser.add_argument("--mode", choices=["cli", "bridge"], default="cli",
+                        help="Режим: cli (интерактивный) или bridge (JSON stdin/stdout для Blook)")
+    parser.add_argument("--model", type=str, default=None, help="Путь к checkpoint модели")
+    parser.add_argument("--max-tokens", type=int, default=4096, help="Макс токенов для генерации")
+    parser.add_argument("--temperature", type=float, default=0.7, help="Temperature")
+    parser.add_argument("--format", type=str, default="text", help="Формат вывода")
     args = parser.parse_args()
 
     # Phase 0: Auto-install
@@ -449,6 +455,11 @@ if __name__ == "__main__":
     # Phase 1: Verify
     ok = verify()
 
-    # Phase 2: CLI (если всё ок и не --check)
-    if not args.check and ok:
+    # Phase 2: Launch
+    if args.mode == "bridge":
+        # Bridge mode for Blook integration (JSON stdin/stdout)
+        from tars_bridge_server import TarsBridgeServer
+        server = TarsBridgeServer(model_path=args.model, device="auto")
+        server.run()
+    elif not args.check and ok:
         run_cli()

@@ -790,12 +790,13 @@ def train(model, dataloader, optimizer, scheduler, scaler, cfg, state, drive_mod
 
             # Optimizer step (every accum steps)
             if (step + 1) % cfg['accum'] == 0 or (step + 1) == len(dataloader):
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 if scaler is not None:
                     scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
                 # Step AdamW group (dual optimizer)
                 if adamw_group is not None:
@@ -1216,7 +1217,9 @@ def main():
 
     # ═══ Scheduler: WSD (Warmup-Stable-Decay) per GOLDEN spec ═══
     actual_steps_per_epoch = min(len(dataloader), cfg["steps_per_epoch"])
-    total_steps = actual_steps_per_epoch * cfg["epochs"]
+    # Scheduler steps only when optimizer steps (every accum batches)
+    optimizer_steps_per_epoch = max(actual_steps_per_epoch // cfg["accum"], 1)
+    total_steps = optimizer_steps_per_epoch * cfg["epochs"]
     warmup_steps = min(cfg["warmup"], int(total_steps * 0.05))  # cap at 5%
     logger.info(f"📊 WSD Schedule: {warmup_steps} warmup → {int(total_steps*0.75)} stable → {int(total_steps*0.20)} decay")
     import warnings

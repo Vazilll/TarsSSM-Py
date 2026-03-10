@@ -289,8 +289,8 @@ class TarsHelixLite(nn.Module):
             h = self.final_norm(x)
             logits = self.lm_head(h)
             
-            # Check for EOS
-            if next_token.item() == 0:  # EOS token
+            # Check for EOS (only safe for batch=1)
+            if next_token.shape[0] == 1 and next_token.item() == 0:
                 break
         
         return generated

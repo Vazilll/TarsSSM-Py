@@ -47,7 +47,7 @@ class TarsConfig:
     # ═══════════════════════════════════════
     # QUANTIZATION & RUNTIME
     # ═══════════════════════════════════════
-    quant_mode: str = "ternary"  # "fp32", "fp16", "ternary" (1.58-bit)
+    quant_mode: str = "fp16"     # "fp32", "fp16", "ternary" (1.58-bit for deploy)
     use_cpp_core: bool = False   # True → tars_core C++ engine
     smoothquant_alpha: float = 0.5  # SmoothQuant balance factor
     int8_dynamic_quant: bool = True  # INT8 dynamic quantization on CPU
