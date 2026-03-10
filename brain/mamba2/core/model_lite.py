@@ -175,12 +175,17 @@ class TarsHelixLite(nn.Module):
         for block in self.blocks:
             if use_ckpt:
                 # Wrap the block to return exactly ONE tensor and handle None inputs safely
+                # Wrap the block to disable autocast and manually manage precision
                 def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        # TarsBlock returns: x, wkv, x_prev, stats, ssd_state, conv_state
-                        # For LITE we only care about the first element `x`
-                        out = module(inputs[0])
-                        return out[0]
+                    def custom_forward(hidden_states):
+                        orig_dtype = hidden_states.dtype
+                        # Force fp32 execution inside the checkpointed region
+                        # Context manager avoids re-applying autocast logic during recompute
+                        with torch.cuda.amp.autocast(enabled=False):
+                            out = module(hidden_states.float())
+                        # TarsBlock returns: (out, wkv, prev_x, ssd, conv)
+                        # Ensure we convert back to exactly what goes into the next block
+                        return out[0].to(orig_dtype)
                     return custom_forward
                 
                 # Checkpointing requires inputs to have requires_grad=True
@@ -189,8 +194,8 @@ class TarsHelixLite(nn.Module):
                 
                 x = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block), 
-                    x, 
-                    use_reentrant=False
+                    x,
+                    use_reentrant=False,
                 )
             else:
                 x, _, _, _, _ = block(x)
