@@ -193,7 +193,7 @@ class TarsHelixLite(nn.Module):
                     use_reentrant=False
                 )
             else:
-                x, _, _, _, _, _ = block(x)
+                x, _, _, _, _ = block(x)
         
         # 3. Final norm
         x = self.final_norm(x)
