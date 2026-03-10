@@ -370,45 +370,73 @@ def print_hw_report(hw):
 # ═══════════════════════════════════════════
 
 def auto_config(level, hw):
-    """Конфиг обучения по уровню + hardware."""
+    """Конфиг обучения по уровню + hardware.
+    
+    GPU tiers (выжимает максимум из каждого):
+      A100-80GB : d=1024, L=20, batch=16, seq=1024
+      A100-40GB : d=1024, L=20, batch=8,  seq=1024
+      L4-24GB   : d=1024, L=20, batch=6,  seq=768
+      T4-15GB   : d=768,  L=16, batch=4,  seq=512
+      GTX-6GB   : d=512,  L=10, batch=2,  seq=256
+      CPU       : d=256,  L=6,  batch=1,  seq=128
+    """
     vram = hw["vram_usable_gb"]
     bf16 = hw["bf16"]
+    gpu_name = hw.get("gpu_name", "").lower()
 
-    # Размер модели по VRAM
-    if vram >= 18:      d, nl = 1024, 20    # A100(40GB), L4(24GB)
-    elif vram >= 11:    d, nl = 768, 16     # T4(15GB)
-    elif vram >= 5:     d, nl = 512, 10     # GTX 1060
-    else:               d, nl = 256, 6      # CPU fallback
-
-    # Batch по VRAM
-    if vram >= 30:      batch = 8
-    elif vram >= 12:    batch = 4   # T4(15GB), L4(24GB)
-    elif vram >= 8:     batch = 2
-    else:               batch = 1
+    # ═══ GPU-specific tiers — max utilization ═══
+    if vram >= 65:
+        # A100-80GB / H100
+        d, nl, batch, max_seq = 1024, 20, 16, 1024
+        grad_ckpt = False
+    elif vram >= 30:
+        # A100-40GB
+        d, nl, batch, max_seq = 1024, 20, 8, 1024
+        grad_ckpt = False
+    elif vram >= 18:
+        # L4-24GB (Ada Lovelace, 24GB, bf16)
+        d, nl, batch, max_seq = 1024, 20, 6, 768
+        grad_ckpt = True  # save VRAM for bigger effective batch
+    elif vram >= 11:
+        # T4-15GB (Turing)
+        d, nl, batch, max_seq = 768, 16, 4, 512
+        grad_ckpt = True
+    elif vram >= 5:
+        # GTX 1060 6GB / RTX 3060 etc.
+        d, nl, batch, max_seq = 512, 10, 2, 256
+        grad_ckpt = True
+    else:
+        # CPU fallback
+        d, nl, batch, max_seq = 256, 6, 1, 128
+        grad_ckpt = False
 
     # AMP dtype
     amp = "bf16" if bf16 else ("fp16" if hw["fp16"] else "fp32")
 
-    # Level-specific
+    # Effective batch = batch * accum → target ~16-32 tokens per step
+    target_eff_batch = 16 if vram < 30 else 32
+    accum = max(1, target_eff_batch // batch)
+
+    # Level-specific (seq_len capped by GPU max)
     configs = {
         "small": {
             "epochs": 2, "steps_per_epoch": 100,
-            "seq_len": 256, "accum": max(1, 16 // batch),
+            "seq_len": min(256, max_seq), "accum": accum,
             "lr": 5e-4, "warmup": 50, "max_chunks": 2000,
         },
         "medium": {
             "epochs": 3, "steps_per_epoch": 500,
-            "seq_len": 512, "accum": max(1, 16 // batch),
+            "seq_len": min(512, max_seq), "accum": accum,
             "lr": 3e-4, "warmup": 200, "max_chunks": 20000,
         },
         "max": {
             "epochs": 5, "steps_per_epoch": 2000,
-            "seq_len": 1024, "accum": max(1, 16 // batch),
+            "seq_len": max_seq, "accum": accum,
             "lr": 3e-4, "warmup": 500, "max_chunks": 100000,
         },
         "marathon": {
             "epochs": 15, "steps_per_epoch": 5000,
-            "seq_len": 1024, "accum": max(1, 16 // batch),
+            "seq_len": max_seq, "accum": accum,
             "lr": 3e-4, "warmup": 1000, "max_chunks": 500000,
         },
     }
@@ -421,6 +449,7 @@ def auto_config(level, hw):
         "num_workers": hw["num_workers"],
         "pin_memory": hw["pin_memory"],
         "compile": hw.get("compile_ok", False),
+        "grad_checkpoint": grad_ckpt,
     })
 
     # CLI overrides
@@ -1065,6 +1094,10 @@ def main():
     print(f"  ⚡ AMP:     {cfg['amp']}")
     print(f"  🔄 Epochs:  {cfg['epochs']}")
     print(f"  💾 Drive:   {drive_mode}")
+    if cfg.get('grad_checkpoint'):
+        print(f"  🧩 GradCkpt: ON (saves ~30% VRAM)")
+    if cfg.get('compile'):
+        print(f"  🔥 Compile: ON (torch.compile)")
     if args.resume and state.get("current_epoch", 0) > 0:
         print(f"  🔄 Resume:  epoch {state['current_epoch']}, loss {state.get('best_loss', '?'):.4f}")
     print("─" * 65)
@@ -1087,6 +1120,26 @@ def main():
         quant_mode="fp16",      # training in FP16/BF16, not ternary
     )
     model = TarsHelixLite(model_cfg).to(device)
+
+    # Gradient checkpointing для L4/T4 (saves ~30% VRAM)
+    if cfg.get('grad_checkpoint', False):
+        from torch.utils.checkpoint import checkpoint as torch_checkpoint
+        # Enable gradient checkpointing on model blocks
+        if hasattr(model, 'gradient_checkpointing_enable'):
+            model.gradient_checkpointing_enable()
+            logger.info("🧩 Gradient checkpointing: ON (native)")
+        else:
+            # Manual: set flag for forward to use checkpoint
+            model._use_gradient_checkpointing = True
+            logger.info("🧩 Gradient checkpointing: ON (manual flag)")
+
+    # torch.compile для совместимых GPU
+    if cfg.get('compile', False) and hasattr(torch, 'compile'):
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            logger.info("🔥 torch.compile: ON")
+        except Exception as e:
+            logger.warning(f"torch.compile failed: {e}")
 
     # Resume from checkpoint
     ckpt = None
