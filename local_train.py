@@ -970,13 +970,20 @@ def smoke_test(device="cpu"):
     t_bwd = time.time() - t0
     logger.info(f"  Backward: {t_bwd*1000:.0f}ms")
 
-    # Gradient check
+    # Gradient check (only trainable params)
     all_ok = True
+    trainable = sum(1 for p in model.parameters() if p.requires_grad)
+    frozen = sum(1 for p in model.parameters() if not p.requires_grad)
+    no_grad = 0
     for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue  # intentionally frozen (e.g. input_norm in fp16)
         if p.grad is None:
             logger.warning(f"  ❌ No gradient: {name}")
-            all_ok = False
-            break
+            no_grad += 1
+    if no_grad > 0:
+        all_ok = False
+    logger.info(f"  Params: {trainable} trainable, {frozen} frozen, {no_grad} missing grad")
 
     # Generate
     prompt = torch.randint(0, 256, (1, 8), device=device)
