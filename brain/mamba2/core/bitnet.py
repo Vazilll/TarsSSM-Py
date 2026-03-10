@@ -166,7 +166,9 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_fp32 = x.float()
         rms = torch.rsqrt(x_fp32.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (x_fp32 * rms).type_as(x) * self.weight
+        out = (x_fp32 * rms).type_as(x) * self.weight
+        # Fix for CUDAGraphs overwritten memory error when combined with torch.compile
+        return out.clone() if out.requires_grad else out
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -1143,8 +1143,14 @@ def main():
     # torch.compile для совместимых GPU
     if cfg.get('compile', False) and hasattr(torch, 'compile'):
         try:
-            model = torch.compile(model, mode="reduce-overhead")
-            logger.info("🔥 torch.compile: ON")
+            # Если включен grad_checkpoint, нельзя использовать CUDA Graphs (reduce-overhead)
+            # так как checkpointing динамически освобождает/пересоздает память тензоров.
+            if cfg.get('grad_checkpoint', False):
+                model = torch.compile(model, mode="default", fullgraph=False)
+                logger.info("🔥 torch.compile: ON (default mode, no CUDA graphs)")
+            else:
+                model = torch.compile(model, mode="reduce-overhead")
+                logger.info("🔥 torch.compile: ON (reduce-overhead mode)")
         except Exception as e:
             logger.warning(f"torch.compile failed: {e}")
 
