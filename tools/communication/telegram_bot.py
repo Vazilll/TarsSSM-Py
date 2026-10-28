@@ -62,7 +62,24 @@ class TarsTelegram:
         
         # Файл для собранных данных (для последующего обучения)
         self._corpus_file = self._data_dir / "telegram_corpus.txt"
-    
+
+        self.stt_model = None
+
+    def _get_stt_model(self):
+        """Ленивая инициализация модели Whisper для STT."""
+        if self.stt_model is None:
+            try:
+                from faster_whisper import WhisperModel
+                logger.info("Инициализация WhisperModel (tiny, int8)...")
+                self.stt_model = WhisperModel("tiny", device="cpu", compute_type="int8")
+            except ImportError:
+                logger.error("Модуль faster-whisper не установлен. Невозможно распознавать голос.")
+                self.stt_model = "error"
+            except Exception as e:
+                logger.error(f"Ошибка при загрузке WhisperModel: {e}")
+                self.stt_model = "error"
+        return self.stt_model if self.stt_model != "error" else None
+
     def _check_user(self, user_id: int) -> bool:
         """Проверить доступ пользователя."""
         if self.allowed_users is None:
@@ -100,6 +117,9 @@ class TarsTelegram:
         ))
         app.add_handler(MessageHandler(
             filters.Document.ALL, self._on_document
+        ))
+        app.add_handler(MessageHandler(
+            filters.VOICE, self._on_voice
         ))
         
         self._running = True
@@ -290,6 +310,80 @@ class TarsTelegram:
                 )
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {e}")
+
+    async def _on_voice(self, update, context):
+        """Обработка голосового сообщения."""
+        if not self._check_user(update.effective_user.id):
+            return
+
+        voice = update.message.voice
+        if not voice:
+            return
+
+        # Получаем файл голосового сообщения
+        import tempfile
+        temp_path = None
+        try:
+            file = await context.bot.get_file(voice.file_id)
+
+            # Сохраняем во временный файл
+            with tempfile.NamedTemporaryFile(suffix='.ogg', delete=False) as tmp:
+                temp_path = tmp.name
+
+            await file.download_to_drive(temp_path)
+
+            await update.message.reply_text("🎤 Распознаю голосовое сообщение...")
+
+            # Транскрибируем
+            model = self._get_stt_model()
+            if not model:
+                await update.message.reply_text("❌ Ошибка: STT-модель не доступна.")
+                return
+
+            # Run the blocking transcribe call in a separate thread
+            import asyncio
+            import functools
+            loop = asyncio.get_running_loop()
+
+            # We need to wrap transcribe to return text since it returns an iterator for segments
+            def _do_transcribe(m, path):
+                segs, _ = m.transcribe(path, language="ru")
+                return " ".join(s.text.strip() for s in segs).strip()
+
+            text = await loop.run_in_executor(None, functools.partial(_do_transcribe, model, temp_path))
+
+            if not text:
+                await update.message.reply_text("🤷 Не удалось распознать речь (пустой текст).")
+                return
+
+            # Сохранить в LEANN
+            if self.memory:
+                user = update.effective_user
+                tagged = f"[{user.first_name}] {text}"
+                self.memory.add_document(tagged)
+                self.messages_collected += 1
+
+            # Сохранить в корпус для обучения
+            self._save_to_corpus(text, source=f"tg_voice:{update.effective_user.id}")
+
+            # Callback
+            if self.on_message:
+                try:
+                    self.on_message(text, update.effective_user.id)
+                except Exception as e:
+                    logger.debug(f"on_message callback error: {e}")
+
+            await update.message.reply_text(f"📝 Распознано:\n\n{text}")
+
+        except Exception as e:
+            logger.error(f"Ошибка обработки голосового сообщения: {e}")
+            await update.message.reply_text(f"❌ Ошибка обработки: {e}")
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception as e:
+                    logger.warning(f"Не удалось удалить временный файл {temp_path}: {e}")
     
     # ═══════ Корпус для обучения ═══════
     
