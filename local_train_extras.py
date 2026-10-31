@@ -196,6 +196,9 @@ def run_quantize(cfg, device, state):
     
     try:
         import torch
+        from brain.mamba2.core.bitnet import UniversalLinear, RMSNorm
+        if hasattr(torch.serialization, 'add_safe_globals'):
+            torch.serialization.add_safe_globals([UniversalLinear, RMSNorm])
         ck = torch.load(str(fp16), map_location="cpu", weights_only=True)
         c = ck.get("config", {})
         dm = str(c.get("d_model", cfg["d_model"]))
