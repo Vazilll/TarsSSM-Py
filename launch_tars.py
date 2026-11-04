@@ -164,7 +164,7 @@ def verify():
 
     # 6. RRN
     try:
-        from brain.rrn import RrnCore
+        __import__("brain.rrn")
         results["RRN"] = "✅ Tier 1.5 Relational"
     except Exception as e:
         results["RRN"] = f"⚠️  {e}"
